@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SPACE GPU 자동 할당 &amp; Admin Run-Approval 서버</title>
+  <link rel="stylesheet" href="/style.css?v=2" />
+</head>
+<body>
+  <!-- Password Gate Modal: Shown on EVERY page load/visit -->
+  <div id="lockOverlay" class="lock-overlay">
+    <div class="lock-card">
+      <h2>🔒 SPACE GPU Runner 보안 인증</h2>
+      <p>접속할 때마다 관리자 비밀번호를 입력해야 대시보드가 열립니다.</p>
+      <form onsubmit="submitPassword(event)">
+        <input
+          type="password"
+          id="lockPasswordInput"
+          placeholder="비밀번호 입력"
+          class="mono"
+          style="text-align:center; font-size:16px; padding:10px;"
+          autofocus
+        />
+        <div id="lockErrorMsg" class="lock-error"></div>
+        <button type="submit" style="width:100%; justify-content:center; margin-top:8px; padding:10px;">
+          🔓 잠금 해제 및 접속
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <header>
+    <div class="brand">
+      <h1>🚀 SPACE GPU 자동 할당 &amp; Group-Volume 런너</h1>
+      <span class="sub">Admin Run-Approval 자동 승인 데몬</span>
+    </div>
+    <div class="status-bar">
+      <span id="jwtBadge" class="badge warn">토큰 미설정</span>
+      <span id="groupBadge" class="badge">Group ID: -</span>
+      <span id="schedBadge" class="badge ok">스케줄러: ON</span>
+      <span id="approvalLoopBadge" class="badge ok">Admin 자동승인: ON</span>
+      <button class="secondary sm" onclick="discoverSpaceResources()">🔄 SPACE 리소스 동기화</button>
+      <button class="success sm" onclick="triggerSchedulerTick()">⚡ 지금 즉시 주기 체크 &amp; 승인 실행</button>
+      <button class="danger sm" onclick="lockDashboard()">🔒 화면 잠금</button>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- Top Row: 1. Auth, Admin Approval & Interval Config | 2. Discovered GPU Pools & Group Volume Helper -->
+    <div class="grid-2">
+      <!-- Card 1: Connection, Admin Run-Approval & Polling Interval Config -->
+      <div class="card">
+        <div class="card-header">
+          <h2>1️⃣ SPACE 연동 인증 · Admin 자동 승인 · 조회 간격 설정</h2>
+          <div class="btn-row">
+            <button class="secondary sm" onclick="copyDevtoolsExtractor()">📋 브라우저 토큰 추출 코드 복사</button>
+            <button class="sm" onclick="saveConfig()">💾 설정 저장</button>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>API Gateway (`baseUrl`)</label>
+            <input type="text" id="cfgBaseUrl" value="https://mlp.n9.sr-cloud.com" class="mono" />
+          </div>
+          <div class="form-group">
+            <label>File Manager Gateway (`sfmUrl`)</label>
+            <input type="text" id="cfgSfmUrl" value="https://sfsm.n9.sr-cloud.com" class="mono" />
+          </div>
+          <div class="form-group full">
+            <label>Admin Access Token (`Bearer` 생략 가능, 만료 시 Refresh Token으로 자동 갱신)</label>
+            <input type="password" id="cfgAccessToken" placeholder="eyJhbGciOiJSUzI1NiIs..." class="mono" />
+          </div>
+          <div class="form-group full">
+            <label>Admin Refresh Token (`POST /api/acm/token` 무중단 자동 갱신용)</label>
+            <input type="password" id="cfgRefreshToken" placeholder="eyJhbGciOiJIUzI1NiIs..." class="mono" />
+          </div>
+          <div class="form-group">
+            <label>Group 선택 또는 직접 입력 (`X-Request-Group-Id`)</label>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="cfgGroupId" placeholder="예: 12" class="mono" style="width:95px;" />
+              <select id="discoveredGroupsSelect" onchange="onSelectDiscoveredGroup(this.value)">
+                <option value="">-- 토큰 저장 후 [리소스 동기화] 클릭 --</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Admin 승인자 계정명 (`approvedBy` / `userName`)</label>
+            <input type="text" id="cfgUserName" placeholder="자동 감지 (JWT / ACM)" class="mono" />
+          </div>
+
+          <div class="form-group full">
+            <label>👑 Admin Run-Approval (`/run-approval`) 자동 승인 범위 (`autoApprovalScope`)</label>
+            <select id="cfgAutoApprovalScope">
+              <option value="all_group">👑 그룹 내 모든 승인 대기(pending) 런 전체 즉시 자동 승인 (Admin 권장)</option>
+              <option value="my_runs">내 계정 + 자동 규칙이 생성한 런 모두 자동 승인</option>
+              <option value="job_only">이 서버 규칙이 생성한 런만 자동 승인</option>
+              <option value="off">자동 승인 끄기 (수동 승인만 사용)</option>
+            </select>
+          </div>
+
+          <!-- Fine-grained Adjustable Intervals -->
+          <div class="form-group">
+            <label>⏱️ ① GPU 할당/워크로드 체크 간격 (초, 1~3600)</label>
+            <input type="number" id="cfgIntervalSec" min="1" max="3600" value="15" />
+          </div>
+
+          <div class="form-group">
+            <label>⏱️ ② Admin Run-Approval 감시 간격 (초, 1~3600)</label>
+            <input type="number" id="cfgApprovalIntervalSec" min="1" max="3600" value="5" />
+          </div>
+
+          <div class="form-group">
+            <label>⏱️ ③ 웹 대시보드 화면 새로고침 간격 (초, 1~600)</label>
+            <input type="number" id="cfgUiRefreshSec" min="1" max="600" value="5" onchange="applyUiRefreshInterval(this.value)" />
+          </div>
+
+          <div class="form-group">
+            <label>⏱️ ④ 런 생성 직후 즉시 승인 추적 (간격 초 × 횟수)</label>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <input type="number" id="cfgPostCreateDelaySec" min="1" max="30" value="2" title="생성 후 승인 폴링 간격(초)" />
+              <span class="hint">초 ×</span>
+              <input type="number" id="cfgPostCreateRetries" min="1" max="60" value="8" title="생성 후 연속 폴링 횟수" />
+              <span class="hint">회</span>
+            </div>
+          </div>
+
+          <div class="form-group full">
+            <label style="color:var(--text); display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;">
+              <input type="checkbox" id="cfgSchedulerEnabled" checked />
+              <b>주기적 GPU 할당 스케줄러 &amp; Admin Run-Approval 자동 승인 데몬 활성화 (`schedulerEnabled`)</b>
+            </label>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:10px;">
+          💡 <b>원클릭 토큰 연동:</b> <code>https://space.n9.sr-cloud.com</code> 로그인 상태에서 상단 <b>[📋 브라우저 토큰 추출 코드 복사]</b> 버튼을 눌러 개발자도구(F12) 콘솔에 붙여넣으면 <code>accessToken</code>, <code>refreshToken</code>, <code>groupId</code>, <code>userName</code>이 복사됩니다. 아래 칸에 붙여넣으면 즉시 저장 및 리소스 동기화가 실행됩니다:
+          <div style="display:flex; gap:6px; margin-top:6px;">
+            <input type="text" id="quickPasteJson" placeholder='여기에 콘솔 출력 JSON 붙여넣기 ({"accessToken":...})' class="mono" oninput="applyQuickPasteJson(this.value)" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 2: Discovered GPU Pools & Group Volume Explorer -->
+      <div class="card">
+        <div class="card-header">
+          <h2>2️⃣ 그룹 GPU Pool 현황 &amp; <code>/group-volume</code> 스크립트 탐색</h2>
+          <div class="btn-row">
+            <button class="secondary sm" onclick="discoverSpaceResources()">🔍 GPU Pool / 이미지 / Spec 조회</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <label>조회된 Group Pools &amp; GPU 코어 목록 (클릭 시 아래 규칙에 자동 입력)</label>
+          <div id="poolsSummaryBox" class="pill-list" style="margin-top:6px;">
+            <span class="hint">아직 조회된 GPU Pool 정보가 없습니다. [SPACE 리소스 동기화]를 눌러주세요.</span>
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <label>저장된 WLM Specifications (`/api/wlm/v2/specification` - 클릭 시 스펙 원클릭 적용)</label>
+          <div id="specsSummaryBox" class="pill-list" style="margin-top:6px;">
+            <span class="hint">조회된 Specification이 없습니다.</span>
+          </div>
+        </div>
+
+        <div>
+          <label>Group Volume (<code>/group-volume</code>) 스크립트 빠른 탐색기 (SFM API)</label>
+          <div style="display:flex; gap:6px; margin-top:5px;">
+            <input type="text" id="sfmBrowsePath" value="/" placeholder="/ (또는 하위 폴더 경로)" class="mono" />
+            <button class="secondary sm" onclick="browseSfmFiles()">📂 폴더 조회</button>
+          </div>
+          <div id="sfmFilesList" class="pill-list" style="margin-top:8px; max-height:145px; overflow-y:auto;"></div>
+          <div class="hint" style="margin-top:6px;">
+            📌 SPACE의 모든 WLM 컨테이너는 그룹 볼륨이 항상 <b><code>/group-volume</code></b> 경로로 자동 마운트됩니다. 따라서 그룹 볼륨의 <code>run.sh</code>는 <code>bash /group-volume/run.sh</code>로 바로 실행됩니다.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Card 3: Job Rule Form & Active Job Rules Table -->
+    <div class="card">
+      <div class="card-header">
+        <h2>3️⃣ 주기적 GPU 할당 및 <code>/group-volume</code> 스크립트 실행 규칙 설정</h2>
+        <div class="btn-row">
+          <button class="secondary sm" onclick="resetJobForm()">➕ 새 규칙 작성 초기화</button>
+          <button class="sm" onclick="saveJobRule()">💾 자동 실행 규칙 저장</button>
+        </div>
+      </div>
+
+      <input type="hidden" id="jobId" value="job-default-1" />
+      <div class="form-grid">
+        <div class="form-group">
+          <label>규칙 이름 (컨테이너명 Prefix로 사용)</label>
+          <input type="text" id="jobName" value="group-vol-worker" class="mono" />
+        </div>
+
+        <div class="form-group">
+          <label>주기적 할당 동작 모드 (`mode`)</label>
+          <select id="jobMode">
+            <option value="ensure_running">항상 실행 유지 (종료/중지 시 즉시 GPU 재할당 &amp; Admin 승인)</option>
+            <option value="when_gpu_free">유휴 GPU 감시 (Pool에 빈 GPU가 날 때만 즉시 낚아채서 실행)</option>
+            <option value="once_until_success">성공할 때까지 실행 (Succeeded 도달 시 자동 중지)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>기존 Specification ID 기반 자동 채우기 (선택)</label>
+          <select id="jobUseSpecId" onchange="onSelectSpecForJob(this.value)">
+            <option value="">-- 직접 입력 (또는 저장된 Spec 선택) --</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>유지할 최소 동시 실행 컨테이너 수 (`minConcurrentRuns`)</label>
+          <input type="number" id="jobMinConcurrent" min="1" max="32" value="1" />
+        </div>
+
+        <div class="form-group">
+          <label>Group Pool (`groupPoolId` — 토큰 연동 시 자동 매핑, 이름으로 선택)</label>
+          <div style="display:flex; gap:6px;">
+            <input type="text" id="jobGroupPoolId" placeholder="자동 매핑" class="mono" style="width:90px;" />
+            <select id="selectGroupPool" onchange="document.getElementById('jobGroupPoolId').value=this.value; populateCoresForPool(this.value)">
+              <option value="">-- Pool 자동 선택 --</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>GPU Core 규격 (`coreId` — 토큰 연동 시 자동 매핑, GPU 이름으로 선택)</label>
+          <div style="display:flex; gap:6px;">
+            <input type="text" id="jobCoreId" placeholder="자동 매핑" class="mono" style="width:90px;" />
+            <select id="selectCoreId" onchange="document.getElementById('jobCoreId').value=this.value">
+              <option value="">-- GPU Core 자동 선택 --</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>할당받을 GPU/Core 개수 (`coreCount`)</label>
+          <input type="number" id="jobCoreCount" min="1" max="64" value="1" />
+        </div>
+
+        <div class="form-group">
+          <label>Priority / Quota (`quotaId` — 비워두면 기본 Priority 자동 매핑)</label>
+          <div style="display:flex; gap:6px;">
+            <input type="text" id="jobQuotaId" placeholder="자동 매핑" class="mono" style="width:90px;" />
+            <select id="selectQuotaId" onchange="document.getElementById('jobQuotaId').value=this.value">
+              <option value="">-- Priority 자동 선택 --</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>컨테이너 이미지 (`containerImage`)</label>
+          <div style="display:flex; gap:6px;">
+            <input type="text" id="jobContainerImage" placeholder="예: harbor.../pytorch:2.1-cuda12.1" class="mono" />
+            <select id="selectImage" style="max-width:160px;" onchange="if(this.value) document.getElementById('jobContainerImage').value=this.value">
+              <option value="">목록</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Experiment ID (`experimentId`, 비워두면 첫 번째 실험 자동 선택)</label>
+          <div style="display:flex; gap:6px;">
+            <input type="text" id="jobExperimentId" placeholder="자동 선택" class="mono" style="width:90px;" />
+            <select id="selectExperiment" onchange="document.getElementById('jobExperimentId').value=this.value">
+              <option value="">-- 자동 --</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>예상 실행 시간 (`expectedRunTime`, Spot/일반 런타임)</label>
+          <input type="text" id="jobExpectedRunTime" value="8h" class="mono" />
+        </div>
+
+        <div class="form-group">
+          <label>재시도 쿨다운(초, 1~3600)</label>
+          <input type="number" id="jobCooldownSec" min="1" value="15" />
+        </div>
+
+        <div class="form-group full">
+          <label>🔥 실행할 Group Volume 스크립트 명령어 (`executionCommand` — 컨테이너 시작 시 자동 실행)</label>
+          <input type="text" id="jobExecutionCommand" value="bash /group-volume/run.sh" class="mono" style="font-size:14px; border-color:var(--accent);" />
+          <div class="hint">
+            예시: <code>bash /group-volume/scripts/train.sh</code> 또는 <code>cd /group-volume/workspace &amp;&amp; python3 main.py --epochs 100</code>
+          </div>
+        </div>
+      </div>
+
+      <div class="checkbox-row" style="margin-top:8px;">
+        <label><input type="checkbox" id="jobEnabled" checked /> <b>이 규칙 주기적 자동 실행 활성화 (`enabled`)</b></label>
+        <label><input type="checkbox" id="jobAutoApprove" checked /> <b>👑 Admin Run-Approval 즉시 자동 승인 (`POST /taskorbit/api/v1/approvals/{id}/approve` 호출하여 바로 GPU 할당)</b></label>
+        <label><input type="checkbox" id="jobRestartOnSuccess" checked /> 정상 종료(`Succeeded`) 후에도 다시 GPU 할당하여 반복 실행</label>
+        <label><input type="checkbox" id="jobRestartOnFail" checked /> 실패/강제종료(`Failed`/`Stopped`) 시 자동으로 GPU 재할당 및 재실행</label>
+        <label><input type="checkbox" id="jobAllowSpot" /> Spot Instance로 실행 (`allowSpot`)</label>
+        <label><input type="checkbox" id="jobEnableWebConsole" checked /> Web Console 활성화 (`webconsole`)</label>
+      </div>
+
+      <!-- Saved Job Rules Table -->
+      <div style="margin-top:18px; overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>상태</th>
+              <th>규칙 이름</th>
+              <th>동작 모드 / Admin 승인</th>
+              <th>Pool / Core / GPU수</th>
+              <th>Group Volume 실행 명령어 (`executionCommand`)</th>
+              <th>최근 체크 상태</th>
+              <th>작업</th>
+            </tr>
+          </thead>
+          <tbody id="jobsTableBody">
+            <tr><td colspan="7" class="hint">로딩 중...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Card 3.5: Admin Run-Approval (/run-approval) & TaskOrbit Queue Panel -->
+    <div class="card">
+      <div class="card-header">
+        <h2>👑 Admin Run-Approval (<code>/run-approval</code>) &amp; TaskOrbit 승인 대기열</h2>
+        <div class="btn-row">
+          <button class="secondary sm" onclick="loadApprovals()">🔄 승인 대기 목록 새로고침</button>
+          <button class="success sm" onclick="approveAllPending()">⚡ 승인 대기 전체 즉시 일괄 승인</button>
+        </div>
+      </div>
+      <div class="hint" style="margin-bottom:10px;">
+        📌 Admin 권한으로 워크로드가 제출되면 <b><code>/taskorbit/api/v1/approvals</code></b>에 <code>pending</code> 항목이 생성됩니다. 서버의 <b>Admin 자동 승인 루프(기본 5초 간격 + 생성 직후 2초×8회 고속 추적)</b>가 감지 즉시 <code>POST /taskorbit/api/v1/approvals/{id}/approve?groupId={groupId}</code>를 호출하여 승인하므로 멈추지 않고 바로 GPU가 할당됩니다.
+      </div>
+      <div style="overflow-x:auto; max-height:260px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>구분 / Approval ID</th>
+              <th>Run ID / 워크로드명</th>
+              <th>사용자 / Namespace</th>
+              <th>요청 리소스 (GPU/CPU/MEM)</th>
+              <th>TaskOrbit 단계 / 상태</th>
+              <th>Admin 제어 (Approve / Reject)</th>
+            </tr>
+          </thead>
+          <tbody id="approvalsTableBody">
+            <tr><td colspan="6" class="hint">잠금 해제 후 자동으로 승인 대기 목록을 불러옵니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Bottom Row: Live WLM Runs & Container Logs | Scheduler Audit History -->
+    <div class="grid-2">
+      <!-- Card 4: Live WLM Runs on SPACE -->
+      <div class="card">
+        <div class="card-header">
+          <h2>4️⃣ SPACE 실시간 WLM 워크로드(Runs) &amp; 컨테이너 로그</h2>
+          <div class="btn-row">
+            <button class="secondary sm" onclick="loadSpaceRuns()">🔄 실시간 런 목록 새로고침</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto; max-height:320px; overflow-y:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Run ID</th>
+                <th>컨테이너 이름</th>
+                <th>상태</th>
+                <th>GPU/리소스</th>
+                <th>명령어 / 이미지</th>
+                <th>제어</th>
+              </tr>
+            </thead>
+            <tbody id="runsTableBody">
+              <tr><td colspan="6" class="hint">[실시간 런 목록 새로고침]을 클릭하면 SPACE WLM 컨테이너 목록을 표시합니다.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div style="margin-top:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <label id="logViewerTitle">📜 컨테이너 실시간 로그 (`/api/wlm/v2/runs/{id}/log`)</label>
+            <button class="secondary sm" onclick="refreshCurrentRunLog()">로그 새로고침</button>
+          </div>
+          <div id="runLogBox" class="code-box">런 목록에서 [로그 보기]를 클릭하면 컨테이너의 표준 출력(stdout/stderr)이 여기에 표시됩니다.</div>
+        </div>
+      </div>
+
+      <!-- Card 5: Scheduler Audit Log -->
+      <div class="card">
+        <div class="card-header">
+          <h2>5️⃣ 주기적 스케줄러 감시 &amp; Admin 자동 할당/승인 이력 (`history`)</h2>
+          <div class="btn-row">
+            <button class="secondary sm" onclick="loadServerState()">🔄 상태 새로고침</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto; max-height:520px; overflow-y:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:155px;">시각</th>
+                <th style="width:70px;">레벨</th>
+                <th>메시지 및 실행 상세</th>
+              </tr>
+            </thead>
+            <tbody id="historyTableBody">
+              <tr><td colspan="3" class="hint">기록 없음</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js?v=2"></script>
+</body>
+</html>
