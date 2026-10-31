@@ -144,3 +144,10 @@ PORT=4300 ADMIN_PASSWORD=cycy node server.mjs
    - 사용자가 숫자 ID를 몰라도 `/api/acm/groups/default`, `/api/wlm/v2/org-resources`, `/api/wlm/v2/specs`, `/api/wlm/v2/quota`를 순차 조회하여 드롭다운과 실행 페이로드에 자동 바인딩하도록 구현했습니다.
 4. **토큰 입력 전 초기 진입 시 401/500 에러 방지**
    - 토큰을 설정하기 전에 대시보드에 처음 접속했을 때 `/api/space/runs` 및 `/api/space/approvals`가 에러 대신 빈 배열과 안내 상태를 반환하도록 개선했습니다.
+5. **무제한 멀티 워커(`minConcurrentRuns`) 자동 생성 및 상단 실시간 컨트롤 배너 추가**
+   - 기존 32개/128개 상한을 해제하여 원하는 목표 워커 수(`1` ~ `9999`개, 제한 없음)만큼 자동으로 신청·승인·보충되도록 개선했습니다.
+   - 최상단 무인 자동화 배너(`#topAutoStatusBanner`)에서 `-4`, `+4`, `+8`, `40개`, `48개`, `64개`, `100개` 프리셋 및 직접 숫자 입력으로 즉시 목표 워커 수를 변경할 수 있습니다.
+   - `evaluateJobRule`의 쿨다운 비교에 1.5초 지터 마진(`cooldownMs - 1500`)을 적용하고 틱 시작 시점 기준으로 타임스탬프를 기록하여 API 응답 지연으로 인해 다음 생성 주기가 건너뛰어지는 현상을 해결했습니다.
+6. **클릭 없는 2단계 무인 자동 승인 (`request` → `approve`) 및 시각적 타임라인 표시**
+   - `WAIT_APPROVAL` 상태의 워크로드가 아직 TaskOrbit 승인 대기열에 등록되지 않은 경우 서버가 자동으로 `POST /taskorbit/api/v1/approvals/request`를 먼저 호출한 뒤 이어서 `POST /taskorbit/api/v1/approvals/{approvalId}/approve`로 Admin 승인을 완료합니다.
+   - 상단 배너 및 워커 현황판에서 최근 자동 신청/자동 승인 시각과 다음 자동 실행 카운트다운을 초 단위로 실시간 표시합니다.
