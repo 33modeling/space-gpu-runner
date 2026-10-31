@@ -716,7 +716,9 @@ function buildAutoApprovalTimeline(allRuns = lastKnownRuns) {
     const t = h.time || null;
 
     if (msg.includes("할당 요청 전송") || msg.includes("할당 및 스크립트 실행 요청 전송")) {
-      const cName = h.containerName || (msg.match(/([a-zA-Z0-9-]+-\d{12}(?:-\d+)?)/)?.[1] ?? "");
+      const cName =
+        h.containerName ||
+        (msg.match(/([a-zA-Z0-9-]+-(?:\d{4}-\d{2}-\d{2}-\d{2}|\d{6}-\d{2}-\d{2}-\d{2}|\d{12})(?:-\d+)?)/)?.[1] ?? "");
       const entry = ensureEntry(h.runId, cName);
       entry.allocationRequestedAt = h.allocationRequestedAt || t;
       if (h.workerSlot) entry.workerSlot = h.workerSlot;
@@ -1402,7 +1404,13 @@ async function buildRunPayload(job) {
   if (!containerImage) throw new Error("컨테이너 이미지(containerImage)가 설정되지 않았습니다.");
   if (!executionCommand) throw new Error("실행할 스크립트 명령어(executionCommand)가 비어 있습니다.");
 
-  const baseSuffix = new Date().toISOString().replace(/[-:T.Z]/g, "").slice(2, 14);
+  const kstDate = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const mm = String(kstDate.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(kstDate.getUTCDate()).padStart(2, "0");
+  const hh = String(kstDate.getUTCHours()).padStart(2, "0");
+  const mi = String(kstDate.getUTCMinutes()).padStart(2, "0");
+  const ss = String(kstDate.getUTCSeconds()).padStart(2, "0");
+  const baseSuffix = `${mm}${dd}-${hh}-${mi}-${ss}`;
   if (baseSuffix === lastContainerSuffix) {
     sameSecondSeq += 1;
   } else {
