@@ -41,6 +41,13 @@ const DEFAULT_STATE = {
     postCreateApproveDelaySec: 2, // Seconds between fast approval retries
     // Run-Approval policy: "all_group" | "my_runs" | "job_only" | "off"
     autoApprovalScope: "all_group",
+    // 🛡️ Smart Server/Cluster Load-Safe Paced Allocation settings
+    smartLoadGuardEnabled: true,
+    maxPendingWorkers: 2, // Pause new spawns when Pending/Creating workers >= this cap
+    stepByStepRunningCheck: true, // Verify in-flight workers transition toward Running & hold if queue stalls
+    apiLatencyWarnMs: 1800, // Stretch cooldown by 1.5x when avg API latency exceeds this
+    apiLatencyCriticalMs: 3500, // Stretch cooldown by 2.5x or hold when avg API latency exceeds this
+    adaptivePollingEnabled: true, // Reduce redundant polling & cache API bursts
   },
   jobs: [
     {
@@ -72,18 +79,34 @@ const DEFAULT_STATE = {
     },
   ],
   history: [],
+  approvalHistory: [],
 };
+
+function isApprovalOrAllocationLogMessage(msg = "") {
+  const s = String(msg);
+  return (
+    s.includes("할당 요청 전송") ||
+    s.includes("할당 및 스크립트 실행 요청 전송") ||
+    s.includes("생성됨:") ||
+    s.includes("승인 완료")
+  );
+}
 
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+      const rawHistory = Array.isArray(raw.history) ? raw.history.slice(0, 200) : [];
+      const rawApprovalHistory = Array.isArray(raw.approvalHistory)
+        ? raw.approvalHistory.slice(0, 300)
+        : rawHistory.filter((h) => h && isApprovalOrAllocationLogMessage(h.message)).slice(0, 300);
       return {
         config: { ...DEFAULT_STATE.config, ...(raw.config || {}) },
         jobs: Array.isArray(raw.jobs)
           ? raw.jobs.map((j) => ({ autoApprove: true, ...j }))
           : DEFAULT_STATE.jobs,
-        history: Array.isArray(raw.history) ? raw.history.slice(0, 200) : [],
+        history: rawHistory,
+        approvalHistory: rawApprovalHistory,
       };
     }
   } catch (e) {
@@ -103,16 +126,42 @@ function saveState() {
 }
 
 function addLog(level, message, meta = {}) {
+  const nowIso = new Date().toISOString();
+  const msgStr = String(message || "");
+
+  // Deduplicate rapid identical token-refresh log lines within 60 seconds so history stays clean
+  if (msgStr.includes("Refresh Token으로 Access Token 자동 갱신 성공") && state.history.length > 0) {
+    const recentSame = state.history.find(
+      (h) =>
+        h &&
+        h.message === msgStr &&
+        h.time &&
+        Date.now() - new Date(h.time).getTime() < 60_000
+    );
+    if (recentSame) {
+      return;
+    }
+  }
+
   const entry = {
-    time: new Date().toISOString(),
+    time: nowIso,
     level,
-    message,
+    message: msgStr,
     ...meta,
   };
-  console.log(`[${entry.time}] [${level.toUpperCase()}] ${message}`, Object.keys(meta).length ? JSON.stringify(meta) : "");
+  console.log(`[${entry.time}] [${level.toUpperCase()}] ${msgStr}`, Object.keys(meta).length ? JSON.stringify(meta) : "");
   state.history.unshift(entry);
   if (state.history.length > 200) {
     state.history.length = 200;
+  }
+  if (!Array.isArray(state.approvalHistory)) {
+    state.approvalHistory = [];
+  }
+  if (isApprovalOrAllocationLogMessage(msgStr)) {
+    state.approvalHistory.unshift(entry);
+    if (state.approvalHistory.length > 300) {
+      state.approvalHistory.length = 300;
+    }
   }
   saveState();
 }
@@ -191,6 +240,92 @@ function extractItemsArray(res) {
 }
 
 /**
+ * 🛡️ Real-Time Server & SPACE API Load Telemetry
+ * Tracks API latency samples, requests-per-minute (RPM), cache hits, error rates, and auto-backoff cooldowns.
+ */
+const loadMonitorStats = {
+  recentLatenciesMs: [], // Last 40 SPACE API call latencies
+  requestTimestampsMs: [], // Timestamps within the last 60s for RPM calculation
+  cacheHitTimestampsMs: [], // Cache hits within the last 60s
+  lastLatencyMs: 0,
+  avgLatencyMs: 0,
+  p95LatencyMs: 0,
+  maxLatencyMs: 0,
+  totalRequests: 0,
+  totalCacheHits: 0,
+  totalErrors: 0,
+  consecutiveErrors: 0,
+  lastErrorAt: null,
+  lastErrorStatus: null,
+  lastErrorMessage: null,
+  backoffUntilMs: 0,
+  backoffReason: null,
+  lastHoldReason: null,
+  lastHoldLogAtMs: 0,
+  poolGpuFree: null,
+  poolGpuTotal: null,
+  poolGpuUpdatedAt: null,
+};
+
+function recordCacheHit() {
+  const now = Date.now();
+  loadMonitorStats.totalCacheHits += 1;
+  loadMonitorStats.cacheHitTimestampsMs.push(now);
+  if (loadMonitorStats.cacheHitTimestampsMs.length > 200) {
+    loadMonitorStats.cacheHitTimestampsMs = loadMonitorStats.cacheHitTimestampsMs.filter((t) => now - t < 60_000);
+  }
+}
+
+function recordApiTelemetry({ endpoint, latencyMs, status, ok, errorMsg = null }) {
+  const now = Date.now();
+  const cleanLatency = Math.max(1, Math.round(Number(latencyMs || 1)));
+  loadMonitorStats.totalRequests += 1;
+  loadMonitorStats.lastLatencyMs = cleanLatency;
+  loadMonitorStats.requestTimestampsMs.push(now);
+  loadMonitorStats.requestTimestampsMs = loadMonitorStats.requestTimestampsMs.filter((t) => now - t < 60_000);
+
+  loadMonitorStats.recentLatenciesMs.push(cleanLatency);
+  if (loadMonitorStats.recentLatenciesMs.length > 40) {
+    loadMonitorStats.recentLatenciesMs.shift();
+  }
+  const arr = loadMonitorStats.recentLatenciesMs;
+  const sum = arr.reduce((a, b) => a + b, 0);
+  loadMonitorStats.avgLatencyMs = Math.round(sum / arr.length);
+  const sorted = [...arr].sort((a, b) => a - b);
+  loadMonitorStats.p95LatencyMs = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] || cleanLatency;
+  loadMonitorStats.maxLatencyMs = sorted[sorted.length - 1] || cleanLatency;
+
+  // Ignore benign "400 Only pending approvals can be approved" races when counting server health errors
+  const isBenignAlreadyApproved =
+    status === 400 && String(errorMsg || "").toLowerCase().includes("only pending approvals");
+
+  if (ok || isBenignAlreadyApproved) {
+    loadMonitorStats.consecutiveErrors = 0;
+    if (loadMonitorStats.backoffUntilMs && now >= loadMonitorStats.backoffUntilMs) {
+      loadMonitorStats.backoffUntilMs = 0;
+      loadMonitorStats.backoffReason = null;
+    }
+  } else {
+    loadMonitorStats.totalErrors += 1;
+    loadMonitorStats.consecutiveErrors += 1;
+    loadMonitorStats.lastErrorAt = new Date(now).toISOString();
+    loadMonitorStats.lastErrorStatus = status;
+    loadMonitorStats.lastErrorMessage = String(errorMsg || `HTTP ${status}`).slice(0, 180);
+
+    // Apply automatic protective backoff cooldown on rate-limit (429), gateway overload (502/503/504), or repeated errors
+    if (status === 429 || status === 502 || status === 503 || status === 504 || loadMonitorStats.consecutiveErrors >= 3) {
+      const expFactor = Math.min(6, Math.max(1, loadMonitorStats.consecutiveErrors));
+      const backoffSec = status === 429 ? Math.min(180, 30 * expFactor) : Math.min(120, 15 * expFactor);
+      loadMonitorStats.backoffUntilMs = Math.max(loadMonitorStats.backoffUntilMs, now + backoffSec * 1000);
+      loadMonitorStats.backoffReason =
+        status === 429
+          ? `SPACE API 요청 제한(HTTP 429) 감지 — ${backoffSec}초간 할당 자동 감속/보호 대기`
+          : `SPACE 서버 과부하/오류(HTTP ${status || "NET"} · 연속 ${loadMonitorStats.consecutiveErrors}회) — ${backoffSec}초간 보호 쿨다운`;
+    }
+  }
+}
+
+/**
  * Core HTTP Client reproducing `mt` Axios client from SPACE `bundle.js#L89935-L90005`
  */
 async function spaceRequest(endpoint, options = {}, isRetry = false) {
@@ -255,10 +390,31 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
     fetchOptions.body = typeof body === "string" ? body : JSON.stringify(body);
   }
 
-  const res = await fetch(url, fetchOptions);
+  const reqStartMs = Date.now();
+  let res;
+  try {
+    res = await fetch(url, fetchOptions);
+  } catch (netErr) {
+    recordApiTelemetry({
+      endpoint,
+      latencyMs: Date.now() - reqStartMs,
+      status: 0,
+      ok: false,
+      errorMsg: netErr.message,
+    });
+    throw netErr;
+  }
+  const reqLatencyMs = Date.now() - reqStartMs;
 
   if (rawResponse) {
     const text = await res.text();
+    recordApiTelemetry({
+      endpoint,
+      latencyMs: reqLatencyMs,
+      status: res.status,
+      ok: res.ok,
+      errorMsg: res.ok ? null : text.slice(0, 200),
+    });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
     }
@@ -280,44 +436,75 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
 
   if (!res.ok) {
     const errMsg = typeof data === "object" && data !== null ? data.message || data.detail || data.error || JSON.stringify(data) : String(data);
+    recordApiTelemetry({
+      endpoint,
+      latencyMs: reqLatencyMs,
+      status: res.status,
+      ok: false,
+      errorMsg: errMsg,
+    });
     throw new Error(`SPACE API Error [${res.status}] ${endpoint}: ${errMsg}`);
   }
+
+  recordApiTelemetry({
+    endpoint,
+    latencyMs: reqLatencyMs,
+    status: res.status,
+    ok: true,
+  });
 
   return data;
 }
 
+let refreshInFlightPromise = null;
+
 async function refreshAccessToken() {
   if (!state.config.refreshToken) return false;
-  try {
-    const url = `${state.config.baseUrl.replace(/\/$/, "")}/api/acm/token`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: state.config.refreshToken.trim(),
-        client_id: "mlp-front",
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      addLog("error", `Access Token 자동 갱신 실패 (HTTP ${res.status})`, { error: errText.slice(0, 200) });
-      return false;
-    }
-    const data = await res.json();
-    const newAccess = data?.access_token || data?.data?.access_token;
-    const newRefresh = data?.refresh_token || data?.data?.refresh_token;
-    if (newAccess) {
-      state.config.accessToken = newAccess;
-      if (newRefresh) state.config.refreshToken = newRefresh;
-      saveState();
-      addLog("info", "Refresh Token으로 Access Token 자동 갱신 성공");
-      return true;
-    }
-  } catch (e) {
-    addLog("error", `Access Token 갱신 중 예외 발생: ${e.message}`);
+  if (refreshInFlightPromise) {
+    return refreshInFlightPromise;
   }
-  return false;
+  refreshInFlightPromise = (async () => {
+    try {
+      const url = `${state.config.baseUrl.replace(/\/$/, "")}/api/acm/token`;
+      const reqStartMs = Date.now();
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          refresh_token: state.config.refreshToken.trim(),
+          client_id: "mlp-front",
+        }),
+      });
+      const latencyMs = Date.now() - reqStartMs;
+      if (!res.ok) {
+        const errText = await res.text();
+        recordApiTelemetry({ endpoint: "/api/acm/token", latencyMs, status: res.status, ok: false, errorMsg: errText });
+        addLog("error", `Access Token 자동 갱신 실패 (HTTP ${res.status})`, { error: errText.slice(0, 200) });
+        return false;
+      }
+      recordApiTelemetry({ endpoint: "/api/acm/token", latencyMs, status: res.status, ok: true });
+      const data = await res.json();
+      const newAccess = data?.access_token || data?.data?.access_token;
+      const newRefresh = data?.refresh_token || data?.data?.refresh_token;
+      if (newAccess) {
+        state.config.accessToken = newAccess;
+        if (newRefresh) state.config.refreshToken = newRefresh;
+        saveState();
+        addLog("info", "Refresh Token으로 Access Token 자동 갱신 성공");
+        return true;
+      }
+    } catch (e) {
+      addLog("error", `Access Token 갱신 중 예외 발생: ${e.message}`);
+    }
+    return false;
+  })();
+
+  try {
+    return await refreshInFlightPromise;
+  } finally {
+    refreshInFlightPromise = null;
+  }
 }
 
 /**
@@ -535,107 +722,175 @@ const spaceApi = {
 
 let lastKnownRuns = [];
 let lastKnownRunsAt = null;
+let lastKnownRunsAtMs = 0;
+let runsInFlightPromise = null;
 const lastKnownApprovalsMap = new Map();
+let approvalSummaryCache = null;
+let approvalSummaryCacheAtMs = 0;
+let approvalSummaryInFlightPromise = null;
+const inFlightApprovalIds = new Set();
+const recentlyApprovedIds = new Map(); // id/runId -> timestampMs
 let lastContainerSuffix = "";
 let sameSecondSeq = 0;
 
-async function fetchCurrentRuns() {
-  try {
-    const res = await spaceApi.getRunsPaginated({ page: 1, size: 100 });
-    const arr = extractItemsArray(res);
-    if (arr.length > 0) {
-      lastKnownRuns = arr;
-      lastKnownRunsAt = new Date().toISOString();
-      return arr;
-    }
-  } catch {
-    // Fallback
+async function fetchCurrentRuns(forceFresh = false) {
+  const now = Date.now();
+  // Short-TTL cache (2.5s) prevents redundant concurrent polling across UI refresh, scheduler tick, and approval loop
+  if (!forceFresh && state.config.adaptivePollingEnabled !== false && lastKnownRuns.length > 0 && now - lastKnownRunsAtMs < 2500) {
+    recordCacheHit();
+    return lastKnownRuns;
   }
-  const res2 = await spaceApi.getRunsList();
-  const arr2 = extractItemsArray(res2);
-  lastKnownRuns = arr2;
-  lastKnownRunsAt = new Date().toISOString();
-  return arr2;
+  if (runsInFlightPromise && !forceFresh) {
+    recordCacheHit();
+    return runsInFlightPromise;
+  }
+
+  runsInFlightPromise = (async () => {
+    try {
+      const res = await spaceApi.getRunsPaginated({ page: 1, size: 100 });
+      const arr = extractItemsArray(res);
+      if (arr.length > 0) {
+        let merged = arr;
+        // If page 1 is full (100 items), also fetch page 2 so 40+ active workers are never hidden behind finished runs
+        if (arr.length >= 100) {
+          try {
+            const resPage2 = await spaceApi.getRunsPaginated({ page: 2, size: 100 });
+            const arr2 = extractItemsArray(resPage2);
+            if (arr2.length > 0) {
+              const seen = new Set(arr.map((r) => String(r.id ?? r.runId ?? "")));
+              for (const r of arr2) {
+                const k = String(r.id ?? r.runId ?? "");
+                if (k && !seen.has(k)) {
+                  seen.add(k);
+                  merged.push(r);
+                }
+              }
+            }
+          } catch {
+            // Ignore page 2 error
+          }
+        }
+        lastKnownRuns = merged;
+        lastKnownRunsAtMs = Date.now();
+        lastKnownRunsAt = new Date(lastKnownRunsAtMs).toISOString();
+        return merged;
+      }
+    } catch {
+      // Fallback
+    }
+    const res2 = await spaceApi.getRunsList();
+    const arr2 = extractItemsArray(res2);
+    lastKnownRuns = arr2;
+    lastKnownRunsAtMs = Date.now();
+    lastKnownRunsAt = new Date(lastKnownRunsAtMs).toISOString();
+    return arr2;
+  })();
+
+  try {
+    return await runsInFlightPromise;
+  } finally {
+    runsInFlightPromise = null;
+  }
 }
 
 /**
  * Fetch both `/taskorbit/api/v1/approvals` (pending items on `/run-approval` page)
- * and `/taskorbit/api/v1/runs` (TaskOrbit queue)
+ * and `/taskorbit/api/v1/runs` (TaskOrbit queue) with 1.5s singleflight cache to protect server load
  */
-async function fetchApprovalStatusSummary() {
-  const summary = {
-    approvals: [],
-    recentApprovals: [],
-    taskOrbitRuns: [],
-    pendingApprovalRuns: [],
-    errors: {},
-  };
+async function fetchApprovalStatusSummary(forceFresh = false) {
+  const now = Date.now();
+  if (!forceFresh && state.config.adaptivePollingEnabled !== false && approvalSummaryCache && now - approvalSummaryCacheAtMs < 1500) {
+    recordCacheHit();
+    return approvalSummaryCache;
+  }
+  if (approvalSummaryInFlightPromise && !forceFresh) {
+    recordCacheHit();
+    return approvalSummaryInFlightPromise;
+  }
 
-  await Promise.all([
-    (async () => {
-      try {
-        const [pendingRes, recentRes] = await Promise.all([
-          spaceApi.getApprovalsList({ status: "pending", page: 1, limit: 100 }).catch(() => null),
-          spaceApi.getApprovalsList({ status: "", page: 1, limit: 50 }).catch(() => null),
-        ]);
-        const pendingArr = extractItemsArray(pendingRes);
-        const recentArr = extractItemsArray(recentRes);
-        summary.recentApprovals = recentArr;
+  approvalSummaryInFlightPromise = (async () => {
+    const summary = {
+      approvals: [],
+      recentApprovals: [],
+      taskOrbitRuns: [],
+      pendingApprovalRuns: [],
+      errors: {},
+    };
 
-        for (const item of [...recentArr, ...pendingArr]) {
-          if (!item) continue;
-          const rId = String(item.runId || "");
-          if (rId) {
-            lastKnownApprovalsMap.set(rId, item);
+    await Promise.all([
+      (async () => {
+        try {
+          const [pendingRes, recentRes] = await Promise.all([
+            spaceApi.getApprovalsList({ status: "pending", page: 1, limit: 100 }).catch(() => null),
+            spaceApi.getApprovalsList({ status: "", page: 1, limit: 50 }).catch(() => null),
+          ]);
+          const pendingArr = extractItemsArray(pendingRes);
+          const recentArr = extractItemsArray(recentRes);
+          summary.recentApprovals = recentArr;
+
+          for (const item of [...recentArr, ...pendingArr]) {
+            if (!item) continue;
+            const rId = String(item.runId || "");
+            if (rId) {
+              lastKnownApprovalsMap.set(rId, item);
+            }
           }
-        }
 
-        const seenIds = new Set();
-        const mergedPending = [];
-        for (const item of [...pendingArr, ...recentArr]) {
-          if (!item || !item.id || seenIds.has(item.id)) continue;
-          if (!item.status || String(item.status).toLowerCase() === "pending") {
-            seenIds.add(item.id);
-            mergedPending.push(item);
+          const seenIds = new Set();
+          const mergedPending = [];
+          for (const item of [...pendingArr, ...recentArr]) {
+            if (!item || !item.id || seenIds.has(item.id)) continue;
+            if (!item.status || String(item.status).toLowerCase() === "pending") {
+              seenIds.add(item.id);
+              mergedPending.push(item);
+            }
           }
+          summary.approvals = mergedPending;
+        } catch (e) {
+          summary.errors.approvals = e.message;
         }
-        summary.approvals = mergedPending;
-      } catch (e) {
-        summary.errors.approvals = e.message;
-      }
-    })(),
-    (async () => {
-      try {
-        const res = await spaceApi.getTaskOrbitRuns();
-        const rawList = extractItemsArray(res);
-        const activeGrp = resolveGroupId();
-        const list = activeGrp
-          ? rawList.filter((r) => !r.groupId || String(r.groupId).toLowerCase() === String(activeGrp).toLowerCase())
-          : rawList;
-        summary.taskOrbitRuns = list.map((r) => {
-          const stUpper = String(r.status || "").toUpperCase();
-          return {
-            ...r,
-            stage:
-              stUpper === "PENDING"
-                ? "approval"
-                : stUpper === "APPROVED"
-                ? "limit"
-                : stUpper === "ADMITTED"
-                ? "queue"
-                : "scheduled",
-          };
-        });
-        summary.pendingApprovalRuns = summary.taskOrbitRuns.filter(
-          (r) => String(r.status || "").toUpperCase() === "PENDING"
-        );
-      } catch (e) {
-        summary.errors.taskOrbit = e.message;
-      }
-    })(),
-  ]);
+      })(),
+      (async () => {
+        try {
+          const res = await spaceApi.getTaskOrbitRuns();
+          const rawList = extractItemsArray(res);
+          const activeGrp = resolveGroupId();
+          const list = activeGrp
+            ? rawList.filter((r) => !r.groupId || String(r.groupId).toLowerCase() === String(activeGrp).toLowerCase())
+            : rawList;
+          summary.taskOrbitRuns = list.map((r) => {
+            const stUpper = String(r.status || "").toUpperCase();
+            return {
+              ...r,
+              stage:
+                stUpper === "PENDING"
+                  ? "approval"
+                  : stUpper === "APPROVED"
+                  ? "limit"
+                  : stUpper === "ADMITTED"
+                  ? "queue"
+                  : "scheduled",
+            };
+          });
+          summary.pendingApprovalRuns = summary.taskOrbitRuns.filter(
+            (r) => String(r.status || "").toUpperCase() === "PENDING"
+          );
+        } catch (e) {
+          summary.errors.taskOrbit = e.message;
+        }
+      })(),
+    ]);
 
-  return summary;
+    approvalSummaryCache = summary;
+    approvalSummaryCacheAtMs = Date.now();
+    return summary;
+  })();
+
+  try {
+    return await approvalSummaryInFlightPromise;
+  } finally {
+    approvalSummaryInFlightPromise = null;
+  }
 }
 
 /**
@@ -675,7 +930,7 @@ const schedulerLoopStats = {
 
 /**
  * Build a comprehensive timeline of Worker Allocations & Admin Auto-Approval Request/Completion timestamps
- * from `state.history`, `lastKnownApprovalsMap`, and `allRuns`.
+ * from `state.approvalHistory`, `state.history`, `lastKnownApprovalsMap`, and `allRuns`.
  */
 function buildAutoApprovalTimeline(allRuns = lastKnownRuns) {
   const byRunId = new Map();
@@ -709,7 +964,11 @@ function buildAutoApprovalTimeline(allRuns = lastKnownRuns) {
     return entry;
   };
 
-  const historyList = Array.isArray(state.history) ? [...state.history].reverse() : [];
+  const combinedHistory = [
+    ...(Array.isArray(state.approvalHistory) ? state.approvalHistory : []),
+    ...(Array.isArray(state.history) ? state.history : []),
+  ];
+  const historyList = combinedHistory.reverse();
   for (const h of historyList) {
     if (!h || !h.message) continue;
     const msg = String(h.message);
@@ -887,6 +1146,12 @@ async function processPendingApprovals(options = {}) {
   isApprovalRunning = true;
   approvalLoopStats.running = true;
   try {
+    // Prune expired entries from recentlyApprovedIds (> 120s)
+    const nowCleanMs = Date.now();
+    for (const [k, ts] of recentlyApprovedIds.entries()) {
+      if (nowCleanMs - ts > 120_000) recentlyApprovedIds.delete(k);
+    }
+
     const currentUser = resolveCurrentUserName();
     const jobPrefixes = state.jobs
       .filter((j) => j.autoApprove !== false)
@@ -899,7 +1164,7 @@ async function processPendingApprovals(options = {}) {
     const trackedRunIds = new Set(state.jobs.filter((j) => j.autoApprove !== false && j.lastRunId).map((j) => String(j.lastRunId)));
     if (targetRunId) trackedRunIds.add(String(targetRunId));
 
-    const summary = await fetchApprovalStatusSummary();
+    const summary = await fetchApprovalStatusSummary(Boolean(targetRunId || forceAll));
     const approvedItems = [];
     const handledRunIds = new Set();
 
@@ -933,6 +1198,16 @@ async function processPendingApprovals(options = {}) {
       if (item.status && String(item.status).toLowerCase() !== "pending") continue;
       if (!shouldApproveItem(item)) continue;
 
+      const appKey = `app:${item.id}`;
+      const runKey = item.runId ? `run:${item.runId}` : null;
+      if (inFlightApprovalIds.has(appKey) || (runKey && inFlightApprovalIds.has(runKey))) continue;
+      if (recentlyApprovedIds.has(appKey) || (runKey && recentlyApprovedIds.has(runKey))) {
+        if (item.runId) handledRunIds.add(String(item.runId));
+        continue;
+      }
+
+      inFlightApprovalIds.add(appKey);
+      if (runKey) inFlightApprovalIds.add(runKey);
       const reqIso = new Date().toISOString();
       approvalLoopStats.lastAutoApprovalRequestAt = reqIso;
       try {
@@ -942,6 +1217,8 @@ async function processPendingApprovals(options = {}) {
           approvedBy: currentUser,
         });
         const doneIso = new Date().toISOString();
+        recentlyApprovedIds.set(appKey, Date.now());
+        if (runKey) recentlyApprovedIds.set(runKey, Date.now());
         if (item.runId) {
           handledRunIds.add(String(item.runId));
           spaceApi.approveTaskOrbitRun(item.runId).catch(() => {});
@@ -968,11 +1245,22 @@ async function processPendingApprovals(options = {}) {
           approvedBy: currentUser,
         });
       } catch (err) {
-        addLog("warn", `[Run-Approval] /approvals/${item.id}/approve 실패: ${err.message}`, {
-          approvalId: item.id,
-          runId: item.runId,
-          approvalRequestedAt: reqIso,
-        });
+        const msgLower = String(err.message || "").toLowerCase();
+        if (msgLower.includes("only pending approvals")) {
+          // Already approved by concurrent fast-tracker; record as recently approved without noisy warning
+          recentlyApprovedIds.set(appKey, Date.now());
+          if (runKey) recentlyApprovedIds.set(runKey, Date.now());
+          if (item.runId) handledRunIds.add(String(item.runId));
+        } else {
+          addLog("warn", `[Run-Approval] /approvals/${item.id}/approve 실패: ${err.message}`, {
+            approvalId: item.id,
+            runId: item.runId,
+            approvalRequestedAt: reqIso,
+          });
+        }
+      } finally {
+        inFlightApprovalIds.delete(appKey);
+        if (runKey) inFlightApprovalIds.delete(runKey);
       }
     }
 
@@ -981,12 +1269,16 @@ async function processPendingApprovals(options = {}) {
       const rId = String(run.runId || run.id || "");
       if (!rId || handledRunIds.has(rId)) continue;
       if (!shouldApproveItem(run)) continue;
+      const runKey = `run:${rId}`;
+      if (inFlightApprovalIds.has(runKey) || recentlyApprovedIds.has(runKey)) continue;
 
+      inFlightApprovalIds.add(runKey);
       const reqIso = new Date().toISOString();
       approvalLoopStats.lastAutoApprovalRequestAt = reqIso;
       try {
         await spaceApi.approveTaskOrbitRun(rId);
         const doneIso = new Date().toISOString();
+        recentlyApprovedIds.set(runKey, Date.now());
         handledRunIds.add(rId);
         approvedItems.push({
           source: "taskorbit-runs",
@@ -1007,6 +1299,8 @@ async function processPendingApprovals(options = {}) {
         });
       } catch {
         // Ignore if already approved via /approvals
+      } finally {
+        inFlightApprovalIds.delete(runKey);
       }
     }
 
@@ -1457,12 +1751,200 @@ async function buildRunPayload(job) {
 }
 
 /**
+ * Compute real-time Server & SPACE Cluster Load / Health Status (`loadMonitor`)
+ * Used by both the UI dashboard and the Smart Load-Safe Paced Allocator (`evaluateJobRule`).
+ */
+function computeServerLoadStatus(allRuns = lastKnownRuns) {
+  const runsList = Array.isArray(allRuns) ? allRuns : [];
+  const now = Date.now();
+  const enabled = state.config.smartLoadGuardEnabled !== false;
+  const maxPendingWorkers = Math.max(1, Number(state.config.maxPendingWorkers || 2));
+  const stepByStepRunningCheck = state.config.stepByStepRunningCheck !== false;
+  const warnMs = Math.max(300, Number(state.config.apiLatencyWarnMs || 1800));
+  const critMs = Math.max(warnMs + 200, Number(state.config.apiLatencyCriticalMs || 3500));
+
+  // Prune request timestamps older than 60s
+  const reqTs = loadMonitorStats.requestTimestampsMs || [];
+  const cacheTs = loadMonitorStats.cacheHitTimestampsMs || [];
+  while (reqTs.length > 0 && now - reqTs[0] > 60000) {
+    reqTs.shift();
+  }
+  while (cacheTs.length > 0 && now - cacheTs[0] > 60000) {
+    cacheTs.shift();
+  }
+  loadMonitorStats.requestsPerMinute = reqTs.length;
+  loadMonitorStats.cacheHitsPerMinute = cacheTs.length;
+
+  const activeRuns = runsList.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
+  const runningRuns = activeRuns.filter((r) =>
+    String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const nonRunningActiveRuns = activeRuns.filter(
+    (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+
+  // Measure how long the oldest non-Running active worker has been waiting in Pending/Creating/Approved
+  let oldestPendingWaitSec = 0;
+  let oldestPendingWorkerName = null;
+  for (const r of nonRunningActiveRuns) {
+    const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+    if (startMs && !Number.isNaN(startMs)) {
+      const waitSec = Math.max(0, Math.floor((now - startMs) / 1000));
+      if (waitSec >= oldestPendingWaitSec) {
+        oldestPendingWaitSec = waitSec;
+        oldestPendingWorkerName = r.containerName || r.name || `#${r.id || r.runId}`;
+      }
+    }
+  }
+
+  // Local Linux host load & memory
+  const cpuCount = Math.max(1, os.cpus()?.length || 1);
+  const [load1, load5, load15] = os.loadavg();
+  const cpuLoadPct = Math.min(100, Math.round((load1 / cpuCount) * 100));
+  const totalMemMb = Math.round(os.totalmem() / (1024 * 1024));
+  const freeMemMb = Math.round(os.freemem() / (1024 * 1024));
+  const rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+
+  const avgLat = loadMonitorStats.avgLatencyMs || 0;
+  const p95Lat = loadMonitorStats.p95LatencyMs || 0;
+  const lastLat = loadMonitorStats.lastLatencyMs || 0;
+  const effectiveLat = Math.max(avgLat, lastLat);
+
+  const backoffRemainingSec =
+    loadMonitorStats.backoffUntilMs > now ? Math.ceil((loadMonitorStats.backoffUntilMs - now) / 1000) : 0;
+
+  let loadLevel = "GREEN"; // GREEN | YELLOW | ORANGE | RED
+  let loadBadgeText = "🟢 쾌적 · 안전 할당";
+  let pacingMultiplier = 1.0;
+  let extraDelaySec = 0;
+  let holdCreation = false;
+  const reasons = [];
+
+  if (backoffRemainingSec > 0) {
+    loadLevel = "RED";
+    loadBadgeText = `🛑 과부하 보호 쿨다운 (${backoffRemainingSec}초)`;
+    pacingMultiplier = 2.5;
+    extraDelaySec = backoffRemainingSec;
+    holdCreation = enabled;
+    reasons.push(
+      `API 연속 오류/한도 보호 쿨다운 중 (${backoffRemainingSec}초 남음 · ${loadMonitorStats.backoffReason || loadMonitorStats.lastBackoffReason || "백오프"})`
+    );
+  }
+
+  if (effectiveLat >= critMs || p95Lat >= critMs * 1.2) {
+    if (loadLevel !== "RED") {
+      loadLevel = "ORANGE";
+      loadBadgeText = "🟠 API 지연 감지 · 자동 감속";
+    }
+    pacingMultiplier = Math.max(pacingMultiplier, 2.0);
+    extraDelaySec = Math.max(extraDelaySec, 15);
+    reasons.push(`SPACE API 응답 지연 높음 (최근 ${lastLat}ms · 평균 ${avgLat}ms · P95 ${p95Lat}ms) → 생성 간격 2.0x 자동 연장`);
+  } else if (effectiveLat >= warnMs) {
+    if (loadLevel === "GREEN") {
+      loadLevel = "YELLOW";
+      loadBadgeText = "🟡 API 부하 주의 · 완만 페이싱";
+    }
+    pacingMultiplier = Math.max(pacingMultiplier, 1.4);
+    extraDelaySec = Math.max(extraDelaySec, 6);
+    reasons.push(`SPACE API 응답 다소 느림 (최근 ${lastLat}ms · 평균 ${avgLat}ms) → 생성 간격 1.4x 완만 조절`);
+  }
+
+  // In-flight Pending/Creating worker congestion check
+  if (nonRunningActiveRuns.length >= maxPendingWorkers) {
+    if (loadLevel === "GREEN" || loadLevel === "YELLOW") {
+      loadLevel = "YELLOW";
+      loadBadgeText = `🟡 준비중 워커 ${nonRunningActiveRuns.length}/${maxPendingWorkers}개 대기 · 순차 보호`;
+    }
+    if (enabled) {
+      holdCreation = true;
+    }
+    reasons.push(
+      `현재 Running 전환 대기 중인 워커 ${nonRunningActiveRuns.length}개 (상한 ${maxPendingWorkers}개) → 기존 워커가 Running 진입할 때까지 추가 생성 일시 대기`
+    );
+  } else if (stepByStepRunningCheck && nonRunningActiveRuns.length > 0 && oldestPendingWaitSec >= 45) {
+    if (loadLevel === "GREEN") {
+      loadLevel = "YELLOW";
+      loadBadgeText = `🟡 클러스터 할당 대기 (${oldestPendingWaitSec}초) · 대기 보호`;
+    }
+    if (enabled) {
+      holdCreation = true;
+    }
+    reasons.push(
+      `선행 워커(${oldestPendingWorkerName})가 ${oldestPendingWaitSec}초째 Pending/승인후 대기 중 → 클러스터 과부하/큐 적체 방지를 위해 Running 진입 시까지 대기`
+    );
+  }
+
+  if (loadMonitorStats.lastPoolCheck && loadMonitorStats.lastPoolCheck.available === false) {
+    if (loadLevel === "GREEN") {
+      loadLevel = "YELLOW";
+      loadBadgeText = "🟡 GPU 풀 여유 대기 중";
+    }
+    reasons.push(`클러스터 풀 상태: ${loadMonitorStats.lastPoolCheck.reason}`);
+  }
+
+  if (reasons.length === 0) {
+    reasons.push(
+      `SPACE API 응답 쾌적 (평균 ${avgLat || lastLat || 0}ms) · 준비 대기 워커 ${nonRunningActiveRuns.length}/${maxPendingWorkers}개 · Running 가동 ${runningRuns.length}개`
+    );
+  }
+
+  return {
+    enabled,
+    loadLevel,
+    loadBadgeText,
+    holdCreation,
+    pacingMultiplier,
+    extraDelaySec,
+    maxPendingWorkers,
+    stepByStepRunningCheck,
+    inFlightPendingCount: nonRunningActiveRuns.length,
+    runningWorkerCount: runningRuns.length,
+    activeWorkerCount: activeRuns.length,
+    oldestPendingWaitSec,
+    oldestPendingWorkerName,
+    api: {
+      lastLatencyMs: lastLat,
+      avgLatencyMs: avgLat,
+      p95LatencyMs: p95Lat,
+      maxLatencyMs: loadMonitorStats.maxLatencyMs || 0,
+      requestsPerMinute: loadMonitorStats.requestsPerMinute,
+      cacheHitsPerMinute: loadMonitorStats.cacheHitsPerMinute,
+      totalRequests: loadMonitorStats.totalRequests,
+      totalErrors: loadMonitorStats.totalErrors,
+      consecutiveErrors: loadMonitorStats.consecutiveErrors,
+      rateLimitCount: loadMonitorStats.rateLimitCount,
+      backoffRemainingSec,
+      lastErrorStatus: loadMonitorStats.lastErrorStatus,
+      lastErrorMessage: loadMonitorStats.lastErrorMessage,
+      warnThresholdMs: warnMs,
+      criticalThresholdMs: critMs,
+    },
+    host: {
+      cpuCount,
+      loadAvg1m: Number(load1.toFixed(2)),
+      loadAvg5m: Number(load5.toFixed(2)),
+      cpuLoadPct,
+      rssMb,
+      freeMemMb,
+      totalMemMb,
+    },
+    poolCheck: loadMonitorStats.lastPoolCheck,
+    throttleCount: loadMonitorStats.throttleCount,
+    lastThrottleReason: loadMonitorStats.lastThrottleReason,
+    lastThrottleAt: loadMonitorStats.lastThrottleAt,
+    reasons,
+     summaryText: reasons[0],
+  };
+}
+
+/**
  * Compute real-time Worker Fleet & Auto-Creation progress statistics for the UI
  */
 function computeWorkerFleetStats(allRuns = lastKnownRuns) {
   const runsList = Array.isArray(allRuns) ? allRuns : [];
   const now = Date.now();
   const configuredSchedSec = Math.max(1, Number(state.config.checkIntervalSec || 15));
+  const loadStatus = computeServerLoadStatus(runsList);
   const timelineList = buildAutoApprovalTimeline(runsList);
   const timelineByRunId = new Map();
   const timelineByName = new Map();
@@ -1518,8 +2000,12 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     const targetGpuCount = targetCount * coreCountPerWorker;
     const remainingGpuToCreate = remainingToCreate * coreCountPerWorker;
 
-    const effectiveCooldownSec = Math.max(1, Number(job.cooldownSec || configuredSchedSec || 15));
-    const effectiveTickSec = Math.min(configuredSchedSec, effectiveCooldownSec);
+    const baseCooldownSec = Math.max(1, Number(job.cooldownSec || configuredSchedSec || 15));
+    const pacedCooldownSec = loadStatus.enabled
+      ? Math.max(baseCooldownSec, Math.ceil(baseCooldownSec * loadStatus.pacingMultiplier) + loadStatus.extraDelaySec)
+      : baseCooldownSec;
+    const effectiveCooldownSec = pacedCooldownSec;
+    const effectiveTickSec = Math.min(configuredSchedSec, baseCooldownSec);
     const scaleUpIntervalSec = Math.max(effectiveTickSec, effectiveCooldownSec);
 
     let nextSpawnAt = null;
@@ -1528,7 +2014,9 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       const lastTriggerMs = job.lastTriggeredAt ? new Date(job.lastTriggeredAt).getTime() : 0;
       const nextByCooldownMs = lastTriggerMs ? lastTriggerMs + effectiveCooldownSec * 1000 : now;
       const nextBySchedMs = lastSchedulerTickTime ? lastSchedulerTickTime + effectiveTickSec * 1000 : now;
-      const nextSpawnMs = Math.max(now, nextByCooldownMs, nextBySchedMs);
+      const backoffMs = loadStatus.api.backoffRemainingSec > 0 ? now + loadStatus.api.backoffRemainingSec * 1000 : now;
+      const holdExtraMs = loadStatus.holdCreation ? Math.max(nextBySchedMs, now + 5000) : now;
+      const nextSpawnMs = Math.max(now, nextByCooldownMs, nextBySchedMs, backoffMs, holdExtraMs);
       nextSpawnAt = new Date(nextSpawnMs).toISOString();
       nextSpawnInSec = Math.max(0, Math.ceil((nextSpawnMs - now) / 1000));
       if (globalNextSpawnInSec === null || nextSpawnInSec < globalNextSpawnInSec) {
@@ -1592,6 +2080,7 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       scaleUpIntervalSec,
       configuredCheckIntervalSec: configuredSchedSec,
       configuredCooldownSec: Number(job.cooldownSec || 15),
+      pacedCooldownSec,
       nextSpawnAt,
       nextSpawnInSec,
       estimatedFullScaleSec: remainingToCreate * scaleUpIntervalSec,
@@ -1616,6 +2105,7 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     nextSpawnInSec: globalNextSpawnInSec,
     jobs: jobFleetList,
     autoApprovalTimeline: timelineList.slice(0, 40),
+    loadMonitor: loadStatus,
   };
 }
 
@@ -1632,14 +2122,25 @@ async function checkPoolGpuAvailable(groupPoolId, coreId, requiredCount) {
     const used = Number(core.used ?? core.allocated ?? core.running ?? 0);
     const free = core.available !== undefined ? Number(core.available) : Math.max(0, total - used);
     if (total > 0 && free < requiredCount) {
-      return {
+      const res = {
         available: false,
         free,
         total,
+        checkedAt: new Date().toISOString(),
         reason: `유휴 GPU 부족 (가용: ${free} / 필요: ${requiredCount}, 전체: ${total})`,
       };
+      loadMonitorStats.lastPoolCheck = res;
+      return res;
     }
-    return { available: true, free, total, reason: `가용 GPU 확인됨 (가용: ${free} / 전체: ${total})` };
+    const res = {
+      available: true,
+      free,
+      total,
+      checkedAt: new Date().toISOString(),
+      reason: `가용 GPU 확인됨 (가용: ${free} / 전체: ${total})`,
+    };
+    loadMonitorStats.lastPoolCheck = res;
+    return res;
   } catch (e) {
     return { available: true, reason: `GPU 상태 조회 생략 (${e.message})` };
   }
@@ -1666,6 +2167,9 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
   const runningRuns = activeRuns.filter((r) =>
     String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
+  const pendingJobRuns = activeRuns.filter(
+    (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
   const latestRun = matchingRuns[0] || null;
   const latestStatusClass = latestRun ? classifyRunStatus(latestRun.status || latestRun.state || latestRun.phase) : "NONE";
 
@@ -1678,6 +2182,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
   }
 
   const minConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
+  const loadStatus = computeServerLoadStatus(allRuns);
 
   if (!forceTrigger) {
     if (activeRuns.length >= minConcurrent) {
@@ -1688,19 +2193,68 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       const moreStr = activeRuns.length > 6 ? ` 외 ${activeRuns.length - 6}개` : "";
       job.lastStatus = `✅ 목표 워커 수 달성 (가동 ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}/${minConcurrent}개): ${activeIds}${moreStr}`;
       saveState();
-      return { triggered: false, reason: job.lastStatus };
+      return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
     }
 
-    // Respect user-configured worker creation interval (`job.cooldownSec` / `state.config.checkIntervalSec`)
-    const effectiveCooldownSec = Math.max(1, Number(job.cooldownSec || state.config.checkIntervalSec || 15));
+    // 🛡️ Smart Load-Safe Guard #1: API Backoff / Rate-Limit Cooldown
+    if (loadStatus.enabled && loadStatus.api.backoffRemainingSec > 0) {
+      const deficit = Math.max(0, minConcurrent - activeRuns.length);
+      loadMonitorStats.throttleCount += 1;
+      loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
+      loadMonitorStats.lastThrottleReason = `API 보호 쿨다운 (${loadStatus.api.backoffRemainingSec}초 대기)`;
+      job.lastStatus = `🛡️ [서버 과부하 보호] SPACE API 응답 안정화 대기 중 (${loadStatus.api.backoffRemainingSec}초 후 자동 재개 · 남은 생성 예정: +${deficit}개)`;
+      saveState();
+      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
+    }
+
+    // 🛡️ Smart Load-Safe Guard #2: In-Flight Pending / Creating Worker Congestion Protection
+    if (loadStatus.enabled && loadStatus.inFlightPendingCount >= loadStatus.maxPendingWorkers) {
+      const deficit = Math.max(0, minConcurrent - activeRuns.length);
+      const pendingNames = pendingJobRuns
+        .slice(0, 3)
+        .map((r) => `${r.containerName || r.name || `#${r.id || r.runId}`}(${r.status || r.state})`)
+        .join(", ");
+      loadMonitorStats.throttleCount += 1;
+      loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
+      loadMonitorStats.lastThrottleReason = `동시 준비중 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 상한 도달`;
+      job.lastStatus = `🛡️ [서버 부하 보호 · 순차 할당] 현재 준비중 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 (${pendingNames || "승인/컨테이너 준비중"}) → Running 진입 확인 후 +${deficit}개 이어서 자동 할당`;
+      saveState();
+      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
+    }
+
+    // 🛡️ Smart Load-Safe Guard #3: Step-by-Step Running Check when an already-submitted worker is waiting in cluster queue >= 45s
+    if (
+      loadStatus.enabled &&
+      loadStatus.stepByStepRunningCheck &&
+      loadStatus.inFlightPendingCount > 0 &&
+      loadStatus.oldestPendingWaitSec >= 45
+    ) {
+      const deficit = Math.max(0, minConcurrent - activeRuns.length);
+      loadMonitorStats.throttleCount += 1;
+      loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
+      loadMonitorStats.lastThrottleReason = `선행 워커(${loadStatus.oldestPendingWorkerName}) ${loadStatus.oldestPendingWaitSec}초째 클러스터 대기 중`;
+      job.lastStatus = `🛡️ [클러스터 큐 적체 보호] 선행 워커(${loadStatus.oldestPendingWorkerName})가 ${loadStatus.oldestPendingWaitSec}초째 Running 대기 중 → 서버 무리 방지를 위해 Running 전환 즉시 +${deficit}개 자동 할당 재개`;
+      saveState();
+      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
+    }
+
+    // Respect user-configured worker creation interval (`job.cooldownSec` / `state.config.checkIntervalSec`), dynamically stretched when SPACE API latency is elevated
+    const baseCooldownSec = Math.max(1, Number(job.cooldownSec || state.config.checkIntervalSec || 15));
+    const effectiveCooldownSec = loadStatus.enabled
+      ? Math.max(baseCooldownSec, Math.ceil(baseCooldownSec * loadStatus.pacingMultiplier) + loadStatus.extraDelaySec)
+      : baseCooldownSec;
     const cooldownMs = effectiveCooldownSec * 1000;
     // Allow 1.5s jitter margin so API latency during `createRun` never causes the next scheduled tick to be skipped
     if (job.lastTriggeredAt && now - new Date(job.lastTriggeredAt).getTime() < Math.max(500, cooldownMs - 1500)) {
       const remainWaitSec = Math.max(1, Math.ceil((cooldownMs - (now - new Date(job.lastTriggeredAt).getTime())) / 1000));
       const deficit = Math.max(0, minConcurrent - activeRuns.length);
-      job.lastStatus = `⏳ 워커 자동 증설 중 (현재 ${activeRuns.length}/${minConcurrent}개 · +${deficit}개 추가 생성 예정 · ${remainWaitSec}초 후 다음 워커 생성)`;
+      const paceNote =
+        loadStatus.enabled && effectiveCooldownSec > baseCooldownSec
+          ? ` · 🛡️ 부하감지 안전간격 ${effectiveCooldownSec}초 적용`
+          : "";
+      job.lastStatus = `⏳ 워커 안전 페이싱 증설 중 (현재 ${activeRuns.length}/${minConcurrent}개 · +${deficit}개 추가 예정 · ${remainWaitSec}초 후 다음 워커 생성${paceNote})`;
       saveState();
-      return { triggered: false, reason: job.lastStatus };
+      return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
     }
 
     if (activeRuns.length === 0 && latestRun) {
@@ -1721,9 +2275,10 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       }
     }
 
-    if (job.mode === "when_gpu_free" && !job.allowSpot && job.groupPoolId && job.coreId) {
+    // Check Pool GPU availability when `when_gpu_free` OR when Smart Load Guard checks Standard pool capacity
+    if ((job.mode === "when_gpu_free" || loadStatus.enabled) && !job.allowSpot && job.groupPoolId && job.coreId) {
       const gpuCheck = await checkPoolGpuAvailable(job.groupPoolId, job.coreId, Number(job.coreCount || 1));
-      if (!gpuCheck.available) {
+      if (!gpuCheck.available && job.mode === "when_gpu_free") {
         job.lastStatus = `GPU 대기 중: ${gpuCheck.reason}`;
         saveState();
         return { triggered: false, reason: job.lastStatus };
@@ -1890,7 +2445,7 @@ async function runSchedulerTick(manual = false) {
       }
       // Refresh runs cache if any job triggered a new worker
       if (results.some((r) => r.triggered)) {
-        await fetchCurrentRuns().catch(() => {});
+        await fetchCurrentRuns(true).catch(() => {});
       }
 
       if (manual) {
@@ -1920,7 +2475,7 @@ async function runSchedulerTick(manual = false) {
         const pendCnt = approvalTickResult?.pendingApprovalsTotal || 0;
         addLog(
           "info",
-          `🔍 [루프 즉시 점검 완료] 현재 가동 워커: ${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers}개 (앞으로 +${fleet.totalRemainingToCreate}개 자동생성 예정) · Admin 승인 처리: ${appCnt}건 (대기: ${pendCnt}건)`
+          `🔍 [루프 즉시 점검 완료] 현재 가동 워커: ${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers}개 (앞으로 +${fleet.totalRemainingToCreate}개 자동생성 예정) · Admin 승인 처리: ${appCnt}건 (대기: ${pendCnt}건) · 부하상태: ${fleet.loadMonitor?.loadBadgeText || "정상"}`
         );
       }
     }
@@ -1930,6 +2485,7 @@ async function runSchedulerTick(manual = false) {
   } finally {
     isTickRunning = false;
   }
+  const fleet = computeWorkerFleetStats(lastKnownRuns);
   return {
     ok: true,
     checkedAt: new Date().toISOString(),
@@ -1937,14 +2493,15 @@ async function runSchedulerTick(manual = false) {
     results,
     schedulerLoopStats,
     approvalLoopStats,
-    workerFleet: computeWorkerFleetStats(lastKnownRuns),
+    workerFleet: fleet,
+    loadMonitor: fleet.loadMonitor,
   };
 }
 
 /**
  * Two Independent Configurable Loops (1-second resolution):
  * 1) Workload / GPU Allocation Check Loop (`checkIntervalSec`, min 1s; capped at max 15s while scaling up missing workers!)
- * 2) Dedicated Admin Run-Approval Auto-Approver Loop (`approvalCheckIntervalSec`, min 1s)
+ * 2) Dedicated Admin Run-Approval Auto-Approver Loop (`approvalCheckIntervalSec`, min 1s; adapts interval when idle to reduce server load)
  */
 let lastSchedulerTickTime = 0;
 let lastApprovalTickTime = 0;
@@ -1957,16 +2514,29 @@ setInterval(async () => {
   }
 
   const now = Date.now();
+  const hasNonRunningActive = lastKnownRuns.some(
+    (r) =>
+      classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
+      !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
 
   // 1. Dedicated fast Admin Run-Approval polling loop (runs independently even if periodic job creation scheduler is OFF!)
   const anyJobAutoApprove = state.jobs.some((j) => j.autoApprove !== false);
   if (state.config.autoApprovalScope !== "off" || anyJobAutoApprove) {
     const hasRecentTrigger = state.jobs.some(
-      (j) => j.autoApprove !== false && j.lastTriggeredAt && now - new Date(j.lastTriggeredAt).getTime() < 10 * 60 * 1000
+      (j) => j.autoApprove !== false && j.lastTriggeredAt && now - new Date(j.lastTriggeredAt).getTime() < 5 * 60 * 1000
     );
     const configuredApprovalSec = Math.max(1, Number(state.config.approvalCheckIntervalSec || 3));
-    // Cap background approval polling at max 3s (2s after recent trigger) so pending runs never wait
-    const effectiveApprovalSec = hasRecentTrigger ? Math.min(2, configuredApprovalSec) : Math.min(3, configuredApprovalSec);
+    const adaptivePolling = state.config.adaptivePollingEnabled !== false;
+    // Fast 2s polling right after a run creation or when any run is Pending; gently relax to 5s when all runs are steadily Running & no pending approvals
+    let effectiveApprovalSec = hasRecentTrigger || hasNonRunningActive || approvalLoopStats.pendingCount > 0
+      ? Math.min(2, configuredApprovalSec)
+      : adaptivePolling
+      ? Math.max(configuredApprovalSec, 5)
+      : Math.min(3, configuredApprovalSec);
+    if (loadMonitorStats.backoffUntilMs > now) {
+      effectiveApprovalSec = Math.max(effectiveApprovalSec, 8);
+    }
     approvalLoopStats.effectiveIntervalSec = effectiveApprovalSec;
     const approvalIntervalMs = effectiveApprovalSec * 1000;
     if (lastApprovalTickTime) {
@@ -1992,8 +2562,11 @@ setInterval(async () => {
   const enabledJobIntervals = state.jobs
     .filter((j) => j.enabled)
     .map((j) => Math.max(1, Number(j.cooldownSec || configuredSchedSec)));
-  const effectiveSchedSec =
+  let effectiveSchedSec =
     enabledJobIntervals.length > 0 ? Math.min(configuredSchedSec, ...enabledJobIntervals) : configuredSchedSec;
+  if (loadMonitorStats.backoffUntilMs > now) {
+    effectiveSchedSec = Math.max(effectiveSchedSec, 10);
+  }
   schedulerLoopStats.effectiveIntervalSec = effectiveSchedSec;
   const schedIntervalMs = effectiveSchedSec * 1000;
   if (lastSchedulerTickTime) {
@@ -2092,10 +2665,11 @@ const server = http.createServer(async (req, res) => {
         approvalLoopStats,
         autoApprovalTimeline: fleet.autoApprovalTimeline || [],
         workerFleet: fleet,
+        loadMonitor: fleet.loadMonitor,
       });
     }
 
-    // 2. Update config (including all intervals!)
+    // 2. Update config (including all intervals & Smart Load Guard settings!)
     if (pathname === "/api/config" && req.method === "POST") {
       const body = await readJsonBody(req);
       const incomingGroupId = body.groupId !== undefined ? sanitizeGroupId(body.groupId) : sanitizeGroupId(state.config.groupId);
@@ -2121,17 +2695,39 @@ const server = http.createServer(async (req, res) => {
           ? { postCreateApproveDelaySec: Math.max(1, Number(body.postCreateApproveDelaySec)) }
           : {}),
         ...(body.autoApprovalScope !== undefined ? { autoApprovalScope: String(body.autoApprovalScope) } : {}),
+        ...(body.smartLoadGuardEnabled !== undefined
+          ? { smartLoadGuardEnabled: Boolean(body.smartLoadGuardEnabled) }
+          : {}),
+        ...(body.maxPendingWorkers !== undefined
+          ? { maxPendingWorkers: Math.max(1, Math.min(32, Number(body.maxPendingWorkers || 2))) }
+          : {}),
+        ...(body.stepByStepRunningCheck !== undefined
+          ? { stepByStepRunningCheck: Boolean(body.stepByStepRunningCheck) }
+          : {}),
+        ...(body.apiLatencyWarnMs !== undefined
+          ? { apiLatencyWarnMs: Math.max(300, Number(body.apiLatencyWarnMs || 1800)) }
+          : {}),
+        ...(body.apiLatencyCriticalMs !== undefined
+          ? { apiLatencyCriticalMs: Math.max(500, Number(body.apiLatencyCriticalMs || 3500)) }
+          : {}),
+        ...(body.adaptivePollingEnabled !== undefined
+          ? { adaptivePollingEnabled: Boolean(body.adaptivePollingEnabled) }
+          : {}),
       };
       resolveGroupId();
       saveState();
-      addLog("info", "서버 및 조회/승인 주기 설정이 업데이트되었습니다.", {
+      addLog("info", "서버 및 조회/승인/부하보호 설정이 업데이트되었습니다.", {
         groupId: state.config.groupId,
         checkIntervalSec: state.config.checkIntervalSec,
         approvalCheckIntervalSec: state.config.approvalCheckIntervalSec,
         uiRefreshIntervalSec: state.config.uiRefreshIntervalSec,
         autoApprovalScope: state.config.autoApprovalScope,
+        smartLoadGuardEnabled: state.config.smartLoadGuardEnabled,
+        maxPendingWorkers: state.config.maxPendingWorkers,
+        stepByStepRunningCheck: state.config.stepByStepRunningCheck,
       });
-      return sendJson(res, 200, { ok: true, config: state.config, workerFleet: computeWorkerFleetStats(lastKnownRuns) });
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      return sendJson(res, 200, { ok: true, config: state.config, workerFleet: fleet, loadMonitor: fleet.loadMonitor });
     }
 
     // 3. Discover SPACE Metadata (Auto-selects Group ID, Group Pool ID, Core ID, Quota ID)
@@ -2522,17 +3118,68 @@ const server = http.createServer(async (req, res) => {
       if (body.checkIntervalSec !== undefined) {
         state.config.checkIntervalSec = Math.max(1, Number(body.checkIntervalSec || 15));
       }
+      if (body.smartLoadGuardEnabled !== undefined) {
+        state.config.smartLoadGuardEnabled = Boolean(body.smartLoadGuardEnabled);
+      }
+      if (body.maxPendingWorkers !== undefined) {
+        state.config.maxPendingWorkers = Math.max(1, Math.min(32, Number(body.maxPendingWorkers || 2)));
+      }
+      if (body.stepByStepRunningCheck !== undefined) {
+        state.config.stepByStepRunningCheck = Boolean(body.stepByStepRunningCheck);
+      }
       saveState();
       addLog(
         "info",
-        `🎯 [${job.name}] 워커 설정 변경 — 목표 워커: ${job.minConcurrentRuns}개 (총 목표 GPU: ${job.minConcurrentRuns * Math.max(1, Number(job.coreCount || 1))}장) · 워커 자동 생성 주기: ${job.cooldownSec}초`
+        `🎯 [${job.name}] 워커 설정 변경 — 목표 워커: ${job.minConcurrentRuns}개 (총 목표 GPU: ${job.minConcurrentRuns * Math.max(1, Number(job.coreCount || 1))}장) · 워커 생성 주기: ${job.cooldownSec}초 · 부하보호: ${state.config.smartLoadGuardEnabled !== false ? `ON (동시 준비중 상한 ${state.config.maxPendingWorkers || 2}개)` : "OFF"}`
       );
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
       return sendJson(res, 200, {
         ok: true,
         job,
         jobs: state.jobs,
         config: state.config,
-        workerFleet: computeWorkerFleetStats(lastKnownRuns),
+        workerFleet: fleet,
+        loadMonitor: fleet.loadMonitor,
+      });
+    }
+
+    if (pathname === "/api/load-guard" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      if (body.smartLoadGuardEnabled !== undefined) {
+        state.config.smartLoadGuardEnabled = Boolean(body.smartLoadGuardEnabled);
+      }
+      if (body.maxPendingWorkers !== undefined) {
+        state.config.maxPendingWorkers = Math.max(1, Math.min(32, Number(body.maxPendingWorkers || 2)));
+      }
+      if (body.stepByStepRunningCheck !== undefined) {
+        state.config.stepByStepRunningCheck = Boolean(body.stepByStepRunningCheck);
+      }
+      if (body.apiLatencyWarnMs !== undefined) {
+        state.config.apiLatencyWarnMs = Math.max(300, Number(body.apiLatencyWarnMs || 1800));
+      }
+      if (body.apiLatencyCriticalMs !== undefined) {
+        state.config.apiLatencyCriticalMs = Math.max(500, Number(body.apiLatencyCriticalMs || 3500));
+      }
+      if (body.clearBackoff) {
+        loadMonitorStats.backoffUntilMs = 0;
+        loadMonitorStats.consecutiveErrors = 0;
+        loadMonitorStats.lastBackoffReason = null;
+      }
+      saveState();
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      addLog(
+        "info",
+        `🛡️ [스마트 부하 모니터링 보호 설정 변경] ${
+          state.config.smartLoadGuardEnabled !== false
+            ? `ON (동시 준비중 워커 상한: ${state.config.maxPendingWorkers || 2}개 · 순차 Running 확인: ${state.config.stepByStepRunningCheck !== false ? "ON" : "OFF"})`
+            : "OFF (제한 없이 즉시 생성)"
+        }`
+      );
+      return sendJson(res, 200, {
+        ok: true,
+        config: state.config,
+        workerFleet: fleet,
+        loadMonitor: fleet.loadMonitor,
       });
     }
 
@@ -2544,7 +3191,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, jobs: state.jobs, workerFleet: computeWorkerFleetStats(lastKnownRuns) });
     }
 
-    // 10. Immediate Manual Trigger of a Job Rule (supports `spawnCount` 1..16) or Scheduler Tick
+    // 10. Immediate Manual Trigger of a Job Rule (supports `spawnCount` 1..64) or Scheduler Tick
     if (pathname === "/api/jobs/trigger" && req.method === "POST") {
       const body = await readJsonBody(req);
       let job = state.jobs.find((j) => j.id === body.jobId) || state.jobs[0];
@@ -2593,13 +3240,18 @@ const server = http.createServer(async (req, res) => {
       }
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
       const spawnCount = Math.min(64, Math.max(1, Number(body.spawnCount || 1)));
-      let runs = await fetchCurrentRuns().catch(() => lastKnownRuns);
+      let runs = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
       const triggerResults = [];
       for (let i = 0; i < spawnCount; i++) {
+        // When spawning multiple workers manually, insert a gentle 1.2s safety gap between requests so SPACE API is not spiked
+        if (i > 0 && state.config.smartLoadGuardEnabled !== false) {
+          await sleep(1200);
+        }
         const resTrigger = await evaluateJobRule(job, runs, true);
         triggerResults.push(resTrigger);
         runs = lastKnownRuns;
       }
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
       return sendJson(res, 200, {
         ok: true,
         result: triggerResults[triggerResults.length - 1],
@@ -2608,7 +3260,8 @@ const server = http.createServer(async (req, res) => {
         job,
         schedulerLoopStats,
         approvalLoopStats,
-        workerFleet: computeWorkerFleetStats(lastKnownRuns),
+        workerFleet: fleet,
+        loadMonitor: fleet.loadMonitor,
       });
     }
 

@@ -124,6 +124,7 @@ let latestWorkerFleet = null;
 let latestSchedulerStats = null;
 let latestApprovalStats = null;
 let latestAutoApprovalTimeline = [];
+let latestLoadMonitor = null;
 let workerCountdownTimerId = null;
 
 function formatPreciseTime(isoStr, includeDate = false) {
@@ -175,6 +176,9 @@ async function loadServerState() {
     } else if (Array.isArray(data.workerFleet?.autoApprovalTimeline)) {
       latestAutoApprovalTimeline = data.workerFleet.autoApprovalTimeline;
     }
+    if (data.loadMonitor || data.workerFleet?.loadMonitor) {
+      latestLoadMonitor = data.loadMonitor || data.workerFleet?.loadMonitor;
+    }
     renderTopAutoStatusBanner();
     renderConfig(data.config, data.approvalLoopStats);
     renderApprovalLoopStatus(data.approvalLoopStats, data.config);
@@ -198,6 +202,29 @@ function renderTopAutoStatusBanner() {
   const schedStats = latestSchedulerStats || {};
   const appStats = latestApprovalStats || {};
   const timeline = latestAutoApprovalTimeline || [];
+  const lm = latestLoadMonitor || fleet.loadMonitor || {};
+  const lmApi = lm.api || {};
+  const lmHost = lm.host || {};
+  const isLoadGuardOn = lm.enabled !== undefined ? Boolean(lm.enabled) : cfg.smartLoadGuardEnabled !== false;
+  const maxPendingCap = lm.maxPendingWorkers || cfg.maxPendingWorkers || 2;
+  const inFlightPending = lm.inFlightPendingCount ?? (jf.pendingCount ?? fleet.totalPendingWorkers ?? 0);
+  const loadLevel = lm.loadLevel || "GREEN";
+  const loadBadgeColor =
+    loadLevel === "RED"
+      ? "#f87171"
+      : loadLevel === "ORANGE"
+      ? "#fb923c"
+      : loadLevel === "YELLOW"
+      ? "#fbbf24"
+      : "#34d399";
+  const loadBoxBorder =
+    loadLevel === "RED"
+      ? "rgba(239,68,68,0.65)"
+      : loadLevel === "ORANGE"
+      ? "rgba(249,115,22,0.6)"
+      : loadLevel === "YELLOW"
+      ? "rgba(245,158,11,0.55)"
+      : "rgba(16,185,129,0.55)";
 
   const activeCnt = jf.activeCount ?? fleet.totalActiveWorkers ?? 0;
   const runningCnt = jf.runningCount ?? fleet.totalRunningWorkers ?? 0;
@@ -392,6 +419,68 @@ function renderTopAutoStatusBanner() {
           <div id="topNextApprovalCountdown" style="color:#34d399; font-weight:700;">⏱️ 다음 자동 승인 대기열 스캔 카운트다운 계산 중...</div>
           <div style="font-size:11px; color:#a7f3d0; margin-top:2px;">
             👑 누적 무클릭 Admin 자동 승인 완료: <b>${totalAutoApproved}건</b> (현재 승인 대기 PENDING: <b>${appStats.pendingCount || 0}건</b> · 마지막 승인 런: <code>${escapeHtml(lastApprovedRunName)}</code>)
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 🛡️ Smart Server & Cluster Load Monitor Bar (Prevents Overloading SPACE & Local Host) -->
+    <div style="margin-top:14px; background:rgba(15,23,42,0.88); border:1.5px solid ${loadBoxBorder}; border-radius:10px; padding:12px 15px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span class="badge ${loadLevel === "GREEN" ? "ok" : loadLevel === "RED" ? "err" : "warn"}" style="font-weight:800; font-size:12.5px; padding:4px 10px;">
+            🛡️ ${escapeHtml(lm.loadBadgeText || (isLoadGuardOn ? "🟢 쾌적 · 안전 할당" : "⚪ 부하보호 OFF"))}
+          </span>
+          <span style="font-weight:800; font-size:13.5px; color:#f8fafc;">
+            서버/클러스터 무리 방지 모니터링 가드 (${isLoadGuardOn ? "활성" : "비활성"})
+          </span>
+          <span style="font-size:12px; color:${loadBadgeColor}; font-weight:600;">
+            — ${escapeHtml(lm.summaryText || "실시간 API 응답속도 및 Pending 워커 수 감시 중")}
+          </span>
+        </div>
+        <div class="btn-row" style="gap:5px;">
+          <button type="button" class="secondary sm" style="padding:3px 8px; ${isLoadGuardOn ? "border-color:#10b981; color:#6ee7b7;" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: ${!isLoadGuardOn} })">
+            ${isLoadGuardOn ? "🛡️ 부하보호 ON (클릭시 OFF)" : "⚪ 부하보호 OFF (클릭시 ON)"}
+          </button>
+          <button type="button" class="secondary sm" style="padding:3px 8px; ${maxPendingCap === 1 ? "background:#065f46; color:#fff;" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: true, maxPendingWorkers: 1 })" title="한 번에 1개씩만 준비시켜 Running 진입을 확인한 뒤 다음 워커를 할당합니다 (가장 안전)">
+            안전 1개씩(Running 확인후 순차)
+          </button>
+          <button type="button" class="secondary sm" style="padding:3px 8px; ${maxPendingCap === 2 ? "background:#1e40af; color:#fff;" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: true, maxPendingWorkers: 2 })">
+            동시 준비 2개(권장)
+          </button>
+          <button type="button" class="secondary sm" style="padding:3px 8px; ${maxPendingCap === 4 ? "background:#1e40af; color:#fff;" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: true, maxPendingWorkers: 4 })">
+            동시 준비 4개(고속)
+          </button>
+        </div>
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-top:10px;">
+        <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
+          <div style="color:#94a3b8;">⏳ 준비중(Pending/Creating) 워커 가드</div>
+          <div style="font-size:14px; font-weight:800; color:${inFlightPending >= maxPendingCap ? "#fbbf24" : "#34d399"}; margin-top:2px;">
+            현재 ${inFlightPending}개 대기 / 상한 ${maxPendingCap}개
+            ${lm.oldestPendingWaitSec > 0 ? `<span style="font-size:11px; color:#fde68a;">(최장 ${lm.oldestPendingWaitSec}초)</span>` : ""}
+          </div>
+        </div>
+
+        <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
+          <div style="color:#94a3b8;">📡 SPACE API 응답속도 (Latency)</div>
+          <div style="font-size:14px; font-weight:800; color:${(lmApi.avgLatencyMs || 0) >= 1800 ? "#fbbf24" : "#60a5fa"}; margin-top:2px;">
+            최근 ${lmApi.lastLatencyMs || 0}ms · 평균 ${lmApi.avgLatencyMs || 0}ms <span style="font-size:11px; color:#94a3b8;">(P95 ${lmApi.p95LatencyMs || 0}ms)</span>
+          </div>
+        </div>
+
+        <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
+          <div style="color:#94a3b8;">🔄 API 호출 빈도 &amp; 스마트 캐시 보호</div>
+          <div style="font-size:14px; font-weight:800; color:#a7f3d0; margin-top:2px;">
+            분당 ${lmApi.requestsPerMinute || 0}회 호출 · 캐시절감 ${lmApi.cacheHitsPerMinute || 0}회/분
+          </div>
+        </div>
+
+        <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
+          <div style="color:#94a3b8;">🖥️ 로컬 런너 서버 리소스 &amp; 페이싱 배율</div>
+          <div style="font-size:14px; font-weight:800; color:#e2e8f0; margin-top:2px;">
+            CPU ${lmHost.cpuLoadPct ?? 0}% (Load ${lmHost.loadAvg1m ?? 0}) · RAM ${lmHost.rssMb ?? 0}MB · 간격 ${(lm.pacingMultiplier || 1).toFixed(1)}x
           </div>
         </div>
       </div>
@@ -595,8 +684,9 @@ function renderWorkerFleetBoard(fleet) {
 
     <!-- Progress Bar -->
     <div style="margin-bottom:10px;">
-      <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1; margin-bottom:4px;">
+      <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1; margin-bottom:4px; flex-wrap:wrap; gap:6px;">
         <span>워커 가동 달성률: <b>${activeCnt} / ${targetCnt} 워커 (${pct}%)</b></span>
+        <span>🛡️ 부하보호: <b>${escapeHtml(fleet.loadMonitor?.loadBadgeText || "🟢 쾌적 · 안전 할당")}</b> (API 평균 ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms · 동시준비 ${fleet.loadMonitor?.inFlightPendingCount ?? pendingCnt}/${fleet.loadMonitor?.maxPendingWorkers ?? 2}개)</span>
         <span>🟢 가동 중: <b>${activeCnt}개</b> &nbsp;·&nbsp; 🔄 자동 생성 예정: <b>+${remainingCnt}개</b></span>
       </div>
       <div style="width:100%; height:10px; background:rgba(15,23,42,0.8); border-radius:999px; overflow:hidden; border:1px solid rgba(148,163,184,0.25);">
@@ -815,7 +905,33 @@ function renderConfig(cfg, loopStats = null) {
   if (activeId !== "cfgUiRefreshSec") document.getElementById("cfgUiRefreshSec").value = cfg.uiRefreshIntervalSec ?? 5;
   if (activeId !== "cfgPostCreateDelaySec") document.getElementById("cfgPostCreateDelaySec").value = cfg.postCreateApproveDelaySec ?? 2;
   if (activeId !== "cfgPostCreateRetries") document.getElementById("cfgPostCreateRetries").value = cfg.postCreateApproveRetries ?? 12;
+  const smartGuardEl = document.getElementById("cfgSmartLoadGuardEnabled");
+  if (smartGuardEl) smartGuardEl.checked = cfg.smartLoadGuardEnabled !== false;
+  if (activeId !== "cfgMaxPendingWorkers" && document.getElementById("cfgMaxPendingWorkers")) {
+    document.getElementById("cfgMaxPendingWorkers").value = cfg.maxPendingWorkers ?? 2;
+  }
+  if (activeId !== "cfgApiLatencyWarnMs" && document.getElementById("cfgApiLatencyWarnMs")) {
+    document.getElementById("cfgApiLatencyWarnMs").value = cfg.apiLatencyWarnMs ?? 1800;
+  }
+  if (activeId !== "cfgApiLatencyCriticalMs" && document.getElementById("cfgApiLatencyCriticalMs")) {
+    document.getElementById("cfgApiLatencyCriticalMs").value = cfg.apiLatencyCriticalMs ?? 3500;
+  }
+  const stepCheckEl = document.getElementById("cfgStepByStepRunningCheck");
+  if (stepCheckEl) stepCheckEl.checked = cfg.stepByStepRunningCheck !== false;
   document.getElementById("cfgSchedulerEnabled").checked = Boolean(cfg.schedulerEnabled);
+
+  const loadGuardBadge = document.getElementById("loadGuardBadge");
+  if (loadGuardBadge) {
+    const lm = latestLoadMonitor || {};
+    if (cfg.smartLoadGuardEnabled === false) {
+      loadGuardBadge.className = "badge warn";
+      loadGuardBadge.textContent = "🛡️ 부하보호: OFF";
+    } else {
+      const lv = lm.loadLevel || "GREEN";
+      loadGuardBadge.className = lv === "GREEN" ? "badge ok" : lv === "RED" ? "badge err" : "badge warn";
+      loadGuardBadge.textContent = lm.loadBadgeText || `🛡️ 부하보호: ON (동시준비 ≤${cfg.maxPendingWorkers ?? 2}개)`;
+    }
+  }
 
   const jwtBadge = document.getElementById("jwtBadge");
   if (cfg.jwtInfo) {
@@ -872,12 +988,21 @@ async function saveConfig() {
       uiRefreshIntervalSec: Number(document.getElementById("cfgUiRefreshSec").value || 5),
       postCreateApproveDelaySec: Number(document.getElementById("cfgPostCreateDelaySec").value || 2),
       postCreateApproveRetries: Number(document.getElementById("cfgPostCreateRetries").value || 8),
+      smartLoadGuardEnabled: document.getElementById("cfgSmartLoadGuardEnabled")
+        ? document.getElementById("cfgSmartLoadGuardEnabled").checked
+        : true,
+      maxPendingWorkers: Number(document.getElementById("cfgMaxPendingWorkers")?.value || 2),
+      apiLatencyWarnMs: Number(document.getElementById("cfgApiLatencyWarnMs")?.value || 1800),
+      apiLatencyCriticalMs: Number(document.getElementById("cfgApiLatencyCriticalMs")?.value || 3500),
+      stepByStepRunningCheck: document.getElementById("cfgStepByStepRunningCheck")
+        ? document.getElementById("cfgStepByStepRunningCheck").checked
+        : true,
       schedulerEnabled: document.getElementById("cfgSchedulerEnabled").checked,
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
     applyUiRefreshInterval(payload.uiRefreshIntervalSec);
     showToast(
-      `✅ 설정 저장 완료! (GPU 체크: ${payload.checkIntervalSec}초 / Admin 승인 감시: ${payload.approvalCheckIntervalSec}초 / UI 새로고침: ${payload.uiRefreshIntervalSec}초)`
+      `✅ 설정 저장 완료! (GPU 체크: ${payload.checkIntervalSec}초 / 승인 감시: ${payload.approvalCheckIntervalSec}초 / 부하보호: ${payload.smartLoadGuardEnabled ? `ON(동시준비 ≤${payload.maxPendingWorkers}개)` : "OFF"})`
     );
     await loadServerState();
     if (payload.accessToken) {
@@ -885,6 +1010,31 @@ async function saveConfig() {
     }
   } catch (e) {
     alert("설정 저장 실패: " + e.message);
+  }
+}
+
+async function quickUpdateLoadGuard(patch = {}) {
+  try {
+    const res = await api("/api/load-guard", {
+      method: "POST",
+      body: JSON.stringify(patch),
+    });
+    if (res.loadMonitor) {
+      latestLoadMonitor = res.loadMonitor;
+    }
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+    }
+    showToast(
+      `🛡️ 스마트 부하 보호 설정 변경 완료! (${
+        res.config?.smartLoadGuardEnabled !== false
+          ? `ON · 최대 동시 준비 워커 ${res.config?.maxPendingWorkers || 2}개`
+          : "OFF"
+      })`
+    );
+    await loadServerState();
+  } catch (e) {
+    alert("스마트 부하 보호 설정 변경 실패: " + e.message);
   }
 }
 

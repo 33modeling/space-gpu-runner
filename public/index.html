@@ -39,6 +39,7 @@
       <span id="groupBadge" class="badge">Group ID: -</span>
       <span id="schedBadge" class="badge ok">스케줄러: ON</span>
       <span id="approvalLoopBadge" class="badge ok">Admin 자동승인: ON</span>
+      <span id="loadGuardBadge" class="badge ok">🛡️ 부하보호: 쾌적</span>
       <button class="secondary sm" onclick="discoverSpaceResources()">🔄 SPACE 리소스 동기화</button>
       <button class="success sm" onclick="triggerSchedulerTick()">⚡ 지금 즉시 주기 체크 &amp; 승인 실행</button>
       <button class="danger sm" onclick="lockDashboard()">🔒 화면 잠금</button>
@@ -134,6 +135,33 @@
               <span class="hint">초 ×</span>
               <input type="number" id="cfgPostCreateRetries" min="1" max="60" value="8" title="생성 후 연속 폴링 횟수" />
               <span class="hint">회</span>
+            </div>
+          </div>
+
+          <div class="form-group full" style="background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.35); border-radius:8px; padding:10px 12px; margin-top:4px;">
+            <label style="color:#6ee7b7; display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:700; margin-bottom:8px;">
+              <input type="checkbox" id="cfgSmartLoadGuardEnabled" checked />
+              🛡️ 서버/클러스터 무리 방지 스마트 부하 모니터링 &amp; 안전 페이싱 (`smartLoadGuardEnabled`)
+            </label>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:8px;">
+              <div>
+                <label style="font-size:11px; color:#94a3b8;">최대 동시 준비(Pending) 워커 상한</label>
+                <input type="number" id="cfgMaxPendingWorkers" min="1" max="32" value="2" title="Pending/Creating 상태인 워커가 이 개수 이상이면 Running 진입 전까지 추가 생성을 잠시 대기합니다" />
+              </div>
+              <div>
+                <label style="font-size:11px; color:#94a3b8;">API 지연 감속 기준 (주의 / 위험 ms)</label>
+                <div style="display:flex; gap:6px; align-items:center;">
+                  <input type="number" id="cfgApiLatencyWarnMs" min="300" max="15000" value="1800" title="주의 응답시간(ms)" />
+                  <span class="hint">/</span>
+                  <input type="number" id="cfgApiLatencyCriticalMs" min="500" max="30000" value="3500" title="위험 응답시간(ms)" />
+                </div>
+              </div>
+              <div style="display:flex; align-items:center; padding-top:14px;">
+                <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
+                  <input type="checkbox" id="cfgStepByStepRunningCheck" checked />
+                  선행 워커 장기 대기(45초+) 시 Running 확인 후 순차 할당
+                </label>
+              </div>
             </div>
           </div>
 
@@ -473,6 +501,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=9"></script>
+  <script src="/app.js?v=10"></script>
 </body>
 </html>
