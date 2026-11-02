@@ -157,6 +157,33 @@ function formatRelativeAgo(isoStr) {
   return `${hr}시간 ${min % 60}분 전`;
 }
 
+let lastSeenAlertId = null;
+
+function maybeTriggerBrowserAlert(alerts, cfg) {
+  if (!Array.isArray(alerts) || alerts.length === 0) return;
+  const newest = alerts[0];
+  if (!newest || !newest.id) return;
+  if (lastSeenAlertId === null) {
+    lastSeenAlertId = newest.id;
+    return;
+  }
+  if (newest.id === lastSeenAlertId) return;
+  lastSeenAlertId = newest.id;
+
+  showToast(`🔔 [${newest.title}] ${newest.message}`);
+  if (cfg?.browserNotifyEnabled !== false && "Notification" in window) {
+    if (Notification.permission === "granted") {
+      try {
+        new Notification(`SPACE GPU: ${newest.title}`, { body: newest.message });
+      } catch {
+        // ignore
+      }
+    } else if (Notification.permission !== "denied") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }
+}
+
 async function loadServerState() {
   if (!sessionPassword) return;
   try {
@@ -179,6 +206,7 @@ async function loadServerState() {
     if (data.loadMonitor || data.workerFleet?.loadMonitor) {
       latestLoadMonitor = data.loadMonitor || data.workerFleet?.loadMonitor;
     }
+    maybeTriggerBrowserAlert(data.alerts || data.workerFleet?.notifications?.alerts || [], data.config);
     renderTopAutoStatusBanner();
     renderConfig(data.config, data.approvalLoopStats);
     renderApprovalLoopStatus(data.approvalLoopStats, data.config);
@@ -556,24 +584,40 @@ function renderWorkerFleetBoard(fleet) {
   const maxVisualSlots = Math.min(Math.max(targetCnt, activeCnt), 256);
   const slotPills = [];
   const activeWorkers = jf.activeWorkers || [];
+  const wd = fleet.watchdog || {};
+  const ts = fleet.timeScale || {};
+  const hf = fleet.hybridFallback || {};
+  const shardingOn = Boolean(fleet.sharding?.injectWorkerEnv ?? serverState?.config?.injectWorkerEnv);
+  const notif = fleet.notifications || {};
+
   for (let i = 0; i < maxVisualSlots; i++) {
     const w = activeWorkers[i];
     if (w) {
       const stUpper = String(w.status || "").toUpperCase();
       const isRun = stUpper.includes("RUN");
-      const dot = isRun ? "🟢" : "⏳";
-      const bg = isRun ? "rgba(16,185,129,0.18)" : "rgba(245,158,11,0.20)";
-      const border = isRun ? "rgba(16,185,129,0.5)" : "rgba(245,158,11,0.5)";
-      const color = isRun ? "#6ee7b7" : "#fde68a";
+      const hasErr = Boolean(w.hasLogError);
+      const dot = hasErr ? "🚨" : isRun ? "🟢" : "⏳";
+      const bg = hasErr ? "rgba(239,68,68,0.22)" : isRun ? "rgba(16,185,129,0.18)" : "rgba(245,158,11,0.20)";
+      const border = hasErr ? "#f87171" : isRun ? "rgba(16,185,129,0.5)" : "rgba(245,158,11,0.5)";
+      const color = hasErr ? "#fecaca" : isRun ? "#6ee7b7" : "#fde68a";
       const srcTag = w.triggerSource === "auto_scheduler" ? "🤖자동" : "👆수동";
+      const slotNum = w.assignedSlot || i + 1;
       const reqTimeShort = w.autoApprovalRequestedAt ? formatPreciseTime(w.autoApprovalRequestedAt, false).slice(0, 8) : "";
       const doneTimeShort = w.approvedAt ? formatPreciseTime(w.approvedAt, false).slice(0, 8) : "";
+      const logLineShort = w.lastLogLine ? String(w.lastLogLine).slice(0, 44) : "";
       slotPills.push(`
         <span class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
-          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(String(w.id))}) · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))} (${w.approvalElapsedSec ?? 1.2}초)"
+          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(String(w.id))}) · 슬롯 #${slotNum} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:2px; padding:4px 8px; border-radius:6px; font-size:11px; background:${bg}; border:1px solid ${border}; color:${color}; font-weight:600;">
-          <span>${dot} 워커#${i + 1} <span style="opacity:0.88;">(#${escapeHtml(String(w.id))} · ${srcTag})</span></span>
-          ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인요청 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)}</span>` : ""}
+          <span>${dot} 슬롯#${slotNum} <span style="opacity:0.88;">(#${escapeHtml(String(w.id))} · ${srcTag})</span></span>
+          ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)}</span>` : ""}
+          ${
+            hasErr
+              ? `<span style="font-size:10px; color:#fca5a5;">🚨 에러감지: ${escapeHtml(w.logErrorKeyword || "Error")}</span>`
+              : logLineShort
+              ? `<span style="font-size:9.5px; color:#cbd5e1; max-width:190px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📝 ${escapeHtml(logLineShort)}</span>`
+              : ""
+          }
         </span>
       `);
     } else {
@@ -581,15 +625,48 @@ function renderWorkerFleetBoard(fleet) {
       const bg = isNext ? "rgba(59,130,246,0.22)" : "rgba(30,41,59,0.65)";
       const border = isNext ? "#60a5fa" : "rgba(148,163,184,0.25)";
       const color = isNext ? "#93c5fd" : "#94a3b8";
+      const nextSlotNum = isNext && jf.nextAssignedSlot ? jf.nextAssignedSlot : i + 1;
       slotPills.push(`
         <span class="mono"
           title="${isNext ? "다음 차례에 자동 생성될 워커 슬롯입니다" : "순차적으로 자동 생성 예정인 워커 슬롯입니다"}"
           style="display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:6px; font-size:11.5px; background:${bg}; border:1px dashed ${border}; color:${color};">
-          ${isNext ? "⚡" : "🔄"} 워커#${i + 1} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span>
+          ${isNext ? "⚡" : "🔄"} 슬롯#${nextSlotNum} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span>
         </span>
       `);
     }
   }
+
+  // Live 1-line Log Summary Rows for active workers that have scanned logs
+  const workersWithLogs = activeWorkers.filter((w) => w.lastLogLine);
+  const liveLogSummaryHtml =
+    workersWithLogs.length > 0
+      ? `
+      <div style="margin-top:10px; background:rgba(15,23,42,0.75); border:1px solid rgba(148,163,184,0.25); border-radius:8px; padding:8px 12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:6px;">
+          <span style="font-size:12px; font-weight:700; color:#93c5fd;">📝 가동 워커 실시간 로그 1줄 요약 보드 (${workersWithLogs.length}/${activeWorkers.length}개 스캔됨 · 클릭 시 전체 로그)</span>
+          <span class="mono" style="font-size:11px; color:#94a3b8;">Watchdog 자동교체: ${wd.zombieTerminatedCount || 0}건 · 로그에러 감지: ${wd.logErrorDetectedCount || 0}건</span>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:6px; max-height:110px; overflow-y:auto;">
+          ${workersWithLogs
+            .slice(0, 16)
+            .map(
+              (w) => `
+            <div class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
+              style="cursor:pointer; font-size:11px; padding:4px 8px; border-radius:5px; background:${
+                w.hasLogError ? "rgba(239,68,68,0.18)" : "rgba(30,41,59,0.7)"
+              }; border:1px solid ${
+                w.hasLogError ? "rgba(239,68,68,0.5)" : "rgba(148,163,184,0.2)"
+              }; display:flex; align-items:center; gap:6px; overflow:hidden;">
+              <span style="color:${w.hasLogError ? "#f87171" : "#34d399"}; font-weight:700; flex-shrink:0;">슬롯#${w.assignedSlot || w.slotIndex} (#${escapeHtml(String(w.id))})</span>
+              <span style="color:#e2e8f0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(w.lastLogLine)}</span>
+            </div>
+          `
+            )
+            .join("")}
+        </div>
+      </div>
+    `
+      : "";
 
   let statusHeadline = "";
   if (remainingCnt > 0) {
@@ -694,10 +771,49 @@ function renderWorkerFleetBoard(fleet) {
       </div>
     </div>
 
+    <!-- 🚀 6-in-1 Smart Operations & Bulk Control Toolbar -->
+    <div style="margin-bottom:10px; padding:9px 12px; border-radius:8px; background:rgba(15,23,42,0.72); border:1px solid rgba(59,130,246,0.35); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px;">
+        <button type="button" class="${wd.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ watchdogEnabled: ${wd.enabled === false ? "true" : "false"} })"
+          title="클릭하여 좀비/먹통 워커 자동 교체(Watchdog) 토글">
+          🧟 1.Watchdog: ${wd.enabled !== false ? `ON (${wd.maxPendingTimeoutMin || 20}분 · 교체 ${wd.zombieTerminatedCount || 0}건)` : "OFF"}
+        </button>
+        <button type="button" class="${shardingOn ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ injectWorkerEnv: ${shardingOn ? "false" : "true"} })"
+          title="클릭하여 워커별 고유 번호(WORKER_SLOT=1..N) 자동 환경변수 주입 토글">
+          🔢 3.WORKER_SLOT 주입: ${shardingOn ? "ON (자동 샤딩)" : "OFF ({{SLOT}} 치환만)"}
+        </button>
+        <button type="button" class="${hf.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ hybridFallbackEnabled: ${hf.enabled === false ? "true" : "false"} })"
+          title="Standard GPU 부족/실패 시 Spot으로(또는 반대로) 자동 폴백">
+          🔄 4.Spot↔Std 폴백: ${hf.enabled !== false ? `ON (폴백 ${hf.fallbackTriggeredCount || 0}회)` : "OFF"}
+        </button>
+        <button type="button" class="${ts.enabled ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ timeScaleEnabled: ${ts.enabled ? "false" : "true"} })"
+          title="주간(${ts.dayTarget || 20}개) / 야간(${ts.nightTarget || 48}개) / 주말(${ts.weekendTarget || 64}개) 목표 워커 수 자동 전환">
+          🌙 5.야간·주말 부스트: ${ts.enabled ? `ON (${escapeHtml(ts.periodLabel || "")} → ${ts.desiredTarget}개)` : `OFF (주${ts.dayTarget || 20}/야${ts.nightTarget || 48}/주말${ts.weekendTarget || 64})`}
+        </button>
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px;"
+          onclick="testAlertNotification()"
+          title="브라우저 데스크톱 알림 및 Webhook 즉시 테스트">
+          🔔 6.알림센터 (${notif.webhookConfigured ? "Webhook+브라우저" : "브라우저 알림"} · ${notif.alerts?.length || 0}건)
+        </button>
+      </div>
+      <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+        <span style="font-size:11px; color:#94a3b8; font-weight:700;">🎛️ 2.일괄제어:</span>
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px;" onclick="bulkControlWorkers('scan_logs')">🔍 전체 워커 최신 로그 스캔</button>
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px; border-color:rgba(245,158,11,0.5); color:#fde68a;" onclick="bulkControlWorkers('stop_pending')">⏳ Pending(${pendingCnt}개) 일괄 취소</button>
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px; border-color:rgba(59,130,246,0.5); color:#93c5fd;" onclick="bulkControlWorkers('rolling_restart', { batchSize: 1 })">🔄 1개씩 무중단 롤링 재시작</button>
+        <button type="button" class="danger sm" style="padding:3px 8px; font-size:11px;" onclick="bulkControlWorkers('stop_all')">🛑 전체 워커 일괄 종료</button>
+      </div>
+    </div>
+
     <!-- Slot Pills Grid -->
-    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:135px; overflow-y:auto; padding-top:4px;">
+    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:145px; overflow-y:auto; padding-top:4px;">
       ${slotPills.join("")}
     </div>
+    ${liveLogSummaryHtml}
   `;
 
   updateWorkerCountdownBadge();
@@ -918,6 +1034,36 @@ function renderConfig(cfg, loopStats = null) {
   }
   const stepCheckEl = document.getElementById("cfgStepByStepRunningCheck");
   if (stepCheckEl) stepCheckEl.checked = cfg.stepByStepRunningCheck !== false;
+
+  // Features 1–6 Config Inputs
+  const wdEl = document.getElementById("cfgWatchdogEnabled");
+  if (wdEl) wdEl.checked = cfg.watchdogEnabled !== false;
+  if (activeId !== "cfgMaxPendingTimeoutMin" && document.getElementById("cfgMaxPendingTimeoutMin")) {
+    document.getElementById("cfgMaxPendingTimeoutMin").value = cfg.maxPendingTimeoutMin ?? 20;
+  }
+  const logRestartEl = document.getElementById("cfgLogErrorAutoRestart");
+  if (logRestartEl) logRestartEl.checked = Boolean(cfg.logErrorAutoRestart);
+  const injEnvEl = document.getElementById("cfgInjectWorkerEnv");
+  if (injEnvEl) injEnvEl.checked = Boolean(cfg.injectWorkerEnv);
+  const hybEl = document.getElementById("cfgHybridFallbackEnabled");
+  if (hybEl) hybEl.checked = cfg.hybridFallbackEnabled !== false;
+  const tsEl = document.getElementById("cfgTimeScaleEnabled");
+  if (tsEl) tsEl.checked = Boolean(cfg.timeScaleEnabled);
+  if (activeId !== "cfgDayTargetWorkers" && document.getElementById("cfgDayTargetWorkers")) {
+    document.getElementById("cfgDayTargetWorkers").value = cfg.dayTargetWorkers ?? 20;
+  }
+  if (activeId !== "cfgNightTargetWorkers" && document.getElementById("cfgNightTargetWorkers")) {
+    document.getElementById("cfgNightTargetWorkers").value = cfg.nightTargetWorkers ?? 48;
+  }
+  if (activeId !== "cfgWeekendTargetWorkers" && document.getElementById("cfgWeekendTargetWorkers")) {
+    document.getElementById("cfgWeekendTargetWorkers").value = cfg.weekendTargetWorkers ?? 64;
+  }
+  if (activeId !== "cfgWebhookUrl" && document.getElementById("cfgWebhookUrl")) {
+    document.getElementById("cfgWebhookUrl").value = cfg.webhookUrl || "";
+  }
+  const bNotifEl = document.getElementById("cfgBrowserNotifyEnabled");
+  if (bNotifEl) bNotifEl.checked = cfg.browserNotifyEnabled !== false;
+
   document.getElementById("cfgSchedulerEnabled").checked = Boolean(cfg.schedulerEnabled);
 
   const loadGuardBadge = document.getElementById("loadGuardBadge");
@@ -997,6 +1143,29 @@ async function saveConfig() {
       stepByStepRunningCheck: document.getElementById("cfgStepByStepRunningCheck")
         ? document.getElementById("cfgStepByStepRunningCheck").checked
         : true,
+      watchdogEnabled: document.getElementById("cfgWatchdogEnabled")
+        ? document.getElementById("cfgWatchdogEnabled").checked
+        : true,
+      maxPendingTimeoutMin: Number(document.getElementById("cfgMaxPendingTimeoutMin")?.value || 20),
+      logErrorAutoRestart: document.getElementById("cfgLogErrorAutoRestart")
+        ? document.getElementById("cfgLogErrorAutoRestart").checked
+        : true,
+      injectWorkerEnv: document.getElementById("cfgInjectWorkerEnv")
+        ? document.getElementById("cfgInjectWorkerEnv").checked
+        : false,
+      hybridFallbackEnabled: document.getElementById("cfgHybridFallbackEnabled")
+        ? document.getElementById("cfgHybridFallbackEnabled").checked
+        : true,
+      timeScaleEnabled: document.getElementById("cfgTimeScaleEnabled")
+        ? document.getElementById("cfgTimeScaleEnabled").checked
+        : false,
+      dayTargetWorkers: Number(document.getElementById("cfgDayTargetWorkers")?.value || 20),
+      nightTargetWorkers: Number(document.getElementById("cfgNightTargetWorkers")?.value || 48),
+      weekendTargetWorkers: Number(document.getElementById("cfgWeekendTargetWorkers")?.value || 64),
+      webhookUrl: document.getElementById("cfgWebhookUrl")?.value || "",
+      browserNotifyEnabled: document.getElementById("cfgBrowserNotifyEnabled")
+        ? document.getElementById("cfgBrowserNotifyEnabled").checked
+        : true,
       schedulerEnabled: document.getElementById("cfgSchedulerEnabled").checked,
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
@@ -1010,6 +1179,82 @@ async function saveConfig() {
     }
   } catch (e) {
     alert("설정 저장 실패: " + e.message);
+  }
+}
+
+async function quickUpdateAutomation(patch = {}) {
+  try {
+    const res = await api("/api/automation/quick-update", {
+      method: "POST",
+      body: JSON.stringify(patch),
+    });
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+    showToast("⚡ 스마트 자동화 설정이 즉시 반영되었습니다!");
+    await loadServerState();
+  } catch (e) {
+    alert("스마트 자동화 설정 변경 실패: " + e.message);
+  }
+}
+
+async function bulkControlWorkers(action, extra = {}) {
+  try {
+    if (action === "stop_all") {
+      const ok = confirm("정말 현재 가동 중인 모든 워커를 일괄 종료하시겠습니까? (주기적 자동 생성도 함께 일시정지됩니다)");
+      if (!ok) return;
+    } else if (action === "stop_pending") {
+      const ok = confirm("현재 Pending / 준비 대기 중인 워커들을 모두 취소하시겠습니까?");
+      if (!ok) return;
+    } else if (action === "rolling_restart") {
+      showToast("🔄 가장 오래된 Running 워커 1개를 종료하고 최신 스크립트로 무중단 교체합니다...");
+    } else if (action === "scan_logs") {
+      showToast("🔍 가동 중인 모든 워커의 최신 로그(마지막 30줄) 및 에러 여부를 스캔합니다...");
+    }
+
+    const res = await api("/api/space/runs/bulk-action", {
+      method: "POST",
+      body: JSON.stringify({ action, ...extra }),
+    });
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+    if (action === "scan_logs") {
+      showToast(`✅ 워커 ${res.scannedCount || 0}개의 실시간 로그 스캔 완료!`);
+    } else if (action === "rolling_restart") {
+      showToast(`🔄 롤링 재시작: 워커 ${res.terminatedCount || 0}개 종료 완료 → 곧 새 워커가 자동 생성됩니다.`);
+    } else if (action === "stop_pending") {
+      showToast(`⏳ Pending 워커 ${res.terminatedCount || 0}개 일괄 취소 완료!`);
+    } else if (action === "stop_all") {
+      showToast(`🛑 전체 워커 ${res.terminatedCount || 0}개 일괄 종료 완료!`);
+    }
+    await loadServerState();
+    await loadSpaceRuns();
+  } catch (e) {
+    alert("워커 일괄 제어 실패: " + e.message);
+  }
+}
+
+async function testAlertNotification() {
+  try {
+    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+      await Notification.requestPermission().catch(() => {});
+    }
+    const webhookUrl = document.getElementById("cfgWebhookUrl")?.value || "";
+    const res = await api("/api/notifications/test", {
+      method: "POST",
+      body: JSON.stringify({ webhookUrl }),
+    });
+    if (res.alert) {
+      lastSeenAlertId = null; // allow immediate browser notification
+      maybeTriggerBrowserAlert([res.alert], serverState?.config || { browserNotifyEnabled: true });
+    }
+    showToast(`🔔 알림 테스트 발송 완료! ${webhookUrl ? "(Webhook + 브라우저 데스크톱 알림)" : "(브라우저 데스크톱 알림)"}`);
+    await loadServerState();
+  } catch (e) {
+    alert("알림 테스트 실패: " + e.message);
   }
 }
 

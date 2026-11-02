@@ -48,6 +48,30 @@ const DEFAULT_STATE = {
     apiLatencyWarnMs: 1800, // Stretch cooldown by 1.5x when avg API latency exceeds this
     apiLatencyCriticalMs: 3500, // Stretch cooldown by 2.5x or hold when avg API latency exceeds this
     adaptivePollingEnabled: true, // Reduce redundant polling & cache API bursts
+    // 1️⃣ 🧟 Zombie / Stuck Worker Watchdog & Live Log Scanner settings
+    watchdogEnabled: true,
+    maxPendingTimeoutMin: 20, // Auto-cancel & replace Pending/Creating workers stuck longer than N minutes
+    logErrorAutoRestart: false, // Auto-terminate & replace Running workers when fatal log error is detected
+    customErrorKeywords: "CUDA out of memory,NCCL error,Segmentation fault,Bus error",
+    // 3️⃣ 🔢 Auto-Sharding Worker Slot Environment Variable Injection
+    injectWorkerEnv: false, // Prepend `export WORKER_SLOT=... WORKER_INDEX=... WORKER_TOTAL=...;`
+    // 4️⃣ 🔄 Spot <-> Standard Hybrid Auto-Fallback
+    hybridFallbackEnabled: true, // Auto-fallback between Spot and Standard (or fallbackCoreId) on allocation failure/shortage
+    fallbackCoreId: "",
+    // 5️⃣ 🌙 Time-of-Day / Weekend Auto-Scaling Boost
+    timeScaleEnabled: false,
+    dayTargetWorkers: 20,
+    nightTargetWorkers: 48,
+    weekendTargetWorkers: 64,
+    nightStartHour: 20, // 20:00 KST
+    nightEndHour: 8, // 08:00 KST
+    // 6️⃣ 🔔 Webhook (Slack/Discord/Telegram) & Browser Alert Notification settings
+    webhookUrl: "",
+    browserNotifyEnabled: true,
+    notifyOnTokenExpiring: true,
+    notifyOnZombieTerminated: true,
+    notifyOnTargetReached: true,
+    notifyOnError: true,
   },
   jobs: [
     {
@@ -80,6 +104,7 @@ const DEFAULT_STATE = {
   ],
   history: [],
   approvalHistory: [],
+  alerts: [],
 };
 
 function isApprovalOrAllocationLogMessage(msg = "") {
@@ -100,6 +125,7 @@ function loadState() {
       const rawApprovalHistory = Array.isArray(raw.approvalHistory)
         ? raw.approvalHistory.slice(0, 300)
         : rawHistory.filter((h) => h && isApprovalOrAllocationLogMessage(h.message)).slice(0, 300);
+      const rawAlerts = Array.isArray(raw.alerts) ? raw.alerts.slice(0, 100) : [];
       return {
         config: { ...DEFAULT_STATE.config, ...(raw.config || {}) },
         jobs: Array.isArray(raw.jobs)
@@ -107,6 +133,7 @@ function loadState() {
           : DEFAULT_STATE.jobs,
         history: rawHistory,
         approvalHistory: rawApprovalHistory,
+        alerts: rawAlerts,
       };
     }
   } catch (e) {
@@ -1595,7 +1622,347 @@ function normalizeExecutionCommand(rawCmd) {
   return result.trim();
 }
 
-async function buildRunPayload(job) {
+/**
+ * ============================================================================
+ * 🚀 Features 1–6: Watchdog, Live Log Snippets, Auto-Sharding (`WORKER_SLOT`),
+ *    Spot↔Standard Hybrid Fallback, Time-of-Day Auto-Scaling, & Alert Center
+ * ============================================================================
+ */
+const DEFAULT_ERROR_KEYWORDS = [
+  "CUDA out of memory",
+  "OutOfMemoryError",
+  "RuntimeError: CUDA error",
+  "NCCL error",
+  "Segmentation fault",
+  "Bus error",
+  "Killed",
+];
+
+const watchdogStats = {
+  lastSweepAt: null,
+  zombieTerminatedCount: 0,
+  logErrorDetectedCount: 0,
+  logErrorRestartedCount: 0,
+  lastActionMessage: null,
+  workerLogSnippets: {}, // runId -> { lastLine, hasError, matchedKeyword, updatedAt }
+  roundRobinIndex: 0,
+};
+
+const hybridFallbackStats = {
+  fallbackTriggeredCount: 0,
+  lastFallbackAt: null,
+  lastFallbackReason: null,
+  lastFallbackMode: null,
+};
+
+const recentAlertDedupeMap = new Map(); // key -> timestampMs
+let lastTokenExpiryAlertBucket = null;
+
+async function pushAlertNotification(level, title, message, meta = {}) {
+  const now = Date.now();
+  const dedupeKey = `${level}:${title}:${meta.dedupeKey || message}`;
+  const prevTs = recentAlertDedupeMap.get(dedupeKey) || 0;
+  if (now - prevTs < 60 * 1000) {
+    return null;
+  }
+  recentAlertDedupeMap.set(dedupeKey, now);
+
+  const alertEntry = {
+    id: `alert-${now}-${Math.random().toString(36).slice(2, 7)}`,
+    time: new Date(now).toISOString(),
+    level, // info | success | warn | error
+    title,
+    message,
+    meta,
+  };
+
+  if (!Array.isArray(state.alerts)) state.alerts = [];
+  state.alerts.unshift(alertEntry);
+  if (state.alerts.length > 100) state.alerts = state.alerts.slice(0, 100);
+  saveState();
+
+  const webhookUrl = String(state.config.webhookUrl || "").trim();
+  if (webhookUrl && /^https?:\/\//i.test(webhookUrl)) {
+    const emoji = level === "error" ? "🚨" : level === "warn" ? "⚠️" : level === "success" ? "✅" : "🔔";
+    const textBody = `${emoji} **[SPACE GPU Auto-Allocator] ${title}**\n${message}`;
+    fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: textBody,
+        content: textBody,
+        title,
+        message,
+        level,
+        time: alertEntry.time,
+        meta,
+      }),
+    }).catch(() => {});
+  }
+
+  return alertEntry;
+}
+
+/**
+ * Feature 5: KST Time-of-Day & Weekend Auto-Scaling (`timeScale`)
+ */
+function computeTimeScaleStatus() {
+  const enabled = Boolean(state.config.timeScaleEnabled);
+  const dayTarget = Math.max(1, Number(state.config.dayTargetWorkers || 20));
+  const nightTarget = Math.max(1, Number(state.config.nightTargetWorkers || 48));
+  const weekendTarget = Math.max(1, Number(state.config.weekendTargetWorkers || 64));
+  const nightStartHour = Math.max(0, Math.min(23, Number(state.config.nightStartHour ?? 20)));
+  const nightEndHour = Math.max(0, Math.min(23, Number(state.config.nightEndHour ?? 8)));
+
+  const kstDate = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const kstDay = kstDate.getUTCDay(); // 0=Sun, 6=Sat
+  const kstHour = kstDate.getUTCHours();
+  const kstMin = kstDate.getUTCMinutes();
+  const isWeekend = kstDay === 0 || kstDay === 6;
+  const isNight =
+    nightStartHour > nightEndHour
+      ? kstHour >= nightStartHour || kstHour < nightEndHour
+      : kstHour >= nightStartHour && kstHour < nightEndHour;
+
+  let activePeriod = "DAY";
+  let periodLabel = "☀️ 주간 평일 모드";
+  let desiredTarget = dayTarget;
+  if (isWeekend) {
+    activePeriod = "WEEKEND";
+    periodLabel = "🎉 주말 풀부스트 모드";
+    desiredTarget = weekendTarget;
+  } else if (isNight) {
+    activePeriod = "NIGHT";
+    periodLabel = `🌙 야간 부스트 모드 (${String(nightStartHour).padStart(2, "0")}:00~${String(nightEndHour).padStart(2, "0")}:00)`;
+    desiredTarget = nightTarget;
+  } else {
+    periodLabel = `☀️ 주간 평일 모드 (${String(nightEndHour).padStart(2, "0")}:00~${String(nightStartHour).padStart(2, "0")}:00)`;
+  }
+
+  return {
+    enabled,
+    activePeriod,
+    periodLabel,
+    desiredTarget,
+    dayTarget,
+    nightTarget,
+    weekendTarget,
+    nightStartHour,
+    nightEndHour,
+    kstTimeStr: `${String(kstHour).padStart(2, "0")}:${String(kstMin).padStart(2, "0")} KST`,
+    isWeekend,
+    isNight,
+  };
+}
+
+function applyTimeScaleToJobs() {
+  const ts = computeTimeScaleStatus();
+  if (!ts.enabled) return ts;
+  let changed = false;
+  for (const job of state.jobs) {
+    if (Number(job.minConcurrentRuns) !== ts.desiredTarget) {
+      const prev = job.minConcurrentRuns;
+      job.minConcurrentRuns = ts.desiredTarget;
+      changed = true;
+      addLog(
+        "info",
+        `🌙 [시간대별 자동 스케일링] ${ts.periodLabel} (${ts.kstTimeStr}) 적용 → [${job.name}] 목표 워커 수 ${prev}개 ➔ ${ts.desiredTarget}개로 자동 전환`
+      );
+    }
+  }
+  if (changed) saveState();
+  return ts;
+}
+
+/**
+ * Feature 3: Pick lowest missing Worker Slot Index (1..targetCount)
+ * and extract assigned slot from containerName or command if present.
+ */
+function extractAssignedSlotFromRun(run) {
+  const name = String(run?.containerName || run?.name || "");
+  const mName = name.match(/-s(\d{1,3})-/i);
+  if (mName) return Number(mName[1]);
+  const cmd = String(run?.executionCommand || "");
+  const mCmd = cmd.match(/WORKER_SLOT=(\d+)/);
+  if (mCmd) return Number(mCmd[1]);
+  return null;
+}
+
+function pickNextWorkerSlot(job, activeRuns, targetCount) {
+  const usedSlots = new Set();
+  activeRuns.forEach((r, idx) => {
+    const slot = extractAssignedSlotFromRun(r);
+    if (slot && slot >= 1) {
+      usedSlots.add(slot);
+    } else {
+      usedSlots.add(idx + 1);
+    }
+  });
+  for (let s = 1; s <= Math.max(targetCount, activeRuns.length + 1); s++) {
+    if (!usedSlots.has(s)) return s;
+  }
+  return activeRuns.length + 1;
+}
+
+/**
+ * Feature 1 & 2: Round-Robin Live Worker Log Scanner & Fatal Error Detector
+ * Checks 1~2 Running workers per scheduler tick (or all when requested manually)
+ * so SPACE API load stays minimal.
+ */
+async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
+  const runsList = Array.isArray(allRuns) ? allRuns : [];
+  const runningRuns = runsList.filter(
+    (r) =>
+      classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
+      String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  if (runningRuns.length === 0) return { scannedCount: 0, snippets: watchdogStats.workerLogSnippets };
+
+  const customKw = String(state.config.customErrorKeywords || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const allKeywords = [...new Set([...DEFAULT_ERROR_KEYWORDS, ...customKw])];
+
+  const batchSize = options.scanAll ? Math.min(runningRuns.length, 16) : Math.min(runningRuns.length, 2);
+  let scannedCount = 0;
+
+  for (let i = 0; i < batchSize; i++) {
+    const idx = (watchdogStats.roundRobinIndex + i) % runningRuns.length;
+    const run = runningRuns[idx];
+    const rId = String(run.id ?? run.runId ?? "");
+    if (!rId) continue;
+
+    // Skip if scanned within the last 20s unless scanAll=true
+    const existing = watchdogStats.workerLogSnippets[rId];
+    if (!options.scanAll && existing?.updatedAt && Date.now() - new Date(existing.updatedAt).getTime() < 20000) {
+      continue;
+    }
+
+    try {
+      const logRaw = await spaceApi.getRunLog(rId, { tailLines: 30 });
+      const text = typeof logRaw === "string" ? logRaw : JSON.stringify(logRaw || "");
+      const lines = text
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const lastLine = lines.length > 0 ? lines[lines.length - 1].slice(0, 180) : "(로그 출력 대기 중)";
+      let matchedKeyword = null;
+      for (const kw of allKeywords) {
+        if (kw && text.toLowerCase().includes(kw.toLowerCase())) {
+          matchedKeyword = kw;
+          break;
+        }
+      }
+      const hasError = Boolean(matchedKeyword);
+      const prevHadError = Boolean(existing?.hasError);
+      watchdogStats.workerLogSnippets[rId] = {
+        runId: rId,
+        runName: run.containerName || run.name || `#${rId}`,
+        lastLine,
+        hasError,
+        matchedKeyword,
+        updatedAt: new Date().toISOString(),
+      };
+      scannedCount += 1;
+
+      if (hasError && !prevHadError) {
+        watchdogStats.logErrorDetectedCount += 1;
+        const rName = run.containerName || run.name || `#${rId}`;
+        addLog("warn", `🧟 [워커 로그 에러 감지] ${rName} (#${rId})에서 '${matchedKeyword}' 감지: ${lastLine}`, {
+          runId: rId,
+          runName: rName,
+          matchedKeyword,
+          lastLine,
+        });
+        if (state.config.notifyOnError !== false) {
+          await pushAlertNotification(
+            "warn",
+            `워커 로그 치명적 에러 감지 (${rName})`,
+            `워커 #${rId} (${rName}) 로그에서 '${matchedKeyword}' 패턴이 감지되었습니다.\n최근 로그: ${lastLine}`,
+            { runId: rId, matchedKeyword, dedupeKey: `logerr-${rId}-${matchedKeyword}` }
+          );
+        }
+        if (state.config.watchdogEnabled !== false && state.config.logErrorAutoRestart) {
+          try {
+            await spaceApi.terminateRun(rId);
+            watchdogStats.logErrorRestartedCount += 1;
+            watchdogStats.lastActionMessage = `로그 에러(${matchedKeyword}) 워커 #${rId} 자동 종료 후 재생성 대기`;
+            addLog(
+              "warn",
+              `🔄 [Watchdog 자동 교체] 치명적 로그 에러(${matchedKeyword})가 발생한 ${rName} (#${rId})를 자동 종료했습니다. 다음 주기에 새 워커로 교체됩니다.`
+            );
+          } catch (termErr) {
+            addLog("error", `[Watchdog] 에러 워커 #${rId} 종료 실패: ${termErr.message}`);
+          }
+        }
+      }
+    } catch {
+      // ignore transient log fetch errors
+    }
+  }
+
+  watchdogStats.roundRobinIndex = (watchdogStats.roundRobinIndex + batchSize) % Math.max(1, runningRuns.length);
+  return { scannedCount, snippets: watchdogStats.workerLogSnippets };
+}
+
+/**
+ * Feature 1: Zombie / Stuck Pending Worker Watchdog Sweep
+ * Automatically terminates non-Running active workers (`Pending`/`Creating`/`Approved`)
+ * stuck longer than `maxPendingTimeoutMin` minutes so the scheduler spawns a fresh worker.
+ */
+async function runWatchdogSweep(allRuns = lastKnownRuns) {
+  watchdogStats.lastSweepAt = new Date().toISOString();
+  if (state.config.watchdogEnabled === false) return { terminatedIds: [] };
+
+  const maxPendingMin = Math.max(3, Number(state.config.maxPendingTimeoutMin || 20));
+  const maxPendingMs = maxPendingMin * 60 * 1000;
+  const now = Date.now();
+  const runsList = Array.isArray(allRuns) ? allRuns : [];
+
+  const nonRunningActive = runsList.filter(
+    (r) =>
+      classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
+      !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+
+  const terminatedIds = [];
+  for (const r of nonRunningActive) {
+    const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+    if (!startMs || Number.isNaN(startMs)) continue;
+    const stuckMs = now - startMs;
+    if (stuckMs >= maxPendingMs) {
+      const rId = String(r.id ?? r.runId ?? "");
+      const rName = r.containerName || r.name || `#${rId}`;
+      const stuckMin = Math.round(stuckMs / 60000);
+      try {
+        await spaceApi.terminateRun(rId);
+        terminatedIds.push(rId);
+        watchdogStats.zombieTerminatedCount += 1;
+        watchdogStats.lastActionMessage = `먹통 Pending 워커 ${rName} (#${rId}, ${stuckMin}분 경과) 자동 종료`;
+        addLog(
+          "warn",
+          `🧟 [Watchdog 좀비 워커 자동 정리] ${rName} (#${rId})가 ${stuckMin}분째 '${r.status || r.state}' 상태로 멈춰 있어 자동 종료했습니다. 새 워커로 교체합니다.`,
+          { runId: rId, runName: rName, stuckMin }
+        );
+        if (state.config.notifyOnZombieTerminated !== false) {
+          await pushAlertNotification(
+            "warn",
+            `좀비 Pending 워커 자동 교체 (${rName})`,
+            `${rName} (#${rId}) 워커가 ${stuckMin}분 동안 Running으로 진입하지 못해 자동 종료 후 재할당합니다.`,
+            { runId: rId, stuckMin, dedupeKey: `zombie-${rId}` }
+          );
+        }
+      } catch (e) {
+        addLog("error", `[Watchdog] 먹통 워커 #${rId} 자동 종료 실패: ${e.message}`);
+      }
+    }
+  }
+
+  return { terminatedIds };
+}
+
+async function buildRunPayload(job, options = {}) {
   await ensureGroupIdConfigured();
 
   let specData = null;
@@ -1605,14 +1972,18 @@ async function buildRunPayload(job) {
   }
 
   const allowSpot =
-    job.allowSpot !== undefined ? Boolean(job.allowSpot) : Boolean(specData?.isSpot || specData?.allowSpot);
+    options.overrideAllowSpot !== undefined
+      ? Boolean(options.overrideAllowSpot)
+      : job.allowSpot !== undefined
+      ? Boolean(job.allowSpot)
+      : Boolean(specData?.isSpot || specData?.allowSpot);
   let groupPoolId = Number(job.groupPoolId || specData?.groupPoolId || specData?.poolId || 0);
-  let coreId = Number(job.coreId || specData?.coreId || 0);
+  let coreId = Number(options.overrideCoreId || job.coreId || specData?.coreId || 0);
   const coreCount = Number(job.coreCount || specData?.coreNum || specData?.coreCount || 1);
   const quotaIdRaw = job.quotaId || specData?.quotaId;
   let quotaId = quotaIdRaw !== undefined && quotaIdRaw !== "" && quotaIdRaw !== null ? Number(quotaIdRaw) : undefined;
   let containerImage = String(job.containerImage || specData?.image || specData?.containerImage || "").trim();
-  const executionCommand = normalizeExecutionCommand(job.executionCommand || specData?.execCommand || "");
+  const rawExecutionCommand = normalizeExecutionCommand(job.executionCommand || specData?.execCommand || "");
 
   // Auto-discover Group Pool ID & Core ID if user left them blank!
   if ((!allowSpot && !groupPoolId) || !coreId) {
@@ -1696,7 +2067,10 @@ async function buildRunPayload(job) {
   if (!coreId) throw new Error("GPU Core ID(coreId)를 찾을 수 없습니다. 상단 [SPACE에서 내 그룹 / GPU Pool / Spec 목록 자동 불러오기]를 눌러주세요.");
   if (!allowSpot && !groupPoolId) throw new Error("Group Pool ID(groupPoolId)를 찾을 수 없습니다. 상단 [SPACE에서 내 그룹 / GPU Pool / Spec 목록 자동 불러오기]를 눌러주세요.");
   if (!containerImage) throw new Error("컨테이너 이미지(containerImage)가 설정되지 않았습니다.");
-  if (!executionCommand) throw new Error("실행할 스크립트 명령어(executionCommand)가 비어 있습니다.");
+  if (!rawExecutionCommand) throw new Error("실행할 스크립트 명령어(executionCommand)가 비어 있습니다.");
+
+  const slotIndex = Math.max(1, Number(options.slotIndex || 1));
+  const targetCount = Math.max(1, Number(options.targetCount || job.minConcurrentRuns || 1));
 
   const kstDate = new Date(Date.now() + 9 * 60 * 60 * 1000);
   const mm = String(kstDate.getUTCMonth() + 1).padStart(2, "0");
@@ -1715,8 +2089,21 @@ async function buildRunPayload(job) {
   const cleanPrefix = String(job.name || "gpu-job")
     .replace(/[^a-zA-Z0-9-]/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 32);
-  const containerName = `${cleanPrefix}-${suffix}`;
+    .slice(0, 28);
+  const slotTag = `s${String(slotIndex).padStart(2, "0")}`;
+  const containerName = `${cleanPrefix}-${slotTag}-${suffix}`;
+
+  // Feature 3: Replace template placeholders (`{{SLOT}}`, `{{INDEX}}`, `{{TOTAL}}`, `{{NAME}}`) & optionally inject `WORKER_SLOT` env vars
+  let executionCommand = rawExecutionCommand
+    .replace(/\{\{\s*(?:WORKER_)?SLOT\s*\}\}/gi, String(slotIndex))
+    .replace(/\{\{\s*(?:WORKER_)?INDEX\s*\}\}/gi, String(slotIndex - 1))
+    .replace(/\{\{\s*(?:WORKER_)?TOTAL\s*\}\}/gi, String(targetCount))
+    .replace(/\{\{\s*(?:WORKER_)?NAME\s*\}\}/gi, containerName);
+
+  const shouldInjectWorkerEnv = Boolean(job.injectWorkerEnv ?? state.config.injectWorkerEnv);
+  if (shouldInjectWorkerEnv && !executionCommand.includes("WORKER_SLOT=")) {
+    executionCommand = `export WORKER_SLOT=${slotIndex} WORKER_INDEX=${slotIndex - 1} WORKER_TOTAL=${targetCount} WORKER_NAME="${containerName}"; ${executionCommand}`;
+  }
 
   const enabledRunFeatures = [];
   if (job.enableWebConsole !== false) {
@@ -2040,8 +2427,13 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       const rId = String(r.id ?? r.runId ?? "");
       const rName = String(r.containerName ?? r.name ?? `worker-${idx + 1}`);
       const tl = timelineByRunId.get(rId) || timelineByName.get(rName) || null;
+      const snippet = watchdogStats.workerLogSnippets[rId] || null;
+      const assignedSlot = extractAssignedSlotFromRun(r) || idx + 1;
+      const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+      const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
       return {
         slotIndex: idx + 1,
+        assignedSlot,
         id: r.id ?? r.runId,
         name: rName,
         status: st,
@@ -2050,6 +2442,7 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
         coreCount: Number(r.coreCount ?? r.coreNum ?? coreCountPerWorker),
         ip: r.ip || "-",
         startTime: r.startTime || null,
+        elapsedSec,
         approvalStatus: r.approvalStatus || tl?.approvalStatus || (isRunning ? "approved" : "pending"),
         allocationRequestedAt: tl?.allocationRequestedAt || r.startTime || null,
         createdAt: tl?.createdAt || r.startTime || null,
@@ -2057,8 +2450,14 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
         approvedAt: tl?.approvedAt || null,
         approvalElapsedSec: tl?.approvalElapsedSec ?? null,
         triggerSource: tl?.triggerSource || "auto",
+        lastLogLine: snippet?.lastLine || null,
+        lastLogUpdatedAt: snippet?.updatedAt || null,
+        hasLogError: Boolean(snippet?.hasError),
+        logErrorKeyword: snippet?.matchedKeyword || null,
       };
     });
+
+    const nextAssignedSlot = pickNextWorkerSlot(job, activeRuns, targetCount);
 
     return {
       jobId: job.id,
@@ -2068,6 +2467,8 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       coreId: job.coreId,
       coreCountPerWorker,
       executionCommand: job.executionCommand,
+      injectWorkerEnv: Boolean(job.injectWorkerEnv ?? state.config.injectWorkerEnv),
+      nextAssignedSlot,
       targetCount,
       activeCount,
       runningCount,
@@ -2088,6 +2489,8 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     };
   });
 
+  const timeScaleStatus = computeTimeScaleStatus();
+
   return {
     updatedAt: lastKnownRunsAt || new Date().toISOString(),
     schedulerEnabled: Boolean(state.config.schedulerEnabled),
@@ -2106,6 +2509,37 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     jobs: jobFleetList,
     autoApprovalTimeline: timelineList.slice(0, 40),
     loadMonitor: loadStatus,
+    watchdog: {
+      enabled: state.config.watchdogEnabled !== false,
+      maxPendingTimeoutMin: Number(state.config.maxPendingTimeoutMin || 20),
+      logErrorAutoRestart: Boolean(state.config.logErrorAutoRestart),
+      customErrorKeywords: state.config.customErrorKeywords || "",
+      lastSweepAt: watchdogStats.lastSweepAt,
+      zombieTerminatedCount: watchdogStats.zombieTerminatedCount,
+      logErrorDetectedCount: watchdogStats.logErrorDetectedCount,
+      logErrorRestartedCount: watchdogStats.logErrorRestartedCount,
+      lastActionMessage: watchdogStats.lastActionMessage,
+      workerLogSnippets: watchdogStats.workerLogSnippets,
+    },
+    timeScale: timeScaleStatus,
+    hybridFallback: {
+      enabled: state.config.hybridFallbackEnabled !== false,
+      fallbackCoreId: state.config.fallbackCoreId || "",
+      ...hybridFallbackStats,
+    },
+    sharding: {
+      injectWorkerEnv: Boolean(state.config.injectWorkerEnv),
+    },
+    notifications: {
+      webhookConfigured: Boolean(state.config.webhookUrl && String(state.config.webhookUrl).trim()),
+      webhookUrl: state.config.webhookUrl || "",
+      browserNotifyEnabled: state.config.browserNotifyEnabled !== false,
+      notifyOnTokenExpiring: state.config.notifyOnTokenExpiring !== false,
+      notifyOnZombieTerminated: state.config.notifyOnZombieTerminated !== false,
+      notifyOnTargetReached: state.config.notifyOnTargetReached !== false,
+      notifyOnError: state.config.notifyOnError !== false,
+      alerts: (state.alerts || []).slice(0, 30),
+    },
   };
 }
 
@@ -2192,8 +2626,24 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
         .join(", ");
       const moreStr = activeRuns.length > 6 ? ` 외 ${activeRuns.length - 6}개` : "";
       job.lastStatus = `✅ 목표 워커 수 달성 (가동 ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}/${minConcurrent}개): ${activeIds}${moreStr}`;
+      if (
+        runningRuns.length >= minConcurrent &&
+        job._lastNotifiedTarget !== minConcurrent &&
+        state.config.notifyOnTargetReached !== false
+      ) {
+        job._lastNotifiedTarget = minConcurrent;
+        pushAlertNotification(
+          "success",
+          `목표 워커 ${minConcurrent}개 전원 Running 달성! (${job.name})`,
+          `[${job.name}] 목표 워커 ${minConcurrent}개 (총 GPU ${minConcurrent * Math.max(1, Number(job.coreCount || 1))}장)가 모두 Running 상태로 가동 중입니다.`,
+          { jobId: job.id, minConcurrent, dedupeKey: `target-${job.id}-${minConcurrent}` }
+        ).catch(() => {});
+      }
       saveState();
       return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
+    }
+    if (activeRuns.length < minConcurrent) {
+      job._lastNotifiedTarget = null;
     }
 
     // 🛡️ Smart Load-Safe Guard #1: API Backoff / Rate-Limit Cooldown
@@ -2274,11 +2724,21 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
         return { triggered: false, reason: job.lastStatus };
       }
     }
+  }
 
-    // Check Pool GPU availability when `when_gpu_free` OR when Smart Load Guard checks Standard pool capacity
-    if ((job.mode === "when_gpu_free" || loadStatus.enabled) && !job.allowSpot && job.groupPoolId && job.coreId) {
-      const gpuCheck = await checkPoolGpuAvailable(job.groupPoolId, job.coreId, Number(job.coreCount || 1));
-      if (!gpuCheck.available && job.mode === "when_gpu_free") {
+  // Feature 4: Check Standard Pool GPU availability & pre-emptively fallback to Spot if enabled!
+  let preOverrideAllowSpot = undefined;
+  if (!forceTrigger && (job.mode === "when_gpu_free" || loadStatus.enabled) && !job.allowSpot && job.groupPoolId && job.coreId) {
+    const gpuCheck = await checkPoolGpuAvailable(job.groupPoolId, job.coreId, Number(job.coreCount || 1));
+    if (!gpuCheck.available) {
+      if (state.config.hybridFallbackEnabled !== false) {
+        preOverrideAllowSpot = true;
+        hybridFallbackStats.fallbackTriggeredCount += 1;
+        hybridFallbackStats.lastFallbackAt = new Date().toISOString();
+        hybridFallbackStats.lastFallbackReason = `Standard 유휴 GPU 부족 (${gpuCheck.reason}) → Spot 자동 폴백`;
+        hybridFallbackStats.lastFallbackMode = "Standard ➔ Spot";
+        addLog("warn", `🔄 [하이브리드 자동 폴백] ${gpuCheck.reason} → 대기 없이 🟧 Spot 모드로 자동 전환하여 할당합니다.`);
+      } else if (job.mode === "when_gpu_free") {
         job.lastStatus = `GPU 대기 중: ${gpuCheck.reason}`;
         saveState();
         return { triggered: false, reason: job.lastStatus };
@@ -2286,11 +2746,16 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
     }
   }
 
-  const nextWorkerSlot = activeRuns.length + 1;
-  const remainingAfterThis = Math.max(0, minConcurrent - nextWorkerSlot);
+  // Feature 3: Pick lowest missing Worker Slot Index (1..minConcurrent)
+  const nextWorkerSlot = pickNextWorkerSlot(job, activeRuns, minConcurrent);
+  const remainingAfterThis = Math.max(0, minConcurrent - (activeRuns.length + 1));
   const triggerSource = forceTrigger ? "manual" : "auto_scheduler";
   const triggerLabel = forceTrigger ? "👆 [수동 클릭 신청]" : "🤖 [무클릭 자동 신청]";
-  const payload = await buildRunPayload(job);
+  let payload = await buildRunPayload(job, {
+    slotIndex: nextWorkerSlot,
+    targetCount: minConcurrent,
+    overrideAllowSpot: preOverrideAllowSpot,
+  });
   const reqIso = new Date().toISOString();
   schedulerLoopStats.lastAllocationRequestAt = reqIso;
   schedulerLoopStats.lastAutoAllocationRequestAt = reqIso;
@@ -2298,7 +2763,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
 
   addLog(
     "info",
-    `${triggerLabel} [${job.name}] 워커 #${nextWorkerSlot}/${minConcurrent} GPU 할당 요청 전송 (남은 자동생성 예정: +${remainingAfterThis}개 · cmd: ${payload.executionCommand})`,
+    `${triggerLabel} [${job.name}] 워커 슬롯 #${nextWorkerSlot} (활성 ${activeRuns.length + 1}/${minConcurrent}) GPU 할당 요청 전송 (남은 자동생성 예정: +${remainingAfterThis}개 · cmd: ${payload.executionCommand})`,
     {
       containerName: payload.containerName,
       workerSlot: `${nextWorkerSlot}/${minConcurrent}`,
@@ -2312,7 +2777,38 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
     }
   );
 
-  const createRes = await spaceApi.createRun(payload);
+  // Feature 4: Spot ↔ Standard / Fallback Core Auto-Retry on `createRun` failure
+  let createRes = null;
+  try {
+    createRes = await spaceApi.createRun(payload);
+  } catch (primaryErr) {
+    if (state.config.hybridFallbackEnabled !== false) {
+      const altAllowSpot = !payload.allowSpot;
+      const altCoreId = state.config.fallbackCoreId ? Number(state.config.fallbackCoreId) : undefined;
+      const fallbackLabel = altAllowSpot ? "Standard ➔ Spot" : "Spot ➔ Standard";
+      addLog(
+        "warn",
+        `🔄 [하이브리드 자동 폴백 재시도] 1차 할당 실패 (${primaryErr.message}) → ${fallbackLabel}${altCoreId ? ` (Core #${altCoreId})` : ""} 모드로 즉시 재시도합니다.`
+      );
+      try {
+        payload = await buildRunPayload(job, {
+          slotIndex: nextWorkerSlot,
+          targetCount: minConcurrent,
+          overrideAllowSpot: altAllowSpot,
+          overrideCoreId: altCoreId || undefined,
+        });
+        createRes = await spaceApi.createRun(payload);
+        hybridFallbackStats.fallbackTriggeredCount += 1;
+        hybridFallbackStats.lastFallbackAt = new Date().toISOString();
+        hybridFallbackStats.lastFallbackReason = `1차 생성 오류(${primaryErr.message.slice(0, 60)}) → ${fallbackLabel} 폴백 성공`;
+        hybridFallbackStats.lastFallbackMode = fallbackLabel;
+      } catch {
+        throw primaryErr;
+      }
+    } else {
+      throw primaryErr;
+    }
+  }
   const createdId = createRes?.id || createRes?.runId || createRes?.data?.id || createRes?.data?.runId || null;
   const createdIso = new Date().toISOString();
 
@@ -2424,14 +2920,46 @@ async function runSchedulerTick(manual = false) {
   const results = [];
   let approvalTickResult = null;
   try {
+    // Feature 5: Dynamically apply KST Time-of-Day / Weekend Auto-Scaling target worker counts if enabled
+    applyTimeScaleToJobs();
+
+    // Feature 6: Check JWT token remaining time and trigger alert if expiring within 30 minutes
+    const jwt = decodeJwtPayload(state.config.accessToken);
+    if (jwt?.exp && state.config.notifyOnTokenExpiring !== false) {
+      const remSec = Math.floor(jwt.exp - Date.now() / 1000);
+      if (remSec > 0 && remSec <= 1800) {
+        const bucket = Math.ceil(remSec / 900); // alert at 30m and 15m buckets
+        if (lastTokenExpiryAlertBucket !== bucket) {
+          lastTokenExpiryAlertBucket = bucket;
+          const remMin = Math.max(1, Math.round(remSec / 60));
+          await pushAlertNotification(
+            "warn",
+            `SPACE Access Token 만료 임박 (${remMin}분 남음)`,
+            `Access Token이 약 ${remMin}분 후 만료됩니다. 자동 갱신(Refresh Token) 상태를 확인하거나 새 토큰을 등록해 주세요.`,
+            { remainingSec: remSec, dedupeKey: `token-exp-${bucket}` }
+          );
+        }
+      } else if (remSec > 1800) {
+        lastTokenExpiryAlertBucket = null;
+      }
+    }
+
     const anyJobAutoApprove = state.jobs.some((j) => j.autoApprove !== false);
     if (manual || state.config.autoApprovalScope !== "off" || anyJobAutoApprove) {
       approvalTickResult = await processPendingApprovals({ forceAll: manual }).catch((e) => ({ error: e.message }));
     }
 
     const enabledJobs = state.jobs.filter((j) => j.enabled);
-    if (manual || enabledJobs.length > 0) {
-      const allRuns = await fetchCurrentRuns();
+    if (manual || enabledJobs.length > 0 || state.config.watchdogEnabled !== false) {
+      let allRuns = await fetchCurrentRuns();
+
+      // Feature 1 & 2: Run Zombie Watchdog Sweep & Round-Robin Live Worker Log Scan
+      const sweepRes = await runWatchdogSweep(allRuns).catch(() => ({ terminatedIds: [] }));
+      if (sweepRes?.terminatedIds?.length > 0) {
+        allRuns = await fetchCurrentRuns(true).catch(() => allRuns);
+      }
+      await scanWorkerLogsRoundRobin(allRuns, { scanAll: manual }).catch(() => {});
+
       for (const job of enabledJobs) {
         try {
           const res = await evaluateJobRule(job, allRuns, false);
@@ -2661,6 +3189,7 @@ const server = http.createServer(async (req, res) => {
         },
         jobs: state.jobs,
         history: state.history.slice(0, 100),
+        alerts: (state.alerts || []).slice(0, 50),
         schedulerLoopStats,
         approvalLoopStats,
         autoApprovalTimeline: fleet.autoApprovalTimeline || [],
@@ -2669,7 +3198,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // 2. Update config (including all intervals & Smart Load Guard settings!)
+    // 2. Update config (including all intervals, Smart Load Guard & Features 1–6 settings!)
     if (pathname === "/api/config" && req.method === "POST") {
       const body = await readJsonBody(req);
       const incomingGroupId = body.groupId !== undefined ? sanitizeGroupId(body.groupId) : sanitizeGroupId(state.config.groupId);
@@ -2713,18 +3242,52 @@ const server = http.createServer(async (req, res) => {
         ...(body.adaptivePollingEnabled !== undefined
           ? { adaptivePollingEnabled: Boolean(body.adaptivePollingEnabled) }
           : {}),
+        // Feature 1: Watchdog
+        ...(body.watchdogEnabled !== undefined ? { watchdogEnabled: Boolean(body.watchdogEnabled) } : {}),
+        ...(body.maxPendingTimeoutMin !== undefined
+          ? { maxPendingTimeoutMin: Math.max(3, Number(body.maxPendingTimeoutMin || 20)) }
+          : {}),
+        ...(body.logErrorAutoRestart !== undefined ? { logErrorAutoRestart: Boolean(body.logErrorAutoRestart) } : {}),
+        ...(body.customErrorKeywords !== undefined ? { customErrorKeywords: String(body.customErrorKeywords || "").trim() } : {}),
+        // Feature 3: Auto-Sharding (`WORKER_SLOT`)
+        ...(body.injectWorkerEnv !== undefined ? { injectWorkerEnv: Boolean(body.injectWorkerEnv) } : {}),
+        // Feature 4: Spot ↔ Standard Hybrid Auto-Fallback
+        ...(body.hybridFallbackEnabled !== undefined ? { hybridFallbackEnabled: Boolean(body.hybridFallbackEnabled) } : {}),
+        ...(body.fallbackCoreId !== undefined ? { fallbackCoreId: String(body.fallbackCoreId || "").trim() } : {}),
+        // Feature 5: Time-of-Day / Weekend Auto-Scaling
+        ...(body.timeScaleEnabled !== undefined ? { timeScaleEnabled: Boolean(body.timeScaleEnabled) } : {}),
+        ...(body.dayTargetWorkers !== undefined ? { dayTargetWorkers: Math.max(1, Number(body.dayTargetWorkers || 20)) } : {}),
+        ...(body.nightTargetWorkers !== undefined ? { nightTargetWorkers: Math.max(1, Number(body.nightTargetWorkers || 48)) } : {}),
+        ...(body.weekendTargetWorkers !== undefined
+          ? { weekendTargetWorkers: Math.max(1, Number(body.weekendTargetWorkers || 64)) }
+          : {}),
+        ...(body.nightStartHour !== undefined ? { nightStartHour: Math.max(0, Math.min(23, Number(body.nightStartHour ?? 20))) } : {}),
+        ...(body.nightEndHour !== undefined ? { nightEndHour: Math.max(0, Math.min(23, Number(body.nightEndHour ?? 8))) } : {}),
+        // Feature 6: Webhook & Browser Notification Center
+        ...(body.webhookUrl !== undefined ? { webhookUrl: String(body.webhookUrl || "").trim() } : {}),
+        ...(body.browserNotifyEnabled !== undefined ? { browserNotifyEnabled: Boolean(body.browserNotifyEnabled) } : {}),
+        ...(body.notifyOnTokenExpiring !== undefined ? { notifyOnTokenExpiring: Boolean(body.notifyOnTokenExpiring) } : {}),
+        ...(body.notifyOnZombieTerminated !== undefined
+          ? { notifyOnZombieTerminated: Boolean(body.notifyOnZombieTerminated) }
+          : {}),
+        ...(body.notifyOnTargetReached !== undefined ? { notifyOnTargetReached: Boolean(body.notifyOnTargetReached) } : {}),
+        ...(body.notifyOnError !== undefined ? { notifyOnError: Boolean(body.notifyOnError) } : {}),
       };
       resolveGroupId();
+      if (state.config.timeScaleEnabled) {
+        applyTimeScaleToJobs();
+      }
       saveState();
-      addLog("info", "서버 및 조회/승인/부하보호 설정이 업데이트되었습니다.", {
+      addLog("info", "서버 및 6대 스마트 자동화/부하보호 설정이 업데이트되었습니다.", {
         groupId: state.config.groupId,
         checkIntervalSec: state.config.checkIntervalSec,
         approvalCheckIntervalSec: state.config.approvalCheckIntervalSec,
         uiRefreshIntervalSec: state.config.uiRefreshIntervalSec,
-        autoApprovalScope: state.config.autoApprovalScope,
         smartLoadGuardEnabled: state.config.smartLoadGuardEnabled,
-        maxPendingWorkers: state.config.maxPendingWorkers,
-        stepByStepRunningCheck: state.config.stepByStepRunningCheck,
+        watchdogEnabled: state.config.watchdogEnabled,
+        injectWorkerEnv: state.config.injectWorkerEnv,
+        hybridFallbackEnabled: state.config.hybridFallbackEnabled,
+        timeScaleEnabled: state.config.timeScaleEnabled,
       });
       const fleet = computeWorkerFleetStats(lastKnownRuns);
       return sendJson(res, 200, { ok: true, config: state.config, workerFleet: fleet, loadMonitor: fleet.loadMonitor });
@@ -2941,6 +3504,198 @@ const server = http.createServer(async (req, res) => {
       const out = await spaceApi.terminateRun(runId);
       addLog("warn", `사용자가 Run #${runId} 강제 종료 요청`, { runId });
       return sendJson(res, 200, { ok: true, data: out });
+    }
+
+    // 8-A. Feature 2: Bulk Worker Control (`scan_logs`, `stop_pending`, `rolling_restart`, `stop_all`)
+    if (pathname === "/api/space/runs/bulk-action" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const action = String(body.action || "").trim();
+      const runs = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+      const activeRuns = runs
+        .filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE")
+        .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
+      const runningRuns = activeRuns.filter((r) =>
+        String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+      );
+      const pendingRuns = activeRuns.filter(
+        (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+      );
+
+      if (action === "scan_logs") {
+        const scanRes = await scanWorkerLogsRoundRobin(runs, { scanAll: true });
+        const fleet = computeWorkerFleetStats(runs);
+        addLog("info", `🔍 [실시간 워커 로그 스캔] 가동 중인 워커 ${scanRes.scannedCount}개의 최신 로그 및 에러 패턴 점검 완료`);
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          scannedCount: scanRes.scannedCount,
+          workerFleet: fleet,
+        });
+      }
+
+      if (action === "stop_pending") {
+        const terminatedIds = [];
+        for (const r of pendingRuns) {
+          const rId = String(r.id ?? r.runId ?? "");
+          if (!rId) continue;
+          try {
+            await spaceApi.terminateRun(rId);
+            terminatedIds.push(rId);
+            await sleep(250);
+          } catch {
+            // ignore
+          }
+        }
+        const updatedRuns = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+        const fleet = computeWorkerFleetStats(updatedRuns);
+        addLog("warn", `⏳ [Pending 워커 일괄 취소] 준비 대기 중인 워커 ${terminatedIds.length}개를 일괄 취소했습니다.`, {
+          terminatedIds,
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          terminatedCount: terminatedIds.length,
+          terminatedIds,
+          workerFleet: fleet,
+        });
+      }
+
+      if (action === "rolling_restart") {
+        const batchSize = Math.max(1, Math.min(8, Number(body.batchSize || 1)));
+        const targets = runningRuns.slice(0, batchSize);
+        const terminatedIds = [];
+        const terminatedNames = [];
+        for (const r of targets) {
+          const rId = String(r.id ?? r.runId ?? "");
+          if (!rId) continue;
+          try {
+            await spaceApi.terminateRun(rId);
+            terminatedIds.push(rId);
+            terminatedNames.push(r.containerName || r.name || `#${rId}`);
+            await sleep(300);
+          } catch {
+            // ignore
+          }
+        }
+        const updatedRuns = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+        const fleet = computeWorkerFleetStats(updatedRuns);
+        addLog(
+          "info",
+          `🔄 [무중단 롤링 재시작] 가장 오래된 Running 워커 ${terminatedIds.length}개(${terminatedNames.join(", ") || "-"})를 종료했습니다. 스케줄러가 최신 스크립트로 즉시 새 워커를 보충합니다.`,
+          { terminatedIds, terminatedNames }
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          terminatedCount: terminatedIds.length,
+          terminatedIds,
+          terminatedNames,
+          workerFleet: fleet,
+        });
+      }
+
+      if (action === "stop_all") {
+        if (body.pauseAutoCreate !== false) {
+          for (const j of state.jobs) j.enabled = false;
+          saveState();
+        }
+        const terminatedIds = [];
+        for (const r of activeRuns) {
+          const rId = String(r.id ?? r.runId ?? "");
+          if (!rId) continue;
+          try {
+            await spaceApi.terminateRun(rId);
+            terminatedIds.push(rId);
+            await sleep(250);
+          } catch {
+            // ignore
+          }
+        }
+        const updatedRuns = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+        const fleet = computeWorkerFleetStats(updatedRuns);
+        addLog(
+          "warn",
+          `🛑 [전체 워커 일괄 종료] 활성 워커 ${terminatedIds.length}개를 일괄 종료했습니다.${body.pauseAutoCreate !== false ? " (주기 자동생성 OFF 전환됨)" : ""}`,
+          { terminatedIds }
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          terminatedCount: terminatedIds.length,
+          terminatedIds,
+          jobs: state.jobs,
+          workerFleet: fleet,
+        });
+      }
+
+      return sendJson(res, 400, { error: `Unknown bulk action: ${action}` });
+    }
+
+    // 8-A2. Features 1–6 Quick Toggle & Settings Update Endpoint
+    if (pathname === "/api/automation/quick-update" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const keys = [
+        "watchdogEnabled",
+        "maxPendingTimeoutMin",
+        "logErrorAutoRestart",
+        "customErrorKeywords",
+        "injectWorkerEnv",
+        "hybridFallbackEnabled",
+        "fallbackCoreId",
+        "timeScaleEnabled",
+        "dayTargetWorkers",
+        "nightTargetWorkers",
+        "weekendTargetWorkers",
+        "nightStartHour",
+        "nightEndHour",
+        "webhookUrl",
+        "browserNotifyEnabled",
+        "notifyOnTokenExpiring",
+        "notifyOnZombieTerminated",
+        "notifyOnTargetReached",
+        "notifyOnError",
+      ];
+      for (const k of keys) {
+        if (body[k] !== undefined) {
+          state.config[k] = body[k];
+        }
+      }
+      if (state.config.timeScaleEnabled) {
+        applyTimeScaleToJobs();
+      }
+      saveState();
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      addLog("info", `⚡ [6대 스마트 자동화 빠른 설정 변경] 완료`, body);
+      return sendJson(res, 200, {
+        ok: true,
+        config: state.config,
+        jobs: state.jobs,
+        workerFleet: fleet,
+        loadMonitor: fleet.loadMonitor,
+      });
+    }
+
+    // 8-A3. Feature 6: Test Notification Endpoint
+    if (pathname === "/api/notifications/test" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      if (body.webhookUrl !== undefined) {
+        state.config.webhookUrl = String(body.webhookUrl || "").trim();
+        saveState();
+      }
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      const alertEntry = await pushAlertNotification(
+        "info",
+        "SPACE GPU Auto-Allocator 테스트 알림",
+        `알림 센터 정상 작동 확인! 현재 가동 워커: ${fleet.totalRunningWorkers}개 Running / 전체 활성 ${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers}개 (총 GPU ${fleet.totalActiveGpus}/${fleet.totalTargetGpus}장)`,
+        { test: true, dedupeKey: `test-${Date.now()}` }
+      );
+      addLog("info", `🔔 [알림 테스트 발송] 브라우저 알림 및 웹훅(${state.config.webhookUrl ? "연결됨" : "미설정"}) 테스트 완료`);
+      return sendJson(res, 200, {
+        ok: true,
+        alert: alertEntry,
+        alerts: (state.alerts || []).slice(0, 30),
+        workerFleet: fleet,
+      });
     }
 
     // 8-B. Admin Run-Approval & TaskOrbit Queue Endpoints
