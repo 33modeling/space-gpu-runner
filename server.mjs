@@ -72,6 +72,17 @@ const DEFAULT_STATE = {
     notifyOnZombieTerminated: true,
     notifyOnTargetReached: true,
     notifyOnError: true,
+    // Batch 2 - 1️⃣ 📝 In-Dashboard Script Editor & Auto-Sync on Container Start
+    syncEditedScriptsOnStart: true,
+    // Batch 2 - 3️⃣ ⛓️ Goal Auto-Stop & Multi-Stage Pipeline Chaining (Stage 1 ➔ Stage 2)
+    autoStopOnComplete: true,
+    autoStopOnCompleteKeyword: "ALL_TASKS_COMPLETED,TRAINING_FINISHED,PIPELINE_DONE",
+    maxTotalSucceededRuns: 0, // 0 = unlimited
+    nextStageCommand: "",
+    // Batch 2 - 6️⃣ 🩺 Bad-Node Eviction Guard & Rapid-Fail Cooldown
+    badNodeGuardEnabled: true,
+    badNodeRapidFailSec: 180,
+    badNodeCooldownSec: 25,
   },
   jobs: [
     {
@@ -102,6 +113,76 @@ const DEFAULT_STATE = {
       lastStatus: "Idle",
     },
   ],
+  presets: [
+    {
+      id: "preset-full-48",
+      name: "🚀 48워커 풀가동 (Spot)",
+      badge: "48W · Spot",
+      executionCommand: "bash /group-volume/run.sh",
+      minConcurrentRuns: 48,
+      coreCount: 1,
+      allowSpot: true,
+      expectedRunTime: "8h",
+      injectWorkerEnv: false,
+      nextStageCommand: "",
+      updatedAt: "2026-11-04T00:00:00.000Z",
+    },
+    {
+      id: "preset-std-20",
+      name: "🛡️ 20워커 안정 가동 (Standard)",
+      badge: "20W · Std",
+      executionCommand: "bash /group-volume/run.sh",
+      minConcurrentRuns: 20,
+      coreCount: 1,
+      allowSpot: false,
+      expectedRunTime: "8h",
+      injectWorkerEnv: false,
+      nextStageCommand: "",
+      updatedAt: "2026-11-04T00:00:00.000Z",
+    },
+    {
+      id: "preset-sharded-16",
+      name: "🔢 16워커 자동 샤딩 (WORKER_SLOT)",
+      badge: "16W · Sharding",
+      executionCommand: "bash /group-volume/run.sh --shard {{SLOT}} --total {{TOTAL}}",
+      minConcurrentRuns: 16,
+      coreCount: 1,
+      allowSpot: true,
+      expectedRunTime: "8h",
+      injectWorkerEnv: true,
+      nextStageCommand: "",
+      updatedAt: "2026-11-04T00:00:00.000Z",
+    },
+    {
+      id: "preset-debug-1",
+      name: "🧪 1워커 빠른 디버그",
+      badge: "1W · Debug",
+      executionCommand: "bash /group-volume/run.sh",
+      minConcurrentRuns: 1,
+      coreCount: 1,
+      allowSpot: true,
+      expectedRunTime: "2h",
+      injectWorkerEnv: true,
+      nextStageCommand: "",
+      updatedAt: "2026-11-04T00:00:00.000Z",
+    },
+  ],
+  scriptFiles: {
+    "/group-volume/run.sh": {
+      path: "/group-volume/run.sh",
+      content: "#!/usr/bin/env bash\nset -e\necho \"[SPACE Worker] Starting on $(hostname) (Slot: ${WORKER_SLOT:-1}/${WORKER_TOTAL:-1})\"\nnvidia-smi -L || true\n# 아래에 실행할 학습/추론 명령어를 작성하세요\n",
+      updatedAt: null,
+      autoInject: false,
+    },
+  },
+  telemetry: {
+    totalGpuHours: 0,
+    dailyGpuHours: {},
+    jobGpuHours: {},
+    timeSeries: [],
+    lastAccountingAtMs: 0,
+    lastSampleAtMs: 0,
+  },
   history: [],
   approvalHistory: [],
   alerts: [],
@@ -126,11 +207,31 @@ function loadState() {
         ? raw.approvalHistory.slice(0, 300)
         : rawHistory.filter((h) => h && isApprovalOrAllocationLogMessage(h.message)).slice(0, 300);
       const rawAlerts = Array.isArray(raw.alerts) ? raw.alerts.slice(0, 100) : [];
+      const rawPresets =
+        Array.isArray(raw.presets) && raw.presets.length > 0 ? raw.presets : structuredClone(DEFAULT_STATE.presets);
+      const rawScriptFiles =
+        raw.scriptFiles && typeof raw.scriptFiles === "object"
+          ? { ...structuredClone(DEFAULT_STATE.scriptFiles), ...raw.scriptFiles }
+          : structuredClone(DEFAULT_STATE.scriptFiles);
+      const rawTelemetry =
+        raw.telemetry && typeof raw.telemetry === "object"
+          ? {
+              totalGpuHours: Number(raw.telemetry.totalGpuHours || 0),
+              dailyGpuHours: raw.telemetry.dailyGpuHours || {},
+              jobGpuHours: raw.telemetry.jobGpuHours || {},
+              timeSeries: Array.isArray(raw.telemetry.timeSeries) ? raw.telemetry.timeSeries.slice(-60) : [],
+              lastAccountingAtMs: Number(raw.telemetry.lastAccountingAtMs || 0),
+              lastSampleAtMs: Number(raw.telemetry.lastSampleAtMs || 0),
+            }
+          : structuredClone(DEFAULT_STATE.telemetry);
       return {
         config: { ...DEFAULT_STATE.config, ...(raw.config || {}) },
         jobs: Array.isArray(raw.jobs)
           ? raw.jobs.map((j) => ({ autoApprove: true, ...j }))
           : DEFAULT_STATE.jobs,
+        presets: rawPresets,
+        scriptFiles: rawScriptFiles,
+        telemetry: rawTelemetry,
         history: rawHistory,
         approvalHistory: rawApprovalHistory,
         alerts: rawAlerts,
@@ -651,6 +752,130 @@ const spaceApi = {
         });
       }
     }
+  },
+
+  readSfmFile: async (filePath = "/group-volume/run.sh") => {
+    const rawStr = String(filePath || "/group-volume/run.sh").trim();
+    const containerPath = rawStr.startsWith("/group-volume")
+      ? rawStr
+      : `/group-volume/${rawStr.replace(/^\/+/, "")}`;
+    const relPath = containerPath.replace(/^\/group-volume\/?/, "");
+    const gId = resolveGroupId();
+    const viewerFilePath = gId ? `/${gId}/group/${relPath}` : `/${relPath}`;
+
+    // 1. Try local cached/edited version first if no remote token, or try remote Data Viewer / SFM download then fallback to local saved copy
+    try {
+      const dlRes = await spaceRequest("/api/dataviewer/v1/files/content", {
+        params: { path: viewerFilePath },
+        rawResponse: true,
+      });
+      if (typeof dlRes === "string" && dlRes.length > 0 && !dlRes.trim().startsWith("<!DOCTYPE html")) {
+        return {
+          path: containerPath,
+          viewerPath: viewerFilePath,
+          content: dlRes,
+          source: "space_dataviewer",
+          updatedAt: state.scriptFiles?.[containerPath]?.updatedAt || new Date().toISOString(),
+          autoInject: Boolean(state.scriptFiles?.[containerPath]?.autoInject),
+        };
+      }
+    } catch {
+      // Fallback to SFM `/files` or local script store
+    }
+    try {
+      const sfmRes = await spaceRequest("/files", {
+        baseUrl: state.config.sfmUrl,
+        params: { path: `/${relPath}` },
+        rawResponse: true,
+      });
+      if (typeof sfmRes === "string" && sfmRes.length > 0 && !sfmRes.trim().startsWith("<!DOCTYPE html")) {
+        return {
+          path: containerPath,
+          viewerPath: viewerFilePath,
+          content: sfmRes,
+          source: "space_sfm",
+          updatedAt: state.scriptFiles?.[containerPath]?.updatedAt || new Date().toISOString(),
+          autoInject: Boolean(state.scriptFiles?.[containerPath]?.autoInject),
+        };
+      }
+    } catch {
+      // Fallback to in-dashboard script store (`state.scriptFiles`)
+    }
+
+    const saved = state.scriptFiles?.[containerPath];
+    if (saved) {
+      return {
+        path: containerPath,
+        viewerPath: viewerFilePath,
+        content: saved.content || "",
+        source: "dashboard_store",
+        updatedAt: saved.updatedAt || null,
+        autoInject: Boolean(saved.autoInject),
+      };
+    }
+
+    return {
+      path: containerPath,
+      viewerPath: viewerFilePath,
+      content: `#!/usr/bin/env bash\nset -e\necho "[SPACE Worker] Running ${containerPath} (Slot: \${WORKER_SLOT:-1}/\${WORKER_TOTAL:-1})"\nnvidia-smi -L || true\n`,
+      source: "template",
+      updatedAt: null,
+      autoInject: false,
+    };
+  },
+
+  writeSfmFile: async (filePath = "/group-volume/run.sh", content = "") => {
+    const rawStr = String(filePath || "/group-volume/run.sh").trim();
+    const containerPath = rawStr.startsWith("/group-volume")
+      ? rawStr
+      : `/group-volume/${rawStr.replace(/^\/+/, "")}`;
+    const relPath = containerPath.replace(/^\/group-volume\/?/, "");
+    const gId = resolveGroupId();
+    const viewerFilePath = gId ? `/${gId}/group/${relPath}` : `/${relPath}`;
+
+    if (!state.scriptFiles) state.scriptFiles = {};
+    state.scriptFiles[containerPath] = {
+      path: containerPath,
+      content: String(content ?? ""),
+      updatedAt: new Date().toISOString(),
+      autoInject: true,
+    };
+    saveState();
+
+    let remoteSaved = false;
+    let remoteMethod = "auto_inject_on_worker_start";
+    try {
+      await spaceRequest("/api/dataviewer/v1/files/content", {
+        method: "PUT",
+        params: { path: viewerFilePath },
+        body: { path: viewerFilePath, content: String(content ?? "") },
+      });
+      remoteSaved = true;
+      remoteMethod = "space_dataviewer_put";
+    } catch {
+      try {
+        await spaceRequest("/files", {
+          method: "POST",
+          baseUrl: state.config.sfmUrl,
+          params: { path: `/${relPath}` },
+          body: { path: `/${relPath}`, content: String(content ?? "") },
+        });
+        remoteSaved = true;
+        remoteMethod = "space_sfm_post";
+      } catch {
+        // SFM web viewer is read-only or requires multipart; `auto_inject_on_worker_start` guarantees writing into `/group-volume/...` inside container on start!
+      }
+    }
+
+    return {
+      ok: true,
+      path: containerPath,
+      viewerPath: viewerFilePath,
+      remoteSaved,
+      remoteMethod,
+      updatedAt: state.scriptFiles[containerPath].updatedAt,
+      autoInject: true,
+    };
   },
 
   // WLM Runs
@@ -1805,7 +2030,200 @@ function pickNextWorkerSlot(job, activeRuns, targetCount) {
 }
 
 /**
- * Feature 1 & 2: Round-Robin Live Worker Log Scanner & Fatal Error Detector
+ * Batch 2 - Feature 2, 3, 5, 6 Runtime Stats & Helpers:
+ * - Feature 2: `parseWorkerLogProgress(text)` (extracts %, Epoch/Step, loss, speed it/s or tok/s, ETA)
+ * - Feature 3: `pipelineStats` (tracks goal completion & Stage 1 -> Stage 2 transitions)
+ * - Feature 5: `updateGpuTelemetry(...)` (accumulates cumulative GPU-Hours & time-series points)
+ * - Feature 6: `badNodeStats` (tracks rapid-fail / hardware ECC/Xid errors & enforces smart cooldown)
+ */
+const BAD_NODE_ERROR_KEYWORDS = [
+  "CUDA initialization error",
+  "uncorrectable ECC",
+  "ECC error",
+  "NVML",
+  "driver version is insufficient",
+  "Xid",
+  "no CUDA-capable device",
+  "device-side assert",
+];
+
+let badNodeStats = {
+  rapidFailCount: 0,
+  hwErrorCount: 0,
+  consecutiveRapidFails: 0,
+  cooldownUntilMs: 0,
+  lastBadRunId: null,
+  lastBadRunName: null,
+  lastReason: null,
+  lastDetectedAt: null,
+  seenFailedRunIds: new Set(),
+};
+
+let pipelineStats = {
+  completedCount: 0,
+  stageTransitionCount: 0,
+  lastCompletedAt: null,
+  lastCompletedReason: null,
+  lastTransitionedAt: null,
+  lastStageCommand: null,
+};
+
+function parseWorkerLogProgress(text = "") {
+  const s = String(text || "");
+  if (!s.trim()) return null;
+
+  const lines = s
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const recentChunk = lines.slice(-12).join("\n");
+
+  // 1. Percentage (`45%`, `45.2%`)
+  let pct = null;
+  const pctMatches = [...recentChunk.matchAll(/\b(\d{1,3}(?:\.\d+)?)\s*%/g)];
+  if (pctMatches.length > 0) {
+    const val = Number(pctMatches[pctMatches.length - 1][1]);
+    if (!Number.isNaN(val) && val >= 0 && val <= 100) {
+      pct = Math.round(val * 10) / 10;
+    }
+  }
+
+  // 2. Step / Epoch (`Epoch 2/5`, `Step 450/1000`, `450/1000 [`)
+  let stepInfo = null;
+  const epochMatch = recentChunk.match(/\b(epoch\s*\d+(?:\s*\/\s*\d+)?)/i);
+  const stepMatch =
+    recentChunk.match(/\b(?:step|iter|batch)?\s*(\d+\s*\/\s*\d+)\b/i) ||
+    recentChunk.match(/\|\s*(\d+\/\d+)\s*\[/);
+  if (epochMatch && stepMatch) {
+    stepInfo = `${epochMatch[1]} · ${stepMatch[1].replace(/\s+/g, "")}`;
+  } else if (epochMatch) {
+    stepInfo = epochMatch[1];
+  } else if (stepMatch) {
+    stepInfo = stepMatch[1].replace(/\s+/g, "");
+    if (pct === null) {
+      const [cur, tot] = stepInfo.split("/").map(Number);
+      if (tot > 0 && cur >= 0 && cur <= tot) {
+        pct = Math.round((cur / tot) * 1000) / 10;
+      }
+    }
+  }
+
+  // 3. Loss (`loss: 0.1234`, `loss=0.1234`, `train_loss: 1.02`)
+  let loss = null;
+  const lossMatches = [...recentChunk.matchAll(/\b(?:train_?|val_?|eval_?)?loss\s*[:=]\s*([0-9]+\.[0-9]+(?:e[+-]?\d+)?)/gi)];
+  if (lossMatches.length > 0) {
+    loss = lossMatches[lossMatches.length - 1][1];
+  }
+
+  // 4. Speed (`1.44it/s`, `2.10 s/it`, `340.5 tok/s`, `125.0 samples/s`)
+  let speedText = null;
+  let speedVal = null;
+  let speedUnit = null;
+  const speedMatches = [
+    ...recentChunk.matchAll(/\b(\d+(?:\.\d+)?)\s*(it\/s|s\/it|tok\/s|tokens\/s|samples\/s|img\/s|steps\/s)\b/gi),
+  ];
+  if (speedMatches.length > 0) {
+    const m = speedMatches[speedMatches.length - 1];
+    const rawNum = Number(m[1]);
+    const rawUnit = m[2].toLowerCase();
+    speedText = `${m[1]} ${m[2]}`;
+    if (!Number.isNaN(rawNum) && rawNum > 0) {
+      if (rawUnit === "s/it") {
+        speedVal = Math.round((1 / rawNum) * 1000) / 1000;
+        speedUnit = "it/s";
+      } else {
+        speedVal = rawNum;
+        speedUnit = rawUnit === "tokens/s" ? "tok/s" : rawUnit;
+      }
+    }
+  }
+
+  // 5. ETA (`<05:12`, `ETA: 00:12:30`, `eta 4m20s`)
+  let eta = null;
+  const tqdmEta = recentChunk.match(/\[(\d{1,2}:\d{2}(?::\d{2})?)<(\d{1,2}:\d{2}(?::\d{2})?)/);
+  const explicitEta = recentChunk.match(/\bETA\s*[:=]?\s*([0-9hms:]{3,12})/i);
+  if (tqdmEta) {
+    eta = tqdmEta[2];
+  } else if (explicitEta) {
+    eta = explicitEta[1];
+  }
+
+  if (pct === null && !stepInfo && !loss && !speedText && !eta) {
+    return null;
+  }
+
+  return {
+    pct,
+    stepInfo,
+    loss,
+    speedText,
+    speedVal,
+    speedUnit,
+    eta,
+    isStraggler: false,
+  };
+}
+
+function updateGpuTelemetry(
+  runsList = [],
+  totalRunningWorkers = 0,
+  totalPendingWorkers = 0,
+  totalRunningGpus = 0,
+  totalTargetGpus = 0,
+  avgApiMs = 0
+) {
+  if (!state.telemetry) {
+    state.telemetry = structuredClone(DEFAULT_STATE.telemetry);
+  }
+  const now = Date.now();
+  const prevMs = Number(state.telemetry.lastAccountingAtMs || 0);
+  const kstDate = new Date(now + 9 * 60 * 60 * 1000);
+  const dateKey = kstDate.toISOString().slice(0, 10);
+  const timeLabel = kstDate.toISOString().slice(11, 19);
+
+  if (prevMs > 0 && now > prevMs) {
+    const elapsedSec = Math.min(300, (now - prevMs) / 1000);
+    if (elapsedSec > 0 && totalRunningGpus > 0) {
+      const addedGpuHours = (totalRunningGpus * elapsedSec) / 3600;
+      state.telemetry.totalGpuHours = Math.round((Number(state.telemetry.totalGpuHours || 0) + addedGpuHours) * 10000) / 10000;
+      if (!state.telemetry.dailyGpuHours) state.telemetry.dailyGpuHours = {};
+      state.telemetry.dailyGpuHours[dateKey] =
+        Math.round((Number(state.telemetry.dailyGpuHours[dateKey] || 0) + addedGpuHours) * 10000) / 10000;
+    }
+  }
+  state.telemetry.lastAccountingAtMs = now;
+
+  const lastSampleMs = Number(state.telemetry.lastSampleAtMs || 0);
+  if (!lastSampleMs || now - lastSampleMs >= 15000) {
+    if (!Array.isArray(state.telemetry.timeSeries)) state.telemetry.timeSeries = [];
+    state.telemetry.timeSeries.push({
+      time: timeLabel,
+      isoTime: new Date(now).toISOString(),
+      runningWorkers: totalRunningWorkers,
+      pendingWorkers: totalPendingWorkers,
+      runningGpus: totalRunningGpus,
+      targetGpus: totalTargetGpus,
+      avgApiMs: Math.round(Number(avgApiMs || 0)),
+      totalGpuHours: Math.round(Number(state.telemetry.totalGpuHours || 0) * 100) / 100,
+    });
+    if (state.telemetry.timeSeries.length > 60) {
+      state.telemetry.timeSeries = state.telemetry.timeSeries.slice(-60);
+    }
+    state.telemetry.lastSampleAtMs = now;
+  }
+
+  return {
+    totalGpuHours: Math.round(Number(state.telemetry.totalGpuHours || 0) * 100) / 100,
+    todayGpuHours: Math.round(Number(state.telemetry.dailyGpuHours?.[dateKey] || 0) * 100) / 100,
+    todayDate: dateKey,
+    dailyGpuHours: state.telemetry.dailyGpuHours || {},
+    timeSeries: state.telemetry.timeSeries || [],
+  };
+}
+
+/**
+ * Feature 1, 2, 3, 6: Round-Robin Live Worker Log Scanner, Progress Parser,
+ * Goal Completion / Stage-2 Pipeline Detector & Hardware Bad-Node Detector.
  * Checks 1~2 Running workers per scheduler tick (or all when requested manually)
  * so SPACE API load stays minimal.
  */
@@ -1822,7 +2240,12 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const allKeywords = [...new Set([...DEFAULT_ERROR_KEYWORDS, ...customKw])];
+  const allKeywords = [...new Set([...DEFAULT_ERROR_KEYWORDS, ...BAD_NODE_ERROR_KEYWORDS, ...customKw])];
+
+  const completeKeywords = String(state.config.autoStopOnCompleteKeyword || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
   const batchSize = options.scanAll ? Math.min(runningRuns.length, 16) : Math.min(runningRuns.length, 2);
   let scannedCount = 0;
@@ -1854,6 +2277,22 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
           break;
         }
       }
+      const isBadNodeHwError = Boolean(
+        matchedKeyword && BAD_NODE_ERROR_KEYWORDS.some((hw) => hw.toLowerCase() === matchedKeyword.toLowerCase())
+      );
+
+      // Feature 2: Parse real-time progress (%, step/epoch, loss, speed, ETA)
+      const progress = parseWorkerLogProgress(text);
+
+      // Feature 3: Check completion keyword in logs
+      let matchedCompleteKw = null;
+      for (const ckw of completeKeywords) {
+        if (ckw && text.toLowerCase().includes(ckw.toLowerCase())) {
+          matchedCompleteKw = ckw;
+          break;
+        }
+      }
+
       const hasError = Boolean(matchedKeyword);
       const prevHadError = Boolean(existing?.hasError);
       watchdogStats.workerLogSnippets[rId] = {
@@ -1861,10 +2300,74 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
         runName: run.containerName || run.name || `#${rId}`,
         lastLine,
         hasError,
+        isBadNodeHwError,
         matchedKeyword,
+        matchedCompleteKw,
+        progress,
         updatedAt: new Date().toISOString(),
       };
       scannedCount += 1;
+
+      // Feature 6: Hardware Bad-Node Error handling
+      if (isBadNodeHwError && !prevHadError && state.config.badNodeGuardEnabled !== false) {
+        const cooldownSec = Math.max(5, Number(state.config.badNodeCooldownSec || 25));
+        badNodeStats.hwErrorCount += 1;
+        badNodeStats.consecutiveRapidFails += 1;
+        badNodeStats.cooldownUntilMs = Date.now() + cooldownSec * 1000;
+        badNodeStats.lastBadRunId = rId;
+        badNodeStats.lastBadRunName = run.containerName || run.name || `#${rId}`;
+        badNodeStats.lastReason = `노드 HW 에러 감지 (${matchedKeyword})`;
+        badNodeStats.lastDetectedAt = new Date().toISOString();
+        addLog(
+          "warn",
+          `🩺 [불량 GPU 노드 회피 가드] ${badNodeStats.lastBadRunName} (#${rId})에서 하드웨어 에러('${matchedKeyword}') 감지 → 동일 불량 노드 재할당 방지를 위해 ${cooldownSec}초 스마트 쿨다운 적용`
+        );
+      }
+
+      // Feature 3: Goal Completion / Stage 1 ➔ Stage 2 Pipeline Chaining
+      if (matchedCompleteKw && !existing?.matchedCompleteKw && state.config.autoStopOnComplete !== false) {
+        const activeJob = state.jobs[0];
+        if (activeJob && activeJob.enabled) {
+          const nextCmd = String(activeJob.nextStageCommand || state.config.nextStageCommand || "").trim();
+          if (nextCmd && !activeJob._stage2Transitioned && activeJob.executionCommand !== nextCmd) {
+            const prevCmd = activeJob.executionCommand;
+            activeJob.executionCommand = nextCmd;
+            activeJob._stage2Transitioned = true;
+            pipelineStats.stageTransitionCount += 1;
+            pipelineStats.lastTransitionedAt = new Date().toISOString();
+            pipelineStats.lastStageCommand = nextCmd;
+            saveState();
+            addLog(
+              "info",
+              `⛓️ [파이프라인 Stage 2 자동 전환] 워커 #${rId} 로그에서 완료 키워드('${matchedCompleteKw}') 감지! 실행 명령어를 Stage 2('${nextCmd}')로 자동 전환합니다.`,
+              { prevCmd, nextCmd, matchedCompleteKw }
+            );
+            await pushAlertNotification(
+              "success",
+              `⛓️ 파이프라인 Stage 1 완료 ➔ Stage 2 자동 전환!`,
+              `워커 #${rId}에서 '${matchedCompleteKw}' 키워드가 감지되어 [${activeJob.name}] 명령어를 Stage 2(${nextCmd})로 자동 전환했습니다.`,
+              { jobId: activeJob.id, nextCmd, dedupeKey: `stage2-${activeJob.id}` }
+            );
+          } else {
+            activeJob.enabled = false;
+            activeJob.lastStatus = `🏁 목표 완료 키워드('${matchedCompleteKw}') 감지됨 — 자동 정지 완료`;
+            pipelineStats.completedCount += 1;
+            pipelineStats.lastCompletedAt = new Date().toISOString();
+            pipelineStats.lastCompletedReason = `로그 키워드 '${matchedCompleteKw}' 감지 (#${rId})`;
+            saveState();
+            addLog(
+              "info",
+              `🏁 [목표 완료 자동 정지] 워커 #${rId} 로그에서 완료 키워드('${matchedCompleteKw}')가 감지되어 [${activeJob.name}] 자동 증설을 정지했습니다.`
+            );
+            await pushAlertNotification(
+              "success",
+              `🏁 목표 작업 완료 감지 — 자동 정지됨 (${activeJob.name})`,
+              `워커 #${rId} 로그에서 완료 키워드('${matchedCompleteKw}')가 확인되어 불필요한 추가 할당을 자동 종료했습니다.`,
+              { jobId: activeJob.id, matchedCompleteKw, dedupeKey: `complete-${activeJob.id}-${matchedCompleteKw}` }
+            );
+          }
+        }
+      }
 
       if (hasError && !prevHadError) {
         watchdogStats.logErrorDetectedCount += 1;
@@ -1883,14 +2386,14 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
             { runId: rId, matchedKeyword, dedupeKey: `logerr-${rId}-${matchedKeyword}` }
           );
         }
-        if (state.config.watchdogEnabled !== false && state.config.logErrorAutoRestart) {
+        if (state.config.watchdogEnabled !== false && (state.config.logErrorAutoRestart || isBadNodeHwError)) {
           try {
             await spaceApi.terminateRun(rId);
             watchdogStats.logErrorRestartedCount += 1;
             watchdogStats.lastActionMessage = `로그 에러(${matchedKeyword}) 워커 #${rId} 자동 종료 후 재생성 대기`;
             addLog(
               "warn",
-              `🔄 [Watchdog 자동 교체] 치명적 로그 에러(${matchedKeyword})가 발생한 ${rName} (#${rId})를 자동 종료했습니다. 다음 주기에 새 워커로 교체됩니다.`
+              `🔄 [Watchdog 자동 교체] 치명적 로그 에러(${matchedKeyword})가 발생한 ${rName} (#${rId})를 자동 종료했습니다. 쿨다운 후 새 노드에 워커가 재배치됩니다.`
             );
           } catch (termErr) {
             addLog("error", `[Watchdog] 에러 워커 #${rId} 종료 실패: ${termErr.message}`);
@@ -2103,6 +2606,24 @@ async function buildRunPayload(job, options = {}) {
   const shouldInjectWorkerEnv = Boolean(job.injectWorkerEnv ?? state.config.injectWorkerEnv);
   if (shouldInjectWorkerEnv && !executionCommand.includes("WORKER_SLOT=")) {
     executionCommand = `export WORKER_SLOT=${slotIndex} WORKER_INDEX=${slotIndex - 1} WORKER_TOTAL=${targetCount} WORKER_NAME="${containerName}"; ${executionCommand}`;
+  }
+
+  // Batch 2 - Feature 1: Auto-sync scripts edited in the dashboard (`state.scriptFiles`) into `/group-volume/...` inside the worker container on start!
+  if (state.config.syncEditedScriptsOnStart !== false && state.scriptFiles) {
+    for (const [scriptPath, scriptEntry] of Object.entries(state.scriptFiles)) {
+      if (
+        scriptEntry &&
+        scriptEntry.autoInject &&
+        typeof scriptEntry.content === "string" &&
+        scriptEntry.content.length > 0 &&
+        executionCommand.includes(scriptPath) &&
+        !executionCommand.includes("base64 -d >")
+      ) {
+        const b64 = Buffer.from(scriptEntry.content, "utf-8").toString("base64");
+        const dirName = path.posix.dirname(scriptPath);
+        executionCommand = `mkdir -p "${dirName}" && echo "${b64}" | base64 -d > "${scriptPath}" && chmod +x "${scriptPath}"; ${executionCommand}`;
+      }
+    }
   }
 
   const enabledRunFeatures = [];
@@ -2431,6 +2952,7 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       const assignedSlot = extractAssignedSlotFromRun(r) || idx + 1;
       const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
       const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
+      const rawProgress = snippet?.progress ? { ...snippet.progress } : null;
       return {
         slotIndex: idx + 1,
         assignedSlot,
@@ -2454,8 +2976,35 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
         lastLogUpdatedAt: snippet?.updatedAt || null,
         hasLogError: Boolean(snippet?.hasError),
         logErrorKeyword: snippet?.matchedKeyword || null,
+        progress: rawProgress,
       };
     });
+
+    // Batch 2 - Feature 2: Detect Straggler workers (`speedVal < 0.55 * medianSpeed` within same unit)
+    const speedGroups = new Map();
+    for (const w of activeWorkers) {
+      if (w.progress?.speedVal && w.progress?.speedUnit) {
+        const u = w.progress.speedUnit;
+        if (!speedGroups.has(u)) speedGroups.set(u, []);
+        speedGroups.get(u).push(w.progress.speedVal);
+      }
+    }
+    for (const [unit, vals] of speedGroups.entries()) {
+      if (vals.length >= 2) {
+        const sorted = [...vals].sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
+        for (const w of activeWorkers) {
+          if (w.progress?.speedUnit === unit && w.progress?.speedVal < median * 0.55) {
+            w.progress.isStraggler = true;
+            w.progress.medianSpeed = Math.round(median * 100) / 100;
+          }
+        }
+      }
+    }
+
+    const succeededCount = matchingRuns.filter(
+      (r) => classifyRunStatus(r.status || r.state || r.phase) === "SUCCEEDED"
+    ).length;
 
     const nextAssignedSlot = pickNextWorkerSlot(job, activeRuns, targetCount);
 
@@ -2467,6 +3016,10 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       coreId: job.coreId,
       coreCountPerWorker,
       executionCommand: job.executionCommand,
+      nextStageCommand: job.nextStageCommand || state.config.nextStageCommand || "",
+      stage2Transitioned: Boolean(job._stage2Transitioned),
+      succeededCount,
+      maxTotalSucceededRuns: Number(job.maxTotalSucceededRuns ?? state.config.maxTotalSucceededRuns ?? 0),
       injectWorkerEnv: Boolean(job.injectWorkerEnv ?? state.config.injectWorkerEnv),
       nextAssignedSlot,
       targetCount,
@@ -2490,6 +3043,16 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
   });
 
   const timeScaleStatus = computeTimeScaleStatus();
+  const telemetryStatus = updateGpuTelemetry(
+    runsList,
+    totalRunningWorkers,
+    totalPendingWorkers,
+    totalRunningGpus,
+    totalTargetGpus,
+    loadStatus?.api?.avgLatencyMs || 0
+  );
+  const badNodeCooldownRemainingSec =
+    badNodeStats.cooldownUntilMs > now ? Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000) : 0;
 
   return {
     updatedAt: lastKnownRunsAt || new Date().toISOString(),
@@ -2539,6 +3102,32 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       notifyOnTargetReached: state.config.notifyOnTargetReached !== false,
       notifyOnError: state.config.notifyOnError !== false,
       alerts: (state.alerts || []).slice(0, 30),
+    },
+    telemetry: telemetryStatus,
+    badNodeGuard: {
+      enabled: state.config.badNodeGuardEnabled !== false,
+      rapidFailSec: Number(state.config.badNodeRapidFailSec || 180),
+      cooldownSec: Number(state.config.badNodeCooldownSec || 25),
+      cooldownRemainingSec: badNodeCooldownRemainingSec,
+      rapidFailCount: badNodeStats.rapidFailCount,
+      hwErrorCount: badNodeStats.hwErrorCount,
+      consecutiveRapidFails: badNodeStats.consecutiveRapidFails,
+      lastBadRunId: badNodeStats.lastBadRunId,
+      lastBadRunName: badNodeStats.lastBadRunName,
+      lastReason: badNodeStats.lastReason,
+      lastDetectedAt: badNodeStats.lastDetectedAt,
+    },
+    pipeline: {
+      autoStopOnComplete: state.config.autoStopOnComplete !== false,
+      autoStopOnCompleteKeyword: state.config.autoStopOnCompleteKeyword || "",
+      maxTotalSucceededRuns: Number(state.config.maxTotalSucceededRuns || 0),
+      nextStageCommand: state.config.nextStageCommand || "",
+      ...pipelineStats,
+    },
+    presets: state.presets || [],
+    scriptEditor: {
+      syncEditedScriptsOnStart: state.config.syncEditedScriptsOnStart !== false,
+      savedPaths: Object.keys(state.scriptFiles || {}),
     },
   };
 }
@@ -2618,7 +3207,87 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
   const minConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
   const loadStatus = computeServerLoadStatus(allRuns);
 
+  // Batch 2 - Feature 6: Detect Rapid-Fail runs (`FAILED` within `< badNodeRapidFailSec` seconds) & trigger Bad-Node Cooldown
+  if (state.config.badNodeGuardEnabled !== false) {
+    const rapidSecLimit = Math.max(20, Number(state.config.badNodeRapidFailSec || 180));
+    const cooldownSec = Math.max(5, Number(state.config.badNodeCooldownSec || 25));
+    const failedRuns = matchingRuns.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "FAILED");
+    for (const fr of failedRuns.slice(0, 5)) {
+      const fId = String(fr.id ?? fr.runId ?? "");
+      if (!fId || badNodeStats.seenFailedRunIds.has(fId)) continue;
+      badNodeStats.seenFailedRunIds.add(fId);
+      const startMs = fr.startTime ? new Date(fr.startTime).getTime() : 0;
+      const endMs = fr.endTime ? new Date(fr.endTime).getTime() : now;
+      const runDurSec = startMs > 0 ? Math.max(0, Math.floor((endMs - startMs) / 1000)) : 9999;
+      if (runDurSec <= rapidSecLimit && now - endMs < 180000) {
+        badNodeStats.rapidFailCount += 1;
+        badNodeStats.consecutiveRapidFails += 1;
+        badNodeStats.cooldownUntilMs = Math.max(badNodeStats.cooldownUntilMs, now + cooldownSec * 1000);
+        badNodeStats.lastBadRunId = fId;
+        badNodeStats.lastBadRunName = fr.containerName || fr.name || `#${fId}`;
+        badNodeStats.lastReason = `시작 ${runDurSec}초 만에 조기 실패(Rapid-Fail <= ${rapidSecLimit}초)`;
+        badNodeStats.lastDetectedAt = new Date(now).toISOString();
+        addLog(
+          "warn",
+          `🩺 [불량 노드 회피 가드] ${badNodeStats.lastBadRunName} (#${fId})가 시작 ${runDurSec}초 만에 조기 실패했습니다. 동일 불량 노드 재할당 방지를 위해 ${cooldownSec}초 스마트 쿨다운을 적용합니다.`
+        );
+      }
+    }
+    if (runningRuns.length > 0 && badNodeStats.consecutiveRapidFails > 0) {
+      // Reset consecutive rapid fails once healthy Running workers are active for > 3 minutes
+      const hasStableRunner = runningRuns.some((r) => {
+        const sMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+        return sMs > 0 && now - sMs > 180000;
+      });
+      if (hasStableRunner) {
+        badNodeStats.consecutiveRapidFails = 0;
+      }
+    }
+  }
+
+  // Batch 2 - Feature 3: Check `maxTotalSucceededRuns` Goal Auto-Stop & Stage 1 ➔ Stage 2 Pipeline Chaining
+  const maxSucc = Number(job.maxTotalSucceededRuns ?? state.config.maxTotalSucceededRuns ?? 0);
+  if (!forceTrigger && maxSucc > 0) {
+    const succeededCount = matchingRuns.filter(
+      (r) => classifyRunStatus(r.status || r.state || r.phase) === "SUCCEEDED"
+    ).length;
+    if (succeededCount >= maxSucc) {
+      const nextCmd = String(job.nextStageCommand || state.config.nextStageCommand || "").trim();
+      if (nextCmd && !job._stage2Transitioned && job.executionCommand !== nextCmd) {
+        const prevCmd = job.executionCommand;
+        job.executionCommand = nextCmd;
+        job._stage2Transitioned = true;
+        pipelineStats.stageTransitionCount += 1;
+        pipelineStats.lastTransitionedAt = new Date(now).toISOString();
+        pipelineStats.lastStageCommand = nextCmd;
+        saveState();
+        addLog(
+          "info",
+          `⛓️ [파이프라인 Stage 2 자동 전환] 누적 성공 ${succeededCount}/${maxSucc}회 달성! [${job.name}] 실행 명령어를 Stage 2('${nextCmd}')로 자동 전환합니다.`,
+          { prevCmd, nextCmd, succeededCount }
+        );
+      } else if (state.config.autoStopOnComplete !== false) {
+        job.enabled = false;
+        job.lastStatus = `🏁 목표 성공 횟수(${succeededCount}/${maxSucc}회) 달성 완료 — 자동 정지됨`;
+        pipelineStats.completedCount += 1;
+        pipelineStats.lastCompletedAt = new Date(now).toISOString();
+        pipelineStats.lastCompletedReason = `누적 성공 ${succeededCount}/${maxSucc}회 달성`;
+        saveState();
+        addLog("info", `🏁 [목표 완료 자동 정지] 누적 성공 ${succeededCount}/${maxSucc}회 달성으로 [${job.name}] 자동 증설을 종료했습니다.`);
+        return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
+      }
+    }
+  }
+
   if (!forceTrigger) {
+    // Batch 2 - Feature 6: Enforce Bad-Node Cooldown before spawning replacement workers
+    if (state.config.badNodeGuardEnabled !== false && badNodeStats.cooldownUntilMs > now) {
+      const remainBadSec = Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000);
+      const deficit = Math.max(0, minConcurrent - activeRuns.length);
+      job.lastStatus = `🩺 [불량 노드 회피 쿨다운] 직전 워커(${badNodeStats.lastBadRunName || "-"}) ${badNodeStats.lastReason || "조기 실패"} → 동일 노드 재당첨 방지를 위해 ${remainBadSec}초 후 +${deficit}개 안전 재배치`;
+      saveState();
+      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
+    }
     if (activeRuns.length >= minConcurrent) {
       const activeIds = activeRuns
         .slice(0, 6)
@@ -3188,6 +3857,8 @@ const server = http.createServer(async (req, res) => {
             : null,
         },
         jobs: state.jobs,
+        presets: state.presets || [],
+        telemetry: fleet.telemetry,
         history: state.history.slice(0, 100),
         alerts: (state.alerts || []).slice(0, 50),
         schedulerLoopStats,
@@ -3272,6 +3943,25 @@ const server = http.createServer(async (req, res) => {
           : {}),
         ...(body.notifyOnTargetReached !== undefined ? { notifyOnTargetReached: Boolean(body.notifyOnTargetReached) } : {}),
         ...(body.notifyOnError !== undefined ? { notifyOnError: Boolean(body.notifyOnError) } : {}),
+        // Batch 2 - Features 1, 3, 6
+        ...(body.syncEditedScriptsOnStart !== undefined
+          ? { syncEditedScriptsOnStart: Boolean(body.syncEditedScriptsOnStart) }
+          : {}),
+        ...(body.autoStopOnComplete !== undefined ? { autoStopOnComplete: Boolean(body.autoStopOnComplete) } : {}),
+        ...(body.autoStopOnCompleteKeyword !== undefined
+          ? { autoStopOnCompleteKeyword: String(body.autoStopOnCompleteKeyword || "").trim() }
+          : {}),
+        ...(body.maxTotalSucceededRuns !== undefined
+          ? { maxTotalSucceededRuns: Math.max(0, Number(body.maxTotalSucceededRuns || 0)) }
+          : {}),
+        ...(body.nextStageCommand !== undefined ? { nextStageCommand: String(body.nextStageCommand || "").trim() } : {}),
+        ...(body.badNodeGuardEnabled !== undefined ? { badNodeGuardEnabled: Boolean(body.badNodeGuardEnabled) } : {}),
+        ...(body.badNodeRapidFailSec !== undefined
+          ? { badNodeRapidFailSec: Math.max(20, Number(body.badNodeRapidFailSec || 180)) }
+          : {}),
+        ...(body.badNodeCooldownSec !== undefined
+          ? { badNodeCooldownSec: Math.max(5, Number(body.badNodeCooldownSec || 25)) }
+          : {}),
       };
       resolveGroupId();
       if (state.config.timeScaleEnabled) {
@@ -3456,6 +4146,63 @@ const server = http.createServer(async (req, res) => {
       const dirPath = parsedUrl.searchParams.get("path") || "/";
       const files = await spaceApi.listSfmFiles(dirPath);
       return sendJson(res, 200, files);
+    }
+
+    // 5-B. Batch 2 - Feature 1: In-Dashboard `/group-volume` Script Read & 1-Click Rolling Deploy
+    if (pathname === "/api/space/sfm-file" && req.method === "GET") {
+      const filePath = parsedUrl.searchParams.get("path") || "/group-volume/run.sh";
+      const fileData = await spaceApi.readSfmFile(filePath);
+      return sendJson(res, 200, fileData);
+    }
+
+    if (pathname === "/api/space/sfm-file" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const filePath = String(body.path || "/group-volume/run.sh").trim();
+      const content = String(body.content ?? "");
+      const writeRes = await spaceApi.writeSfmFile(filePath, content);
+      addLog(
+        "info",
+        `📝 [웹 에디터 스크립트 저장] ${writeRes.path} 저장 완료 (컨테이너 시작 시 자동 동기화: ${state.config.syncEditedScriptsOnStart !== false ? "ON" : "OFF"})`,
+        { path: writeRes.path, remoteSaved: writeRes.remoteSaved }
+      );
+
+      let rollingResult = null;
+      if (body.rollingRestart) {
+        const runs = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+        const runningRuns = runs
+          .filter(
+            (r) =>
+              classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
+              String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+          )
+          .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
+        const batchSize = Math.max(1, Math.min(8, Number(body.batchSize || 2)));
+        const targets = runningRuns.slice(0, batchSize);
+        const terminatedIds = [];
+        for (const r of targets) {
+          const rId = String(r.id ?? r.runId ?? "");
+          if (!rId) continue;
+          try {
+            await spaceApi.terminateRun(rId);
+            terminatedIds.push(rId);
+            await sleep(250);
+          } catch {
+            // ignore
+          }
+        }
+        rollingResult = { terminatedCount: terminatedIds.length, terminatedIds };
+        addLog(
+          "info",
+          `🚀 [스크립트 저장 + 원클릭 롤링 배포] ${writeRes.path} 저장 후 가동 워커 ${terminatedIds.length}개를 교체 재시작했습니다.`
+        );
+      }
+
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      return sendJson(res, 200, {
+        ...writeRes,
+        rollingResult,
+        workerFleet: fleet,
+      });
     }
 
     // 6. List Live WLM Runs on SPACE (auto-approves any pending run on the fly if auto-approval is active!)
@@ -3654,6 +4401,14 @@ const server = http.createServer(async (req, res) => {
         "notifyOnZombieTerminated",
         "notifyOnTargetReached",
         "notifyOnError",
+        "syncEditedScriptsOnStart",
+        "autoStopOnComplete",
+        "autoStopOnCompleteKeyword",
+        "maxTotalSucceededRuns",
+        "nextStageCommand",
+        "badNodeGuardEnabled",
+        "badNodeRapidFailSec",
+        "badNodeCooldownSec",
       ];
       for (const k of keys) {
         if (body[k] !== undefined) {
@@ -3665,7 +4420,7 @@ const server = http.createServer(async (req, res) => {
       }
       saveState();
       const fleet = computeWorkerFleetStats(lastKnownRuns);
-      addLog("info", `⚡ [6대 스마트 자동화 빠른 설정 변경] 완료`, body);
+      addLog("info", `⚡ [스마트 자동화 빠른 설정 변경] 완료`, body);
       return sendJson(res, 200, {
         ok: true,
         config: state.config,
@@ -3696,6 +4451,141 @@ const server = http.createServer(async (req, res) => {
         alerts: (state.alerts || []).slice(0, 30),
         workerFleet: fleet,
       });
+    }
+
+    // 8-A4. Batch 2 - Feature 4: Experiment Presets Bookmark Endpoints (`GET/POST /api/presets`, `POST /api/presets/apply`, `DELETE /api/presets/:id`)
+    if (pathname === "/api/presets" && req.method === "GET") {
+      return sendJson(res, 200, { presets: state.presets || [] });
+    }
+
+    if (pathname === "/api/presets" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      if (!Array.isArray(state.presets)) state.presets = [];
+      const activeJob = state.jobs[0] || {};
+      const newPreset = {
+        id: body.id || `preset-${Date.now()}`,
+        name: String(body.name || "새 실험 프리셋").trim(),
+        badge: String(body.badge || `${body.minConcurrentRuns || activeJob.minConcurrentRuns || 1}W`).trim(),
+        executionCommand: String(body.executionCommand ?? activeJob.executionCommand ?? "bash /group-volume/run.sh").trim(),
+        minConcurrentRuns: Math.max(1, Number(body.minConcurrentRuns ?? activeJob.minConcurrentRuns ?? 1)),
+        coreCount: Math.max(1, Number(body.coreCount ?? activeJob.coreCount ?? 1)),
+        allowSpot: Boolean(body.allowSpot ?? activeJob.allowSpot),
+        expectedRunTime: String(body.expectedRunTime ?? activeJob.expectedRunTime ?? "8h"),
+        injectWorkerEnv: Boolean(body.injectWorkerEnv ?? state.config.injectWorkerEnv),
+        nextStageCommand: String(body.nextStageCommand ?? state.config.nextStageCommand ?? "").trim(),
+        updatedAt: new Date().toISOString(),
+      };
+      const existingIdx = state.presets.findIndex((p) => p.id === newPreset.id || p.name === newPreset.name);
+      if (existingIdx >= 0) {
+        state.presets[existingIdx] = newPreset;
+      } else {
+        state.presets.unshift(newPreset);
+      }
+      saveState();
+      addLog("info", `⚡ [실험 프리셋 북마크 저장] '${newPreset.name}' (${newPreset.minConcurrentRuns}워커 · ${newPreset.allowSpot ? "Spot" : "Standard"})`);
+      return sendJson(res, 200, { ok: true, preset: newPreset, presets: state.presets });
+    }
+
+    if (pathname === "/api/presets/apply" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const preset = (state.presets || []).find((p) => p.id === body.presetId);
+      if (!preset) {
+        return sendJson(res, 404, { error: "해당 프리셋을 찾을 수 없습니다." });
+      }
+      const job = state.jobs[0];
+      if (job) {
+        job.executionCommand = preset.executionCommand || job.executionCommand;
+        job.minConcurrentRuns = Math.max(1, Number(preset.minConcurrentRuns || 1));
+        job.coreCount = Math.max(1, Number(preset.coreCount || 1));
+        job.allowSpot = Boolean(preset.allowSpot);
+        if (preset.expectedRunTime) job.expectedRunTime = preset.expectedRunTime;
+        if (preset.injectWorkerEnv !== undefined) {
+          job.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
+          state.config.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
+        }
+        if (preset.nextStageCommand !== undefined) {
+          job.nextStageCommand = preset.nextStageCommand;
+          state.config.nextStageCommand = preset.nextStageCommand;
+        }
+        job._stage2Transitioned = false;
+        job.enabled = true;
+        saveState();
+      }
+      addLog(
+        "info",
+        `⚡ [프리셋 원클릭 적용] '${preset.name}' 적용 완료 → 목표 워커 ${preset.minConcurrentRuns}개 (${preset.allowSpot ? "Spot" : "Standard"}) · 명령어: ${preset.executionCommand}`
+      );
+      let triggerRes = null;
+      if (body.triggerImmediately && job) {
+        const runs = await fetchCurrentRuns().catch(() => lastKnownRuns);
+        triggerRes = await evaluateJobRule(job, runs, true).catch((e) => ({ error: e.message }));
+      }
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      return sendJson(res, 200, {
+        ok: true,
+        preset,
+        jobs: state.jobs,
+        config: state.config,
+        triggerRes,
+        workerFleet: fleet,
+      });
+    }
+
+    if (pathname.startsWith("/api/presets/") && req.method === "DELETE") {
+      const presetId = decodeURIComponent(pathname.split("/").pop() || "");
+      state.presets = (state.presets || []).filter((p) => p.id !== presetId);
+      saveState();
+      addLog("info", `🗑️ [프리셋 삭제] ID=${presetId}`);
+      return sendJson(res, 200, { ok: true, presets: state.presets });
+    }
+
+    // 8-A5. Batch 2 - Feature 5: GPU Telemetry Report Export (`GET /api/telemetry/export?format=csv|json`)
+    if (pathname === "/api/telemetry/export" && req.method === "GET") {
+      const format = String(parsedUrl.searchParams.get("format") || "csv").toLowerCase();
+      const fleet = computeWorkerFleetStats(lastKnownRuns);
+      const tel = fleet.telemetry || {};
+      if (format === "json") {
+        return sendJson(res, 200, {
+          exportedAt: new Date().toISOString(),
+          groupId: state.config.groupId,
+          totalGpuHours: tel.totalGpuHours || 0,
+          todayGpuHours: tel.todayGpuHours || 0,
+          dailyGpuHours: tel.dailyGpuHours || {},
+          timeSeries: tel.timeSeries || [],
+          activeFleetSummary: {
+            totalRunningWorkers: fleet.totalRunningWorkers,
+            totalActiveWorkers: fleet.totalActiveWorkers,
+            totalTargetWorkers: fleet.totalTargetWorkers,
+            totalRunningGpus: fleet.totalRunningGpus,
+            totalTargetGpus: fleet.totalTargetGpus,
+          },
+        });
+      }
+      const rows = [
+        ["Section", "TimeOrDate", "RunningWorkers", "PendingWorkers", "RunningGPUs", "TargetGPUs", "AvgApiMs", "CumulativeGpuHours"],
+      ];
+      for (const [day, hrs] of Object.entries(tel.dailyGpuHours || {})) {
+        rows.push(["DAILY_SUMMARY", day, "", "", "", "", "", String(hrs)]);
+      }
+      for (const pt of tel.timeSeries || []) {
+        rows.push([
+          "TIME_SERIES",
+          pt.isoTime || pt.time || "",
+          String(pt.runningWorkers ?? 0),
+          String(pt.pendingWorkers ?? 0),
+          String(pt.runningGpus ?? 0),
+          String(pt.targetGpus ?? 0),
+          String(pt.avgApiMs ?? 0),
+          String(pt.totalGpuHours ?? tel.totalGpuHours ?? 0),
+        ]);
+      }
+      const csvText = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+      res.writeHead(200, {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="space-gpu-telemetry-${new Date().toISOString().slice(0, 10)}.csv"`,
+      });
+      res.end("\uFEFF" + csvText);
+      return;
     }
 
     // 8-B. Admin Run-Approval & TaskOrbit Queue Endpoints

@@ -210,10 +210,15 @@ async function loadServerState() {
     renderTopAutoStatusBanner();
     renderConfig(data.config, data.approvalLoopStats);
     renderApprovalLoopStatus(data.approvalLoopStats, data.config);
+    renderPresetsBar(data.presets || latestWorkerFleet?.presets || []);
     renderWorkerFleetBoard(latestWorkerFleet);
     renderJobsTable(data.jobs || [], latestWorkerFleet);
     renderHistoryTable(data.history || []);
     applyUiRefreshInterval(data.config?.uiRefreshIntervalSec || 5);
+    if (!window._initialEditorLoaded) {
+      window._initialEditorLoaded = true;
+      openSfmScriptEditor(undefined, { silent: true }).catch(() => {});
+    }
   } catch (e) {
     console.error(e);
   }
@@ -589,6 +594,9 @@ function renderWorkerFleetBoard(fleet) {
   const hf = fleet.hybridFallback || {};
   const shardingOn = Boolean(fleet.sharding?.injectWorkerEnv ?? serverState?.config?.injectWorkerEnv);
   const notif = fleet.notifications || {};
+  const bng = fleet.badNodeGuard || {};
+  const pipe = fleet.pipeline || {};
+  const tel = fleet.telemetry || {};
 
   for (let i = 0; i < maxVisualSlots; i++) {
     const w = activeWorkers[i];
@@ -596,21 +604,50 @@ function renderWorkerFleetBoard(fleet) {
       const stUpper = String(w.status || "").toUpperCase();
       const isRun = stUpper.includes("RUN");
       const hasErr = Boolean(w.hasLogError);
-      const dot = hasErr ? "🚨" : isRun ? "🟢" : "⏳";
-      const bg = hasErr ? "rgba(239,68,68,0.22)" : isRun ? "rgba(16,185,129,0.18)" : "rgba(245,158,11,0.20)";
-      const border = hasErr ? "#f87171" : isRun ? "rgba(16,185,129,0.5)" : "rgba(245,158,11,0.5)";
-      const color = hasErr ? "#fecaca" : isRun ? "#6ee7b7" : "#fde68a";
+      const prog = w.progress || null;
+      const isStraggler = Boolean(prog?.isStraggler);
+      const dot = hasErr ? "🚨" : isStraggler ? "🐢" : isRun ? "🟢" : "⏳";
+      const bg = hasErr
+        ? "rgba(239,68,68,0.22)"
+        : isStraggler
+        ? "rgba(249,115,22,0.22)"
+        : isRun
+        ? "rgba(16,185,129,0.18)"
+        : "rgba(245,158,11,0.20)";
+      const border = hasErr
+        ? "#f87171"
+        : isStraggler
+        ? "#fb923c"
+        : isRun
+        ? "rgba(16,185,129,0.5)"
+        : "rgba(245,158,11,0.5)";
+      const color = hasErr ? "#fecaca" : isStraggler ? "#fed7aa" : isRun ? "#6ee7b7" : "#fde68a";
       const srcTag = w.triggerSource === "auto_scheduler" ? "🤖자동" : "👆수동";
       const slotNum = w.assignedSlot || i + 1;
       const reqTimeShort = w.autoApprovalRequestedAt ? formatPreciseTime(w.autoApprovalRequestedAt, false).slice(0, 8) : "";
       const doneTimeShort = w.approvedAt ? formatPreciseTime(w.approvedAt, false).slice(0, 8) : "";
       const logLineShort = w.lastLogLine ? String(w.lastLogLine).slice(0, 44) : "";
+
+      const progParts = [];
+      if (prog) {
+        if (prog.pct !== null && prog.pct !== undefined) progParts.push(`${prog.pct}%`);
+        if (prog.stepInfo) progParts.push(prog.stepInfo);
+        if (prog.loss) progParts.push(`loss=${prog.loss}`);
+        if (prog.speedText) progParts.push(prog.speedText);
+        if (prog.eta) progParts.push(`ETA ${prog.eta}`);
+      }
+      const progBadgeHtml =
+        progParts.length > 0
+          ? `<span style="font-size:10px; color:${isStraggler ? "#fdba74" : "#38bdf8"}; font-weight:700;">📈 ${escapeHtml(progParts.join(" · "))}${isStraggler ? ` (🐢느림 < 중앙값 ${prog.medianSpeed})` : ""}</span>`
+          : "";
+
       slotPills.push(`
         <span class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
           title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(String(w.id))}) · 슬롯 #${slotNum} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:2px; padding:4px 8px; border-radius:6px; font-size:11px; background:${bg}; border:1px solid ${border}; color:${color}; font-weight:600;">
           <span>${dot} 슬롯#${slotNum} <span style="opacity:0.88;">(#${escapeHtml(String(w.id))} · ${srcTag})</span></span>
           ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)}</span>` : ""}
+          ${progBadgeHtml}
           ${
             hasErr
               ? `<span style="font-size:10px; color:#fca5a5;">🚨 에러감지: ${escapeHtml(w.logErrorKeyword || "Error")}</span>`
@@ -636,37 +673,95 @@ function renderWorkerFleetBoard(fleet) {
     }
   }
 
-  // Live 1-line Log Summary Rows for active workers that have scanned logs
+  // Live 1-line Log & Progress Summary Rows for active workers that have scanned logs
   const workersWithLogs = activeWorkers.filter((w) => w.lastLogLine);
+  const stragglerCount = activeWorkers.filter((w) => w.progress?.isStraggler).length;
   const liveLogSummaryHtml =
     workersWithLogs.length > 0
       ? `
       <div style="margin-top:10px; background:rgba(15,23,42,0.75); border:1px solid rgba(148,163,184,0.25); border-radius:8px; padding:8px 12px;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:6px;">
-          <span style="font-size:12px; font-weight:700; color:#93c5fd;">📝 가동 워커 실시간 로그 1줄 요약 보드 (${workersWithLogs.length}/${activeWorkers.length}개 스캔됨 · 클릭 시 전체 로그)</span>
+          <span style="font-size:12px; font-weight:700; color:#93c5fd;">📈 2. 가동 워커 실시간 진행률(% · Loss · Speed · ETA) &amp; 로그 요약 보드 (${workersWithLogs.length}/${activeWorkers.length}개 스캔됨${stragglerCount > 0 ? ` · 🐢 느린 워커 ${stragglerCount}개 감지` : ""})</span>
           <span class="mono" style="font-size:11px; color:#94a3b8;">Watchdog 자동교체: ${wd.zombieTerminatedCount || 0}건 · 로그에러 감지: ${wd.logErrorDetectedCount || 0}건</span>
         </div>
-        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:6px; max-height:110px; overflow-y:auto;">
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:6px; max-height:125px; overflow-y:auto;">
           ${workersWithLogs
             .slice(0, 16)
-            .map(
-              (w) => `
+            .map((w) => {
+              const p = w.progress;
+              const pSummary = p
+                ? [
+                    p.pct !== null && p.pct !== undefined ? `${p.pct}%` : null,
+                    p.stepInfo,
+                    p.loss ? `loss:${p.loss}` : null,
+                    p.speedText,
+                    p.eta ? `ETA:${p.eta}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
+                : "";
+              return `
             <div class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
               style="cursor:pointer; font-size:11px; padding:4px 8px; border-radius:5px; background:${
-                w.hasLogError ? "rgba(239,68,68,0.18)" : "rgba(30,41,59,0.7)"
+                w.hasLogError
+                  ? "rgba(239,68,68,0.18)"
+                  : p?.isStraggler
+                  ? "rgba(249,115,22,0.18)"
+                  : "rgba(30,41,59,0.7)"
               }; border:1px solid ${
-                w.hasLogError ? "rgba(239,68,68,0.5)" : "rgba(148,163,184,0.2)"
+                w.hasLogError
+                  ? "rgba(239,68,68,0.5)"
+                  : p?.isStraggler
+                  ? "rgba(249,115,22,0.5)"
+                  : "rgba(148,163,184,0.2)"
               }; display:flex; align-items:center; gap:6px; overflow:hidden;">
-              <span style="color:${w.hasLogError ? "#f87171" : "#34d399"}; font-weight:700; flex-shrink:0;">슬롯#${w.assignedSlot || w.slotIndex} (#${escapeHtml(String(w.id))})</span>
+              <span style="color:${w.hasLogError ? "#f87171" : p?.isStraggler ? "#fb923c" : "#34d399"}; font-weight:700; flex-shrink:0;">슬롯#${w.assignedSlot || w.slotIndex} (#${escapeHtml(String(w.id))})</span>
+              ${pSummary ? `<span style="background:rgba(56,189,248,0.16); color:#38bdf8; padding:1px 5px; border-radius:4px; font-size:10px; flex-shrink:0;">${p?.isStraggler ? "🐢 " : ""}${escapeHtml(pSummary)}</span>` : ""}
               <span style="color:#e2e8f0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(w.lastLogLine)}</span>
             </div>
-          `
-            )
+          `;
+            })
             .join("")}
         </div>
       </div>
     `
       : "";
+
+  // Feature 5: Cumulative GPU-Hours Telemetry & Time-Series Mini Bar Chart Board
+  const tsSeries = Array.isArray(tel.timeSeries) ? tel.timeSeries.slice(-24) : [];
+  const maxSeriesGpu = Math.max(1, targetGpus, ...tsSeries.map((pt) => Number(pt.runningGpus || 0)));
+  const miniBarsHtml =
+    tsSeries.length > 0
+      ? tsSeries
+          .map((pt) => {
+            const hPct = Math.max(10, Math.min(100, Math.round(((pt.runningGpus || 0) / maxSeriesGpu) * 100)));
+            return `<div title="${escapeHtml(pt.time || "")} — 가동 GPU: ${pt.runningGpus || 0}/${pt.targetGpus || targetGpus}장 (Running 워커 ${pt.runningWorkers || 0}개 · API ${pt.avgApiMs || 0}ms)" style="flex:1; min-width:5px; max-width:14px; height:${hPct}%; background:linear-gradient(180deg, #34d399, #3b82f6); border-radius:2px 2px 0 0;"></div>`;
+          })
+          .join("")
+      : `<span class="hint" style="font-size:11px;">시계열 샘플 수집 중...</span>`;
+
+  const telemetryBoardHtml = `
+    <div style="margin-top:10px; padding:9px 12px; border-radius:8px; background:rgba(15,23,42,0.78); border:1px solid rgba(16,185,129,0.32); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+      <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+        <div>
+          <div style="font-size:11px; color:#94a3b8;">📊 5. 누적 GPU-Hours 가동 통계</div>
+          <div class="mono" style="font-size:15px; font-weight:800; color:#34d399;">
+            총 ${tel.totalGpuHours ?? 0} GPU-Hours <span style="font-size:11.5px; color:#a7f3d0; font-weight:600;">(오늘 ${tel.todayDate || ""}: ${tel.todayGpuHours ?? 0} GPU-h)</span>
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:2px;">
+          <span style="font-size:10.5px; color:#94a3b8;">시간대별 가동 GPU 추이 (최근 ${tsSeries.length}샘플)</span>
+          <div style="display:flex; align-items:flex-end; gap:2px; height:26px; width:180px; padding:2px 4px; background:rgba(2,6,23,0.65); border-radius:4px; border:1px solid rgba(148,163,184,0.2);">
+            ${miniBarsHtml}
+          </div>
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+        <button type="button" class="secondary sm" style="padding:3px 9px; font-size:11px; border-color:rgba(16,185,129,0.45); color:#6ee7b7;" onclick="exportTelemetryReport('csv')">📥 CSV 리포트 다운로드</button>
+        <button type="button" class="secondary sm" style="padding:3px 9px; font-size:11px;" onclick="exportTelemetryReport('json')">📥 JSON 리포트</button>
+      </div>
+    </div>
+  `;
 
   let statusHeadline = "";
   if (remainingCnt > 0) {
@@ -799,6 +894,16 @@ function renderWorkerFleetBoard(fleet) {
           title="브라우저 데스크톱 알림 및 Webhook 즉시 테스트">
           🔔 6.알림센터 (${notif.webhookConfigured ? "Webhook+브라우저" : "브라우저 알림"} · ${notif.alerts?.length || 0}건)
         </button>
+        <button type="button" class="${bng.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ badNodeGuardEnabled: ${bng.enabled === false ? "true" : "false"} })"
+          title="워커가 시작 3분 내 조기 실패하거나 하드웨어(ECC/Xid) 에러 발생 시 쿨다운 후 다른 노드에 재배치">
+          🩺 불량노드 가드: ${bng.enabled !== false ? `ON (회피 ${(bng.rapidFailCount || 0) + (bng.hwErrorCount || 0)}건${bng.cooldownRemainingSec > 0 ? ` · 쿨다운 ${bng.cooldownRemainingSec}초` : ""})` : "OFF"}
+        </button>
+        <button type="button" class="${pipe.autoStopOnComplete !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ autoStopOnComplete: ${pipe.autoStopOnComplete === false ? "true" : "false"} })"
+          title="완료 키워드 감지 또는 목표 성공 횟수 도달 시 자동 정지 / Stage 2 파이프라인 자동 전환">
+          ⛓️ 완료정지·체이닝: ${pipe.autoStopOnComplete !== false ? `ON (${pipe.nextStageCommand ? "Stage1➔2" : "자동정지"} · 성공 ${jf.succeededCount || 0}회)` : "OFF"}
+        </button>
       </div>
       <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
         <span style="font-size:11px; color:#94a3b8; font-weight:700;">🎛️ 2.일괄제어:</span>
@@ -814,6 +919,7 @@ function renderWorkerFleetBoard(fleet) {
       ${slotPills.join("")}
     </div>
     ${liveLogSummaryHtml}
+    ${telemetryBoardHtml}
   `;
 
   updateWorkerCountdownBadge();
@@ -1064,6 +1170,27 @@ function renderConfig(cfg, loopStats = null) {
   const bNotifEl = document.getElementById("cfgBrowserNotifyEnabled");
   if (bNotifEl) bNotifEl.checked = cfg.browserNotifyEnabled !== false;
 
+  // Batch 2 Config Inputs
+  const bngEl = document.getElementById("cfgBadNodeGuardEnabled");
+  if (bngEl) bngEl.checked = cfg.badNodeGuardEnabled !== false;
+  if (activeId !== "cfgBadNodeCooldownSec" && document.getElementById("cfgBadNodeCooldownSec")) {
+    document.getElementById("cfgBadNodeCooldownSec").value = cfg.badNodeCooldownSec ?? 25;
+  }
+  const syncScriptEl = document.getElementById("cfgSyncEditedScriptsOnStart");
+  if (syncScriptEl) syncScriptEl.checked = cfg.syncEditedScriptsOnStart !== false;
+  const autoStopEl = document.getElementById("cfgAutoStopOnComplete");
+  if (autoStopEl) autoStopEl.checked = cfg.autoStopOnComplete !== false;
+  if (activeId !== "cfgAutoStopOnCompleteKeyword" && document.getElementById("cfgAutoStopOnCompleteKeyword")) {
+    document.getElementById("cfgAutoStopOnCompleteKeyword").value =
+      cfg.autoStopOnCompleteKeyword ?? "ALL_TASKS_COMPLETED,TRAINING_FINISHED,PIPELINE_DONE";
+  }
+  if (activeId !== "cfgMaxTotalSucceededRuns" && document.getElementById("cfgMaxTotalSucceededRuns")) {
+    document.getElementById("cfgMaxTotalSucceededRuns").value = cfg.maxTotalSucceededRuns ?? 0;
+  }
+  if (activeId !== "cfgNextStageCommand" && document.getElementById("cfgNextStageCommand")) {
+    document.getElementById("cfgNextStageCommand").value = cfg.nextStageCommand || "";
+  }
+
   document.getElementById("cfgSchedulerEnabled").checked = Boolean(cfg.schedulerEnabled);
 
   const loadGuardBadge = document.getElementById("loadGuardBadge");
@@ -1166,6 +1293,19 @@ async function saveConfig() {
       browserNotifyEnabled: document.getElementById("cfgBrowserNotifyEnabled")
         ? document.getElementById("cfgBrowserNotifyEnabled").checked
         : true,
+      badNodeGuardEnabled: document.getElementById("cfgBadNodeGuardEnabled")
+        ? document.getElementById("cfgBadNodeGuardEnabled").checked
+        : true,
+      badNodeCooldownSec: Number(document.getElementById("cfgBadNodeCooldownSec")?.value || 25),
+      syncEditedScriptsOnStart: document.getElementById("cfgSyncEditedScriptsOnStart")
+        ? document.getElementById("cfgSyncEditedScriptsOnStart").checked
+        : true,
+      autoStopOnComplete: document.getElementById("cfgAutoStopOnComplete")
+        ? document.getElementById("cfgAutoStopOnComplete").checked
+        : true,
+      autoStopOnCompleteKeyword: document.getElementById("cfgAutoStopOnCompleteKeyword")?.value || "",
+      maxTotalSucceededRuns: Number(document.getElementById("cfgMaxTotalSucceededRuns")?.value || 0),
+      nextStageCommand: document.getElementById("cfgNextStageCommand")?.value || "",
       schedulerEnabled: document.getElementById("cfgSchedulerEnabled").checked,
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
@@ -1780,7 +1920,8 @@ async function browseSfmFiles() {
             ? `cd ${parentDir} && python3 ${containerPath}`
             : `cd ${parentDir} && bash ${containerPath}`;
           document.getElementById("jobExecutionCommand").value = cmd;
-          showToast(`✨ 실행 명령어가 [${cmd}] 로 설정되었습니다.`);
+          openSfmScriptEditor(containerPath, { silent: true }).catch(() => {});
+          showToast(`✨ 실행 명령어가 [${cmd}] 로 설정되고 웹 에디터에 로드되었습니다.`);
         }
       };
       box.appendChild(pill);
@@ -2354,6 +2495,206 @@ function renderHistoryTable(history) {
       `;
     })
     .join("");
+}
+
+// =========================================================================
+// Batch 2 - Feature 1: In-Dashboard `/group-volume` Script Web Editor & Rolling Deploy
+// =========================================================================
+async function openSfmScriptEditor(optPath, opts = {}) {
+  const pathInput = document.getElementById("sfmEditorFilePath");
+  const ta = document.getElementById("sfmEditorTextarea");
+  const badge = document.getElementById("sfmEditorStatusBadge");
+  if (!pathInput || !ta) return;
+
+  const targetPath = (optPath || pathInput.value || "/group-volume/run.sh").trim();
+  pathInput.value = targetPath;
+  if (badge) {
+    badge.className = "badge info";
+    badge.textContent = "불러오는 중...";
+  }
+  try {
+    const res = await api(`/api/space/sfm-file?path=${encodeURIComponent(targetPath)}`);
+    ta.value = res.content ?? "";
+    if (badge) {
+      badge.className = res.autoInject ? "badge ok" : "badge info";
+      badge.textContent = res.autoInject
+        ? `동기화 활성 (${res.source || "saved"})`
+        : `로드됨 (${res.source || "template"})`;
+    }
+    if (!opts.silent) {
+      showToast(`📂 [${res.path || targetPath}] 스크립트를 웹 에디터에 불러왔습니다.`);
+    }
+  } catch (e) {
+    if (badge) {
+      badge.className = "badge warn";
+      badge.textContent = "새 스크립트 작성 모드";
+    }
+    if (!opts.silent) {
+      showToast(`📝 [${targetPath}] 새 스크립트 편집 모드로 열렸습니다.`);
+    }
+  }
+}
+
+async function saveSfmScriptFile(rollingRestart = false) {
+  const pathInput = document.getElementById("sfmEditorFilePath");
+  const ta = document.getElementById("sfmEditorTextarea");
+  const badge = document.getElementById("sfmEditorStatusBadge");
+  if (!pathInput || !ta) return;
+
+  const filePath = (pathInput.value || "/group-volume/run.sh").trim();
+  const content = ta.value || "";
+
+  if (rollingRestart) {
+    const ok = confirm(
+      `[${filePath}] 스크립트를 저장하고 현재 가동 중인 워커를 무중단 롤링 재시작하여 새 스크립트를 즉시 반영할까요?`
+    );
+    if (!ok) return;
+  }
+
+  try {
+    const res = await api("/api/space/sfm-file", {
+      method: "POST",
+      body: JSON.stringify({
+        path: filePath,
+        content,
+        rollingRestart: Boolean(rollingRestart),
+        batchSize: 2,
+      }),
+    });
+    if (badge) {
+      badge.className = "badge ok";
+      badge.textContent = `저장됨 · 컨테이너 시작 시 100% 자동 동기화`;
+    }
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+    if (rollingRestart) {
+      showToast(
+        `🚀 [${res.path}] 저장 + 가동 워커 ${res.rollingResult?.terminatedCount || 0}개 무중단 롤링 교체 시작!`
+      );
+    } else {
+      showToast(`💾 [${res.path}] 스크립트 저장 완료! (컨테이너 시작 시 자동 동기화 반영)`);
+    }
+    await loadServerState();
+  } catch (e) {
+    alert("스크립트 저장 실패: " + e.message);
+  }
+}
+
+// =========================================================================
+// Batch 2 - Feature 4: Experiment Presets Bookmark Bar & 1-Click Switcher
+// =========================================================================
+function renderPresetsBar(presets = []) {
+  const panel = document.getElementById("presetsBarPanel");
+  if (!panel) return;
+  const list = Array.isArray(presets) ? presets : [];
+  if (list.length === 0) {
+    panel.innerHTML = `<div style="font-size:12px; color:#fcd34d;">⚡ 등록된 실험 프리셋이 없습니다. 우측 상단 [⭐ 현재 설정을 프리셋으로 저장] 버튼을 눌러 추가하세요.</div>`;
+    return;
+  }
+  const pillsHtml = list
+    .map(
+      (p) => `
+      <div style="display:inline-flex; align-items:center; gap:4px; background:rgba(15,23,42,0.82); border:1px solid rgba(245,158,11,0.45); border-radius:6px; padding:4px 8px;">
+        <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11.5px; border:none; background:transparent; color:#fde68a; font-weight:700;"
+          onclick="applyJobPreset('${escapeHtml(p.id)}', false)"
+          title="클릭 시 [${escapeHtml(p.name)}] 설정 적용 (명령어: ${escapeHtml(p.executionCommand || "")} · 목표 ${p.minConcurrentRuns}워커)">
+          ${escapeHtml(p.name)} <span class="mono" style="font-size:10.5px; color:#93c5fd;">[${escapeHtml(p.badge || `${p.minConcurrentRuns}W`)}]</span>
+        </button>
+        <button type="button" class="success sm" style="padding:2px 6px; font-size:10.5px;"
+          onclick="applyJobPreset('${escapeHtml(p.id)}', true)"
+          title="프리셋 적용과 동시에 즉시 할당 트리거">🚀적용+실행</button>
+        <button type="button" class="secondary sm" style="padding:1px 5px; font-size:10px; color:#94a3b8;"
+          onclick="deleteJobPreset('${escapeHtml(p.id)}')"
+          title="이 프리셋 삭제">✕</button>
+      </div>
+    `
+    )
+    .join("");
+
+  panel.innerHTML = `
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; width:100%;">
+      <span style="font-size:12px; font-weight:700; color:#fcd34d; flex-shrink:0;">⚡ 4. 실험 프리셋 원클릭 전환:</span>
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; flex:1;">
+        ${pillsHtml}
+      </div>
+    </div>
+  `;
+}
+
+async function applyJobPreset(presetId, triggerImmediately = false) {
+  try {
+    const res = await api("/api/presets/apply", {
+      method: "POST",
+      body: JSON.stringify({ presetId, triggerImmediately }),
+    });
+    if (res.jobs && res.jobs[0]) {
+      populateJobForm(res.jobs[0]);
+    }
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+    showToast(
+      `⚡ 프리셋 [${res.preset?.name || presetId}] 적용 완료! (목표 ${res.preset?.minConcurrentRuns}워커 · ${
+        res.preset?.allowSpot ? "Spot" : "Standard"
+      })${triggerImmediately ? " + 즉시 실행 요청됨!" : ""}`
+    );
+    await loadServerState();
+  } catch (e) {
+    alert("프리셋 적용 실패: " + e.message);
+  }
+}
+
+async function saveCurrentJobAsPreset() {
+  const defaultName = `${document.getElementById("jobName")?.value || "실험"} (${document.getElementById("jobMinConcurrent")?.value || 1}워커)`;
+  const name = prompt("저장할 실험 프리셋(북마크) 이름을 입력하세요:", defaultName);
+  if (!name || !name.trim()) return;
+  const minConcurrentRuns = Math.max(1, Number(document.getElementById("jobMinConcurrent")?.value || 1));
+  const allowSpot = document.getElementById("jobAllowSpot")?.checked || false;
+  const executionCommand = document.getElementById("jobExecutionCommand")?.value || "bash /group-volume/run.sh";
+  const coreCount = Math.max(1, Number(document.getElementById("jobCoreCount")?.value || 1));
+  const expectedRunTime = document.getElementById("jobExpectedRunTime")?.value || "8h";
+
+  try {
+    const res = await api("/api/presets", {
+      method: "POST",
+      body: JSON.stringify({
+        name: name.trim(),
+        badge: `${minConcurrentRuns}W · ${allowSpot ? "Spot" : "Std"}`,
+        executionCommand,
+        minConcurrentRuns,
+        coreCount,
+        allowSpot,
+        expectedRunTime,
+      }),
+    });
+    renderPresetsBar(res.presets || []);
+    showToast(`⭐ [${name.trim()}] 프리셋이 북마크 바에 저장되었습니다!`);
+  } catch (e) {
+    alert("프리셋 저장 실패: " + e.message);
+  }
+}
+
+async function deleteJobPreset(presetId) {
+  try {
+    const res = await api(`/api/presets/${encodeURIComponent(presetId)}`, { method: "DELETE" });
+    renderPresetsBar(res.presets || []);
+    showToast("🗑️ 프리셋이 삭제되었습니다.");
+  } catch (e) {
+    alert("프리셋 삭제 실패: " + e.message);
+  }
+}
+
+// =========================================================================
+// Batch 2 - Feature 5: Export GPU Telemetry Report (CSV / JSON)
+// =========================================================================
+function exportTelemetryReport(format = "csv") {
+  const pw = encodeURIComponent(sessionPassword || "");
+  const url = `/api/telemetry/export?format=${encodeURIComponent(format)}&pw=${pw}`;
+  window.open(url, "_blank");
+  showToast(`📥 누적 GPU-Hours 리포트(${format.toUpperCase()}) 다운로드를 시작합니다.`);
 }
 
 function escapeHtml(str) {

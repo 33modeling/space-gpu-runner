@@ -218,6 +218,30 @@
               </label>
               <button type="button" class="secondary sm" onclick="testAlertNotification()" style="padding:3px 8px; font-size:11px;">🔔 알림 테스트</button>
             </div>
+            <div style="margin-top:8px; padding-top:8px; border-top:1px dashed rgba(139,92,246,0.35); display:flex; flex-direction:column; gap:6px;">
+              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:11px; color:#e2e8f0;">
+                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;" title="워커가 시작 3분 내 조기 실패하거나 ECC/Xid/CUDA init 에러 발생 시 쿨다운 후 다른 노드에 재배치">
+                  <input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 🩺 <b>불량 GPU 노드 회피 쿨다운 가드</b>
+                </label>
+                <span>회피 쿨다운(초): <input type="number" id="cfgBadNodeCooldownSec" value="25" min="5" max="300" class="mono" style="width:48px; padding:2px 4px; font-size:11px;" /></span>
+                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;" title="웹 에디터에서 수정한 /group-volume 스크립트를 워커 컨테이너 시작 시 자동으로 동기화">
+                  <input type="checkbox" id="cfgSyncEditedScriptsOnStart" checked /> 📝 <b>웹 에디터 수정 스크립트 컨테이너 자동 동기화</b>
+                </label>
+              </div>
+              <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:11px; color:#e2e8f0;">
+                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+                  <input type="checkbox" id="cfgAutoStopOnComplete" checked /> ⛓️ <b>목표 완료 자동정지 &amp; 파이프라인 체이닝</b>
+                </label>
+                <span>완료 키워드:</span>
+                <input type="text" id="cfgAutoStopOnCompleteKeyword" value="ALL_TASKS_COMPLETED,TRAINING_FINISHED,PIPELINE_DONE" class="mono" style="width:190px; padding:2px 6px; font-size:11px;" />
+                <span>목표 성공수(0=무제한):</span>
+                <input type="number" id="cfgMaxTotalSucceededRuns" value="0" min="0" max="9999" class="mono" style="width:52px; padding:2px 4px; font-size:11px;" />
+              </div>
+              <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:11px;">
+                <span style="color:#c4b5fd; font-weight:600;">⛓️ Stage 2 후속 명령어 (선택):</span>
+                <input type="text" id="cfgNextStageCommand" placeholder="예: bash /group-volume/eval_and_merge.sh (Stage 1 완료 시 자동 전환)" class="mono" style="flex:1; min-width:220px; padding:3px 8px; font-size:11px;" />
+              </div>
+            </div>
           </div>
 
           <div class="form-group full">
@@ -241,7 +265,7 @@
       <!-- Card 2: Discovered GPU Pools & Group Volume Explorer -->
       <div class="card">
         <div class="card-header">
-          <h2>2️⃣ 그룹 GPU Pool 현황 &amp; <code>/group-volume</code> 스크립트 탐색</h2>
+          <h2>2️⃣ 그룹 GPU Pool 현황 &amp; <code>/group-volume</code> 스크립트 탐색 · 웹 에디터</h2>
           <div class="btn-row">
             <button class="secondary sm" onclick="discoverSpaceResources()">🔍 GPU Pool / 이미지 / Spec 조회</button>
           </div>
@@ -269,10 +293,27 @@
             <button class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/group-volume'; browseSfmFiles()">📁 /group-volume</button>
             <button class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/user-volume'; browseSfmFiles()">📁 /user-volume</button>
           </div>
-          <div id="sfmFilesList" class="pill-list" style="margin-top:8px; max-height:145px; overflow-y:auto;"></div>
+          <div id="sfmFilesList" class="pill-list" style="margin-top:8px; max-height:130px; overflow-y:auto;"></div>
           <div class="hint" style="margin-top:6px;">
-            📌 SPACE WLM 컨테이너 내부에서는 그룹 볼륨이 <b><code>/group-volume</code></b>, 개인 볼륨이 <b><code>/user-volume</code></b>으로 마운트됩니다. 위에서 폴더/스크립트를 클릭하면 아래 실행 명령어에 바로 입력됩니다.
+            📌 위에서 스크립트 클릭 시 아래 실행 명령어에 자동 입력되며, <b>[📝 편집]</b>을 누르면 아래 <b>실시간 웹 에디터</b>에서 바로 수정 &amp; 무중단 롤링 배포할 수 있습니다.
           </div>
+        </div>
+
+        <!-- 📝 Feature 1: In-Dashboard /group-volume Script Live Web Editor -->
+        <div id="sfmScriptEditorPanel" style="margin-top:12px; padding:10px 12px; border-radius:8px; background:rgba(15,23,42,0.75); border:1px solid rgba(56,189,248,0.35);">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
+            <div style="font-size:12px; font-weight:700; color:#38bdf8;">
+              📝 1. 대시보드 내장 <code>/group-volume</code> 스크립트 실시간 웹 에디터 &amp; 원클릭 배포
+            </div>
+            <span id="sfmEditorStatusBadge" class="badge info" style="font-size:10.5px;">대기 중</span>
+          </div>
+          <div style="display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap;">
+            <input type="text" id="sfmEditorFilePath" value="/group-volume/run.sh" placeholder="/group-volume/run.sh" class="mono" style="flex:1; min-width:200px; padding:4px 8px; font-size:12px;" />
+            <button type="button" class="secondary sm" onclick="openSfmScriptEditor()" style="padding:4px 10px; font-size:11.5px;">📂 파일 불러오기</button>
+            <button type="button" class="sm" onclick="saveSfmScriptFile(false)" style="padding:4px 10px; font-size:11.5px; background:rgba(16,185,129,0.25); border:1px solid rgba(16,185,129,0.55); color:#6ee7b7;">💾 스크립트 저장</button>
+            <button type="button" class="sm" onclick="saveSfmScriptFile(true)" style="padding:4px 10px; font-size:11.5px; background:rgba(59,130,246,0.28); border:1px solid rgba(59,130,246,0.6); color:#93c5fd;" title="스크립트 저장과 동시에 가동 중인 워커를 순차 교체하여 새 스크립트를 즉시 반영합니다.">🚀 저장 + 무중단 롤링 배포</button>
+          </div>
+          <textarea id="sfmEditorTextarea" rows="5" class="mono" placeholder="#!/usr/bin/env bash&#10;set -e&#10;echo &quot;Starting worker slot ${WORKER_SLOT:-1}/${WORKER_TOTAL:-1}&quot;&#10;bash /group-volume/run.sh" style="width:100%; font-size:11.5px; line-height:1.45; padding:8px; border-radius:6px; background:rgba(2,6,23,0.85); color:#e2e8f0; border:1px solid rgba(148,163,184,0.28); resize:vertical;"></textarea>
         </div>
       </div>
     </div>
@@ -282,9 +323,15 @@
       <div class="card-header">
         <h2>3️⃣ 주기적 GPU 할당 및 <code>/group-volume</code> 스크립트 실행 규칙 설정</h2>
         <div class="btn-row">
+          <button class="secondary sm" onclick="saveCurrentJobAsPreset()" style="border-color:rgba(245,158,11,0.5); color:#fcd34d;">⭐ 현재 설정을 프리셋으로 저장</button>
           <button class="secondary sm" onclick="resetJobForm()">➕ 새 규칙 작성 초기화</button>
           <button class="sm" onclick="saveJobRule()">💾 자동 실행 규칙 저장</button>
         </div>
+      </div>
+
+      <!-- ⚡ Feature 4: Quick Experiment Presets Bookmark Bar -->
+      <div id="presetsBarPanel" style="margin-bottom:12px; padding:9px 12px; border-radius:8px; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.32); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+        <div style="font-size:12px; font-weight:700; color:#fcd34d;">⚡ 4. 실험 프리셋(Preset) 원클릭 전환 바 불러오는 중...</div>
       </div>
 
       <!-- 📊 Live Worker Fleet Status & Auto-Spawn Progress Board -->
@@ -556,6 +603,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=11"></script>
+  <script src="/app.js?v=12"></script>
 </body>
 </html>
