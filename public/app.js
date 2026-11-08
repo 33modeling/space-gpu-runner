@@ -1195,17 +1195,43 @@ function renderConfig(cfg, loopStats = null) {
   }
 
   const jwtBadge = document.getElementById("jwtBadge");
+  const card1Banner = document.getElementById("card1TokenStatusBanner");
   if (cfg.jwtInfo) {
     const rem = cfg.jwtInfo.remainingSec;
-    const mins = rem !== null ? Math.floor(rem / 60) : "?";
-    jwtBadge.className = rem !== null && rem > 0 ? "badge ok" : "badge warn";
-    jwtBadge.textContent = `인증됨: ${cfg.jwtInfo.sub || cfg.resolvedUserName || "User"} (만료 ${mins}분 전)`;
+    const mins = rem !== null ? Math.floor(rem / 60) : null;
+    const userLabel = cfg.userName || cfg.resolvedUserName || cfg.jwtInfo.sub || "User";
+    if (rem !== null && rem > 0) {
+      jwtBadge.className = "badge ok";
+      jwtBadge.textContent = `🟢 인증됨: ${userLabel} (${mins}분 남음)`;
+      if (card1Banner) {
+        card1Banner.style.background = "rgba(16, 185, 129, 0.14)";
+        card1Banner.style.borderColor = "rgba(16, 185, 129, 0.45)";
+        card1Banner.style.color = "#6ee7b7";
+        card1Banner.innerHTML = `🟢 <b>SPACE 토큰 정상 인증됨</b> — 계정: <code>${escapeHtml(userLabel)}</code> · 그룹: <code>${escapeHtml(cfg.groupId || "자동")}</code> · 남은 시간: <b>${mins}분</b> ${cfg.hasRefreshToken ? "(Refresh 자동 갱신 활성)" : ""}`;
+      }
+    } else {
+      const expiredMins = mins !== null ? Math.abs(mins) : "?";
+      jwtBadge.className = "badge err";
+      jwtBadge.textContent = `🚨 토큰 만료됨 (${expiredMins}분 전 만료)`;
+      if (card1Banner) {
+        card1Banner.style.background = "rgba(239, 68, 68, 0.16)";
+        card1Banner.style.borderColor = "rgba(239, 68, 68, 0.55)";
+        card1Banner.style.color = "#fca5a5";
+        card1Banner.innerHTML = `🚨 <b>저장된 SPACE 토큰이 만료되었습니다 (${expiredMins}분 전 만료)</b> — 먼저 <code>space.n9.sr-cloud.com</code> 탭을 <b>새로고침(<code>F5</code>)하여 재로그인</b>한 뒤 아래에 새 토큰을 붙여넣어 주세요!`;
+      }
+    }
   } else if (cfg.hasAccessToken) {
     jwtBadge.className = "badge ok";
     jwtBadge.textContent = "Access Token 설정됨";
   } else {
     jwtBadge.className = "badge warn";
     jwtBadge.textContent = "토큰 미설정";
+    if (card1Banner) {
+      card1Banner.style.background = "rgba(245, 158, 11, 0.14)";
+      card1Banner.style.borderColor = "rgba(245, 158, 11, 0.45)";
+      card1Banner.style.color = "#fde68a";
+      card1Banner.innerHTML = `⚠️ <b>SPACE 토큰이 아직 설정되지 않았습니다.</b> 아래 안내에 따라 토큰을 복사해 붙여넣어 주세요.`;
+    }
   }
 
   document.getElementById("groupBadge").textContent = `Group ID: ${cfg.groupId || "미설정"}`;
@@ -1412,74 +1438,198 @@ async function quickUpdateLoadGuard(patch = {}) {
 }
 
 function copyDevtoolsExtractor() {
-  const snippet = `copy(sessionStorage)`;
+  const snippet = `copy(JSON.stringify({accessToken:sessionStorage.access_token||localStorage.access_token,refreshToken:sessionStorage.refresh_token||localStorage.refresh_token,groupId:localStorage.group_id||sessionStorage.group_id}))`;
+  const inputEl = document.getElementById("devtoolsSnippetInput");
+  if (inputEl) {
+    inputEl.value = snippet;
+    inputEl.focus();
+    inputEl.select();
+  }
   const onCopied = () => {
-    showToast("📋 copy(sessionStorage) 코드가 복사되었습니다! SPACE 콘솔(F12)에 입력 후 Enter를 누르고 아래 칸에 붙여넣으세요.");
+    showToast("📋 토큰 추출 코드가 복사되었습니다! space.n9.sr-cloud.com 콘솔(F12)에 붙여넣고 Enter를 누른 뒤, 아래 칸에 Ctrl+V 하세요.");
   };
+  // Always try synchronous execCommand('copy') first so HTTP LAN IP (10.113.125.253:4300) never loses user-gesture activation!
+  const syncOk = fallbackCopyText(snippet);
+  if (syncOk) {
+    onCopied();
+    return;
+  }
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(snippet).then(onCopied).catch(() => fallbackCopyText(snippet, onCopied));
+    navigator.clipboard
+      .writeText(snippet)
+      .then(onCopied)
+      .catch(() => {
+        showToast("💡 화면의 파란색 추출 코드가 전체 선택되었습니다. Ctrl+C를 눌러 복사하세요!");
+      });
   } else {
-    fallbackCopyText(snippet, onCopied);
+    showToast("💡 화면의 파란색 추출 코드가 전체 선택되었습니다. Ctrl+C를 눌러 복사하세요!");
   }
 }
 
 function onAccessTokenInput(val) {
-  if (val && val.trim().startsWith("{")) {
-    applyQuickPasteJson(val);
+  if (val && (val.trim().startsWith("{") || val.includes("access_token"))) {
+    applyQuickPasteJson(val, false);
   }
 }
 
-function fallbackCopyText(text, onSuccess) {
+function fallbackCopyText(text) {
   try {
     const ta = document.createElement("textarea");
     ta.value = text;
     ta.style.position = "fixed";
-    ta.style.opacity = "0";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
-    document.execCommand("copy");
+    const ok = document.execCommand("copy");
     document.body.removeChild(ta);
-    if (onSuccess) onSuccess();
-  } catch (err) {
-    prompt("아래 코드를 복사하여 space.n9.sr-cloud.com 콘솔(F12)에 붙여넣으세요:", text);
+    return Boolean(ok);
+  } catch {
+    return false;
   }
 }
 
-async function applyQuickPasteJson(raw) {
-  if (!raw) return;
-  const trimmed = raw.trim().replace(/^['"]|['"]$/g, "");
-  if (!trimmed) return;
+function decodeBrowserJwt(token) {
+  try {
+    const parts = String(token || "").trim().split(".");
+    if (parts.length < 2) return null;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
+}
 
-  // Case 1: User pasted raw JWT (eyJ...) directly from Application -> Session Storage -> access_token
-  if (trimmed.startsWith("eyJ") && trimmed.split(".").length >= 2) {
-    document.getElementById("cfgAccessToken").value = trimmed;
-    document.getElementById("quickPasteJson").value = "";
-    showToast("✅ Access Token 인식 완료! 자동으로 그룹 및 GPU 풀 정보를 불러옵니다...");
-    await saveConfig();
-    await discoverSpaceResources();
+function showTokenPasteResult(type, htmlMsg) {
+  const box = document.getElementById("tokenPasteResultBox");
+  if (!box) return;
+  box.style.display = "block";
+  if (type === "ok") {
+    box.style.background = "rgba(16, 185, 129, 0.16)";
+    box.style.border = "1px solid rgba(16, 185, 129, 0.5)";
+    box.style.color = "#6ee7b7";
+  } else if (type === "warn") {
+    box.style.background = "rgba(245, 158, 11, 0.16)";
+    box.style.border = "1px solid rgba(245, 158, 11, 0.5)";
+    box.style.color = "#fde68a";
+  } else {
+    box.style.background = "rgba(239, 68, 68, 0.18)";
+    box.style.border = "1px solid rgba(239, 68, 68, 0.55)";
+    box.style.color = "#fca5a5";
+  }
+  box.innerHTML = htmlMsg;
+}
+
+async function applyQuickPasteJson(raw, isManualButton = false) {
+  if (!raw || !raw.trim()) {
+    if (isManualButton) {
+      showTokenPasteResult("err", "⚠️ 붙여넣은 내용이 비어 있습니다. 먼저 SPACE 콘솔 또는 Session Storage에서 토큰을 복사해 붙여넣어 주세요.");
+    }
+    return;
+  }
+  const trimmed = raw.trim();
+
+  let extractedAccess = "";
+  let extractedRefresh = "";
+  let extractedGroup = "";
+  let extractedUser = "";
+
+  // 1. Try JSON parsing (supports copy(sessionStorage) multi-line JSON, copy(JSON.stringify(...)), or nested objects)
+  if (trimmed.startsWith("{")) {
+    try {
+      const obj = JSON.parse(trimmed);
+      const merged = {
+        ...(obj.s && typeof obj.s === "object" ? obj.s : {}),
+        ...(obj.l && typeof obj.l === "object" ? obj.l : {}),
+        ...obj,
+      };
+      extractedAccess = String(merged.accessToken || merged.access_token || "").replace(/^['"]|['"]$/g, "").trim();
+      extractedRefresh = String(merged.refreshToken || merged.refresh_token || "").replace(/^['"]|['"]$/g, "").trim();
+      extractedGroup = String(merged.groupId || merged.group_id || "").replace(/^['"]|['"]$/g, "").trim();
+      extractedUser = String(merged.userName || merged.user_name || merged.username || "").replace(/^['"]|['"]$/g, "").trim();
+    } catch {
+      // If multi-line JSON is partially pasted or malformed, fall through to universal JWT regex scanner below
+    }
+  }
+
+  // 2. Universal JWT Scanner: Finds all eyJ...xxx.yyy.zzz tokens anywhere in the text (cURL, Headers, Application table row, or JSON)
+  const jwtMatches = trimmed.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g) || [];
+  for (const jwt of jwtMatches) {
+    const payload = decodeBrowserJwt(jwt);
+    if (!payload) continue;
+    if (payload.typ === "Refresh") {
+      if (!extractedRefresh) extractedRefresh = jwt;
+    } else {
+      if (!extractedAccess) extractedAccess = jwt;
+      if (payload.preferred_username && !extractedUser) {
+        extractedUser = String(payload.preferred_username);
+      }
+    }
+  }
+
+  if (!extractedAccess && !extractedRefresh) {
+    // Only show error if user clicked button or finished pasting a JSON object `{...}`
+    if (isManualButton || (trimmed.startsWith("{") && trimmed.endsWith("}")) || trimmed.length > 30) {
+      showTokenPasteResult(
+        "err",
+        `🚨 붙여넣은 내용에서 유효한 SPACE 토큰(<code>eyJ...</code>)을 찾지 못했습니다!<br/>👉 <code>space.n9.sr-cloud.com</code>에 로그인된 탭의 콘솔에서 실행했는지 확인하거나, <code>F12 → Application → Session Storage</code>에서 <code>access_token</code> 값을 복사해 붙여넣어 주세요.`
+      );
+    }
     return;
   }
 
-  // Case 2: User pasted JSON from copy(sessionStorage) or Console snippet
-  if (!trimmed.startsWith("{")) return;
-  try {
-    const obj = JSON.parse(trimmed);
-    const accessToken = obj.accessToken || obj.access_token;
-    const refreshToken = obj.refreshToken || obj.refresh_token;
-    const groupId = obj.groupId || obj.group_id;
-    const userName = obj.userName || obj.user_name || obj.username;
+  // 3. Check JWT Expiration before saving so we immediately warn if the SPACE browser tab itself had an expired token!
+  const nowSec = Math.floor(Date.now() / 1000);
+  const accPayload = extractedAccess ? decodeBrowserJwt(extractedAccess) : null;
+  const refPayload = extractedRefresh ? decodeBrowserJwt(extractedRefresh) : null;
+  const accRemSec = accPayload?.exp ? accPayload.exp - nowSec : null;
+  const refRemSec = refPayload?.exp ? refPayload.exp - nowSec : null;
 
-    if (accessToken) document.getElementById("cfgAccessToken").value = String(accessToken).replace(/^"|"$/g, "");
-    if (refreshToken) document.getElementById("cfgRefreshToken").value = String(refreshToken).replace(/^"|"$/g, "");
-    if (groupId) document.getElementById("cfgGroupId").value = String(groupId).replace(/^"|"$/g, "");
-    if (userName) document.getElementById("cfgUserName").value = String(userName).replace(/^"|"$/g, "");
-    document.getElementById("quickPasteJson").value = "";
-    await saveConfig();
-    await discoverSpaceResources();
-  } catch {
-    // ignore partial input
+  if (extractedAccess) document.getElementById("cfgAccessToken").value = extractedAccess;
+  if (extractedRefresh) {
+    document.getElementById("cfgRefreshToken").value = extractedRefresh;
+  } else if (accRemSec !== null && accRemSec > 0) {
+    // Clear old expired refresh token if user pasted only a fresh access_token
+    const oldRef = document.getElementById("cfgRefreshToken").value;
+    const oldRefPayload = oldRef ? decodeBrowserJwt(oldRef) : null;
+    if (oldRefPayload?.exp && oldRefPayload.exp < nowSec) {
+      document.getElementById("cfgRefreshToken").value = "";
+    }
   }
+  if (extractedGroup && extractedGroup !== "undefined" && extractedGroup !== "null") {
+    document.getElementById("cfgGroupId").value = extractedGroup;
+  }
+  if (extractedUser && extractedUser !== "undefined" && extractedUser !== "null") {
+    document.getElementById("cfgUserName").value = extractedUser;
+  }
+
+  document.getElementById("quickPasteJson").value = "";
+
+  // Case A: Both Access Token and Refresh Token in the SPACE tab are ALREADY expired!
+  if ((accRemSec !== null && accRemSec <= 0) && (refRemSec === null || refRemSec <= 0)) {
+    const expiredMins = Math.abs(Math.floor(accRemSec / 60));
+    showTokenPasteResult(
+      "err",
+      `🚨 <b>주의: 방금 복사해 오신 토큰은 ${expiredMins}분 전에 이미 만료된 토큰입니다!</b><br/>` +
+        `원인: 열려 있는 <code>space.n9.sr-cloud.com</code> 탭이 오래전에 로그인되어 세션이 만료된 상태입니다.<br/>` +
+        `👉 <b>해결법:</b> <code>space.n9.sr-cloud.com</code> 탭에서 <b>새로고침(<code>F5</code>)하여 다시 로그인</b>한 뒤, 똑같이 복사해 붙여넣어 주세요!`
+    );
+    showToast(`🚨 복사하신 SPACE 탭의 토큰이 이미 만료(${expiredMins}분 전)되어 있습니다! SPACE 탭을 F5 새로고침 후 다시 복사하세요.`);
+    await saveConfig();
+    return;
+  }
+
+  // Case B: Access Token is valid (or Refresh Token is valid and server will auto-refresh)
+  const validMins = accRemSec !== null && accRemSec > 0 ? Math.floor(accRemSec / 60) : Math.floor((refRemSec || 0) / 60);
+  showTokenPasteResult(
+    "ok",
+    `✅ <b>새 토큰 적용 완료!</b> (계정: <code>${escapeHtml(extractedUser || accPayload?.preferred_username || "감지됨")}</code> · 유효시간: <b>${validMins}분 남음</b>${extractedRefresh ? " · Refresh 토큰 포함" : ""}) — 그룹 및 GPU 풀을 자동 동기화합니다.`
+  );
+  showToast(`✅ 새 SPACE 토큰 적용 완료! (유효시간 ${validMins}분 남음)`);
+  await saveConfig();
+  await discoverSpaceResources();
 }
 
 async function discoverSpaceResources(opts = {}) {

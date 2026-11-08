@@ -67,16 +67,32 @@
         <div class="card-header">
           <h2>1️⃣ SPACE 연동 인증 &amp; 기본 스케줄러 설정</h2>
           <div class="btn-row">
-            <button class="secondary sm" onclick="copyDevtoolsExtractor()">📋 토큰 추출 코드 복사</button>
-            <button class="sm" onclick="saveConfig()">💾 설정 저장</button>
+            <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()">📋 1. 추출 코드 복사</button>
+            <button type="button" class="sm" onclick="saveConfig()">💾 설정 저장</button>
           </div>
         </div>
 
+        <!-- 현재 토큰 유효/만료 상태 실시간 배너 -->
+        <div id="card1TokenStatusBanner" style="margin-bottom:8px; padding:8px 12px; border-radius:8px; font-size:12.5px; font-weight:700; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4); color:#fde68a;">
+          ⏳ 토큰 상태 확인 중...
+        </div>
+
         <div class="hint" style="margin-bottom:10px; background:rgba(59,130,246,0.1); border:1px solid rgba(59,130,246,0.35); border-radius:8px; padding:10px;">
-          💡 <b>초간단 토큰 연동 (3초 완료):</b> <code>space.n9.sr-cloud.com</code>에서 <code>F12(콘솔)</code> → <b style="color:#38bdf8;"><code>copy(sessionStorage)</code></b> 입력 후 엔터 → 아래 칸에 <b><code>Ctrl+V</code></b>!
-          <div style="display:flex; gap:6px; margin-top:6px;">
-            <input type="text" id="quickPasteJson" placeholder="여기에 Ctrl+V 붙여넣기하면 토큰·그룹·GPU 풀이 자동 세팅됩니다!" class="mono" oninput="applyQuickPasteJson(this.value)" />
+          <div style="font-size:12px; color:#e2e8f0; line-height:1.5;">
+            💡 <b>토큰 연동 방법 (아래 3가지 중 편한 방법 아무거나 사용 가능!):</b><br/>
+            ① <b>[주의]</b> 먼저 <code>space.n9.sr-cloud.com</code> 탭을 <b>새로고침(<code>F5</code>)하여 로그인 상태가 살아있는지 확인</b>하세요.<br/>
+            ② <code>F12</code> → <b>Console(콘솔)</b> 탭에서 아래 코드를 붙여넣고 <code>Enter</code> (또는 직접 <b style="color:#38bdf8;"><code>copy(sessionStorage)</code></b> 타이핑 후 <code>Enter</code>)<br/>
+            <span style="color:#94a3b8; font-size:11px;">※ 콘솔 붙여넣기가 막혀 있으면 <code>F12</code> → <b>Application</b> → <b>Session Storage</b>에서 <code>access_token</code> 값(<code>eyJ...</code>)을 더블클릭 복사해도 됩니다!</span>
           </div>
+          <div style="display:flex; gap:6px; margin-top:6px; align-items:center;">
+            <input type="text" id="devtoolsSnippetInput" readonly value='copy(JSON.stringify({accessToken:sessionStorage.access_token||localStorage.access_token,refreshToken:sessionStorage.refresh_token||localStorage.refresh_token,groupId:localStorage.group_id||sessionStorage.group_id}))' class="mono" onclick="this.select(); copyDevtoolsExtractor();" style="flex:1; font-size:11px; padding:5px 8px; background:rgba(2,6,23,0.85); color:#38bdf8; border:1px solid rgba(56,189,248,0.4); cursor:pointer;" title="클릭하면 전체 선택 및 복사됩니다" />
+            <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()" style="flex-shrink:0;">📋 코드 복사</button>
+          </div>
+          <div style="display:flex; gap:6px; margin-top:8px; align-items:stretch;">
+            <textarea id="quickPasteJson" rows="2" placeholder="여기에 Ctrl+V로 붙여넣으세요! (copy(sessionStorage) 여러 줄 JSON, eyJ... 토큰 원문, cURL 모두 자동 인식)" class="mono" oninput="applyQuickPasteJson(this.value, false)" style="flex:1; font-size:12px; padding:6px 8px; resize:vertical;"></textarea>
+            <button type="button" class="success sm" onclick="applyQuickPasteJson(document.getElementById('quickPasteJson').value, true)" style="flex-shrink:0; font-weight:800; padding:0 14px;">🚀 토큰 즉시 적용</button>
+          </div>
+          <div id="tokenPasteResultBox" style="display:none; margin-top:6px; padding:6px 10px; border-radius:6px; font-size:12px; font-weight:700;"></div>
         </div>
 
         <div class="form-grid">
@@ -622,6 +638,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=13"></script>
+  <script src="/app.js?v=14"></script>
 </body>
 </html>

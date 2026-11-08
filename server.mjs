@@ -585,9 +585,14 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
 }
 
 let refreshInFlightPromise = null;
+let lastDeadRefreshToken = "";
 
 async function refreshAccessToken() {
-  if (!state.config.refreshToken) return false;
+  const rt = (state.config.refreshToken || "").trim();
+  if (!rt) return false;
+  if (rt === lastDeadRefreshToken) {
+    return false;
+  }
   if (refreshInFlightPromise) {
     return refreshInFlightPromise;
   }
@@ -600,7 +605,7 @@ async function refreshAccessToken() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           grant_type: "refresh_token",
-          refresh_token: state.config.refreshToken.trim(),
+          refresh_token: rt,
           client_id: "mlp-front",
         }),
       });
@@ -608,7 +613,12 @@ async function refreshAccessToken() {
       if (!res.ok) {
         const errText = await res.text();
         recordApiTelemetry({ endpoint: "/api/acm/token", latencyMs, status: res.status, ok: false, errorMsg: errText });
-        addLog("error", `Access Token 자동 갱신 실패 (HTTP ${res.status})`, { error: errText.slice(0, 200) });
+        if (res.status === 400 || res.status === 401) {
+          lastDeadRefreshToken = rt;
+        }
+        addLog("error", `Access Token 자동 갱신 실패 (HTTP ${res.status}) — 1번 카드에서 새 토큰을 붙여넣어 주세요.`, {
+          error: errText.slice(0, 200),
+        });
         return false;
       }
       recordApiTelemetry({ endpoint: "/api/acm/token", latencyMs, status: res.status, ok: true });
@@ -616,6 +626,7 @@ async function refreshAccessToken() {
       const newAccess = data?.access_token || data?.data?.access_token;
       const newRefresh = data?.refresh_token || data?.data?.refresh_token;
       if (newAccess) {
+        lastDeadRefreshToken = "";
         state.config.accessToken = newAccess;
         if (newRefresh) state.config.refreshToken = newRefresh;
         saveState();
@@ -3963,6 +3974,27 @@ const server = http.createServer(async (req, res) => {
           ? { badNodeCooldownSec: Math.max(5, Number(body.badNodeCooldownSec || 25)) }
           : {}),
       };
+      // Smart JWT classification & dead refresh-token cleanup on config save
+      if (state.config.accessToken) {
+        const accPayload = decodeJwtPayload(state.config.accessToken);
+        if (accPayload?.typ === "Refresh") {
+          state.config.refreshToken = state.config.accessToken;
+          lastDeadRefreshToken = "";
+          await refreshAccessToken();
+        } else if (accPayload?.preferred_username && !state.config.userName) {
+          state.config.userName = String(accPayload.preferred_username);
+        }
+      }
+      if (state.config.refreshToken) {
+        const refPayload = decodeJwtPayload(state.config.refreshToken);
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (refPayload?.exp && refPayload.exp < nowSec) {
+          // Clear already-expired refresh token so it doesn't fail on auto-refresh
+          state.config.refreshToken = "";
+        } else {
+          lastDeadRefreshToken = "";
+        }
+      }
       resolveGroupId();
       if (state.config.timeScaleEnabled) {
         applyTimeScaleToJobs();
