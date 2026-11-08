@@ -87,15 +87,24 @@ function lockDashboard(msg = "") {
   setTimeout(() => input && input.focus(), 50);
 }
 
+let bgRefreshTickCounter = 0;
+let lastKnownPendingApprovals = 0;
+let lastKnownActiveWorkerIdsSig = "";
+
 function applyUiRefreshInterval(sec) {
-  const cleanSec = Math.max(1, Math.min(600, Number(sec || 5)));
+  const cleanSec = Math.max(2, Math.min(600, Number(sec || 5)));
   if (uiRefreshTimer && currentUiRefreshSec === cleanSec) return;
   currentUiRefreshSec = cleanSec;
   if (uiRefreshTimer) clearInterval(uiRefreshTimer);
-  uiRefreshTimer = setInterval(() => {
+  uiRefreshTimer = setInterval(async () => {
     if (!sessionPassword) return;
-    loadServerState();
-    loadApprovals();
+    bgRefreshTickCounter += 1;
+    await loadServerState({ background: true });
+    // Avoid redundant back-to-back DOM redraws: /api/state already includes approvalLoopStats & timeline.
+    // Only poll /api/space/approvals or /api/space/runs when pending approvals exist, active runs changed, or every 3rd tick.
+    if (lastKnownPendingApprovals > 0 || bgRefreshTickCounter % 3 === 0) {
+      loadApprovals({ background: true });
+    }
   }, cleanSec * 1000);
 }
 
@@ -184,7 +193,7 @@ function maybeTriggerBrowserAlert(alerts, cfg) {
   }
 }
 
-async function loadServerState() {
+async function loadServerState(options = {}) {
   if (!sessionPassword) return;
   try {
     const data = await api("/api/state");
@@ -197,6 +206,7 @@ async function loadServerState() {
     }
     if (data.approvalLoopStats) {
       latestApprovalStats = data.approvalLoopStats;
+      lastKnownPendingApprovals = Number(data.approvalLoopStats.pendingCount || 0);
     }
     if (Array.isArray(data.autoApprovalTimeline)) {
       latestAutoApprovalTimeline = data.autoApprovalTimeline;
@@ -215,6 +225,19 @@ async function loadServerState() {
     renderJobsTable(data.jobs || [], latestWorkerFleet);
     renderHistoryTable(data.history || []);
     applyUiRefreshInterval(data.config?.uiRefreshIntervalSec || 5);
+
+    // If active worker IDs or statuses changed during background poll, sync the bottom runs table calmly
+    const activeSig = (latestWorkerFleet?.jobs || [])
+      .map((j) => (j.activeWorkers || []).map((w) => `${w.id}:${w.status}`).join(","))
+      .join(";");
+    if (activeSig !== lastKnownActiveWorkerIdsSig) {
+      const wasInitial = lastKnownActiveWorkerIdsSig === "";
+      lastKnownActiveWorkerIdsSig = activeSig;
+      if (!wasInitial && options.background && data.config?.hasAccessToken) {
+        loadSpaceRuns({ background: true });
+      }
+    }
+
     if (!window._initialEditorLoaded) {
       window._initialEditorLoaded = true;
       openSfmScriptEditor(undefined, { silent: true }).catch(() => {});
@@ -313,8 +336,146 @@ function selectFleetJobTab(jobId) {
   if (jobObj) {
     loadJobToForm(jobObj, false, false);
   } else {
-    if (latestWorkerFleet) renderWorkerFleetBoard(latestWorkerFleet);
+    if (latestWorkerFleet) renderWorkerFleetBoard(latestWorkerFleet, { force: true });
     renderTopAutoStatusBanner();
+  }
+}
+
+// ============================================================================
+// Anti-Flicker / Partial DOM Diffing & Slot Hover-Freeze State
+// ============================================================================
+let isSlotBoardFrozen = false; // Manual freeze toggle button
+let autoFreezeOnSlotHover = true; // Auto-freeze slot grid while mouse cursor is over #wfSlotPillsGrid
+let isMouseOverSlotGrid = false;
+let isMouseOverRunsTable = false;
+let pendingSlotItemsBuffer = null;
+
+function updateHtmlIfSigChanged(el, sig, html) {
+  if (!el) return false;
+  const sigStr = String(sig ?? "");
+  if (el.getAttribute("data-render-sig") === sigStr) {
+    return false;
+  }
+  el.setAttribute("data-render-sig", sigStr);
+  el.innerHTML = html;
+  return true;
+}
+
+function setSlotGridHover(isHovering) {
+  const nextVal = Boolean(isHovering);
+  if (isMouseOverSlotGrid === nextVal) return;
+  isMouseOverSlotGrid = nextVal;
+  const badgeEl = document.getElementById("wfSlotFreezeStatusBadge");
+  if (badgeEl) {
+    if (isSlotBoardFrozen) {
+      badgeEl.style.display = "inline-flex";
+      badgeEl.textContent = "🔒 슬롯 화면 수동 고정 중";
+    } else if (autoFreezeOnSlotHover && isMouseOverSlotGrid) {
+      badgeEl.style.display = "inline-flex";
+      badgeEl.textContent = "⏸️ 마우스 올림 — 슬롯 움직임 일시 고정됨";
+    } else {
+      badgeEl.style.display = "none";
+    }
+  }
+  // When mouse leaves the slot grid and manual freeze is off, flush any buffered slot updates cleanly in-place
+  if (!isMouseOverSlotGrid && !isSlotBoardFrozen && pendingSlotItemsBuffer) {
+    const gridEl = document.getElementById("wfSlotPillsGrid");
+    if (gridEl) {
+      patchSlotPillsGrid(gridEl, pendingSlotItemsBuffer, true);
+    }
+    pendingSlotItemsBuffer = null;
+  }
+}
+
+function toggleAutoFreezeOnSlotHover(checked) {
+  autoFreezeOnSlotHover = Boolean(checked);
+  if (!autoFreezeOnSlotHover && !isSlotBoardFrozen && pendingSlotItemsBuffer) {
+    const gridEl = document.getElementById("wfSlotPillsGrid");
+    if (gridEl) patchSlotPillsGrid(gridEl, pendingSlotItemsBuffer, true);
+    pendingSlotItemsBuffer = null;
+  }
+  renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+}
+
+function toggleSlotBoardFreeze(forceState) {
+  if (typeof forceState === "boolean") {
+    isSlotBoardFrozen = forceState;
+  } else {
+    isSlotBoardFrozen = !isSlotBoardFrozen;
+  }
+  showToast(
+    isSlotBoardFrozen
+      ? "🔒 슬롯 화면이 고정되었습니다. (해제 전까지 슬롯 재배치가 멈춥니다)"
+      : "🔓 슬롯 화면 고정이 해제되어 최신 상태가 반영되었습니다."
+  );
+  renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+}
+
+function patchSlotPillsGrid(gridEl, slotItems, forceRender = false) {
+  if (!gridEl || !Array.isArray(slotItems)) return;
+  if (!forceRender && (isSlotBoardFrozen || (autoFreezeOnSlotHover && isMouseOverSlotGrid))) {
+    pendingSlotItemsBuffer = slotItems;
+    return;
+  }
+  pendingSlotItemsBuffer = null;
+
+  const fullGridSig = slotItems.map((it) => `${it.key}:${it.sig}`).join("||");
+  if (gridEl.getAttribute("data-grid-sig") === fullGridSig) {
+    return; // Zero changes across all slots -> 0 DOM mutations!
+  }
+  gridEl.setAttribute("data-grid-sig", fullGridSig);
+
+  const prevScrollTop = gridEl.scrollTop;
+  const existingMap = new Map();
+  for (const child of Array.from(gridEl.children)) {
+    const k = child.getAttribute("data-slot-key");
+    if (k) existingMap.set(k, child);
+  }
+
+  const desiredKeys = new Set(slotItems.map((it) => it.key));
+  // Remove stale slot elements no longer in the list
+  for (const [k, node] of existingMap.entries()) {
+    if (!desiredKeys.has(k)) {
+      node.remove();
+      existingMap.delete(k);
+    }
+  }
+
+  // Patch or insert each slot in exact order while keeping unchanged DOM nodes 100% intact
+  slotItems.forEach((item, idx) => {
+    let node = existingMap.get(item.key);
+    if (!node) {
+      const temp = document.createElement("div");
+      temp.innerHTML = item.html.trim();
+      node = temp.firstElementChild;
+      if (!node) return;
+      node.setAttribute("data-slot-key", item.key);
+      node.setAttribute("data-slot-sig", item.sig);
+      const refNode = gridEl.children[idx] || null;
+      gridEl.insertBefore(node, refNode);
+      existingMap.set(item.key, node);
+    } else {
+      if (node.getAttribute("data-slot-sig") !== item.sig) {
+        const temp = document.createElement("div");
+        temp.innerHTML = item.html.trim();
+        const newNode = temp.firstElementChild;
+        if (newNode) {
+          newNode.setAttribute("data-slot-key", item.key);
+          newNode.setAttribute("data-slot-sig", item.sig);
+          node.replaceWith(newNode);
+          node = newNode;
+          existingMap.set(item.key, node);
+        }
+      }
+      const currentAtIdx = gridEl.children[idx];
+      if (currentAtIdx !== node) {
+        gridEl.insertBefore(node, currentAtIdx || null);
+      }
+    }
+  });
+
+  if (prevScrollTop > 0) {
+    gridEl.scrollTop = prevScrollTop;
   }
 }
 
@@ -431,7 +592,7 @@ function renderTopAutoStatusBanner() {
     })
     .join("");
 
-  banner.innerHTML = `
+  const bannerHtml = `
     <!-- Top Header Row -->
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; padding-bottom:12px; border-bottom:1px solid rgba(148,163,184,0.25);">
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -557,7 +718,7 @@ function renderTopAutoStatusBanner() {
         </div>
 
         <div class="mono" style="font-size:12px; color:#e2e8f0; background:rgba(2,6,23,0.65); padding:9px 12px; border-radius:8px; border:1px solid rgba(16,185,129,0.3); line-height:1.6;">
-          <div>📌 <b>마지막 승인 대기열(Queue) 스캔 시각:</b> <span style="color:#6ee7b7; font-weight:700;">${escapeHtml(formatPreciseTime(appStats.lastCheckedAt, true))}</span> <span style="color:#94a3b8;">(누적 스캔 #${appStats.tickCount || 0}회)</span></div>
+          <div>📌 <b>마지막 승인 대기열(Queue) 스캔 시각:</b> <span id="topQueueScanTimeSpan" style="color:#6ee7b7; font-weight:700;">${escapeHtml(formatPreciseTime(appStats.lastCheckedAt, true))}</span> <span id="topQueueScanTickSpan" style="color:#94a3b8;">(누적 스캔 #${appStats.tickCount || 0}회)</span></div>
           <div id="topNextApprovalCountdown" style="color:#34d399; font-weight:700;">⏱️ 다음 자동 승인 대기열 스캔 카운트다운 계산 중...</div>
           <div style="font-size:11px; color:#a7f3d0; margin-top:2px;">
             👑 누적 무클릭 Admin 자동 승인 완료: <b>${totalAutoApproved}건</b> (현재 승인 대기 PENDING: <b>${appStats.pendingCount || 0}건</b> · 마지막 승인 런: <code>${escapeHtml(lastApprovedRunName)}</code>)
@@ -576,7 +737,7 @@ function renderTopAutoStatusBanner() {
           <span style="font-weight:800; font-size:13.5px; color:#f8fafc;">
             서버/클러스터 무리 방지 모니터링 가드 (${isLoadGuardOn ? "활성" : "비활성"})
           </span>
-          <span style="font-size:12px; color:${loadBadgeColor}; font-weight:600;">
+          <span id="topLoadSummaryTextSpan" style="font-size:12px; color:${loadBadgeColor}; font-weight:600;">
             — ${escapeHtml(lm.summaryText || "실시간 API 응답속도 및 Pending 워커 수 감시 중")}
           </span>
         </div>
@@ -599,7 +760,7 @@ function renderTopAutoStatusBanner() {
       <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-top:10px;">
         <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
           <div style="color:#94a3b8;">⏳ 준비중(Pending/Creating) 워커 가드</div>
-          <div style="font-size:14px; font-weight:800; color:${inFlightPending >= maxPendingCap ? "#fbbf24" : "#34d399"}; margin-top:2px;">
+          <div id="topInFlightGuardSpan" style="font-size:14px; font-weight:800; color:${inFlightPending >= maxPendingCap ? "#fbbf24" : "#34d399"}; margin-top:2px;">
             현재 ${inFlightPending}개 대기 / 상한 ${maxPendingCap}개
             ${lm.oldestPendingWaitSec > 0 ? `<span style="font-size:11px; color:#fde68a;">(최장 ${lm.oldestPendingWaitSec}초)</span>` : ""}
           </div>
@@ -607,21 +768,21 @@ function renderTopAutoStatusBanner() {
 
         <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
           <div style="color:#94a3b8;">📡 SPACE API 응답속도 (Latency)</div>
-          <div style="font-size:14px; font-weight:800; color:${(lmApi.avgLatencyMs || 0) >= 1800 ? "#fbbf24" : "#60a5fa"}; margin-top:2px;">
+          <div id="topApiLatencySpan" style="font-size:14px; font-weight:800; color:${(lmApi.avgLatencyMs || 0) >= 1800 ? "#fbbf24" : "#60a5fa"}; margin-top:2px;">
             최근 ${lmApi.lastLatencyMs || 0}ms · 평균 ${lmApi.avgLatencyMs || 0}ms <span style="font-size:11px; color:#94a3b8;">(P95 ${lmApi.p95LatencyMs || 0}ms)</span>
           </div>
         </div>
 
         <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
           <div style="color:#94a3b8;">🔄 API 호출 빈도 &amp; 스마트 캐시 보호</div>
-          <div style="font-size:14px; font-weight:800; color:#a7f3d0; margin-top:2px;">
+          <div id="topApiRpmSpan" style="font-size:14px; font-weight:800; color:#a7f3d0; margin-top:2px;">
             분당 ${lmApi.requestsPerMinute || 0}회 호출 · 캐시절감 ${lmApi.cacheHitsPerMinute || 0}회/분
           </div>
         </div>
 
         <div class="mono" style="background:rgba(2,6,23,0.6); border:1px solid rgba(148,163,184,0.2); border-radius:7px; padding:7px 10px; font-size:11.5px;">
           <div style="color:#94a3b8;">🖥️ 로컬 런너 서버 리소스 &amp; 페이싱 배율</div>
-          <div style="font-size:14px; font-weight:800; color:#e2e8f0; margin-top:2px;">
+          <div id="topHostCpuSpan" style="font-size:14px; font-weight:800; color:#e2e8f0; margin-top:2px;">
             CPU ${lmHost.cpuLoadPct ?? 0}% (Load ${lmHost.loadAvg1m ?? 0}) · RAM ${lmHost.rssMb ?? 0}MB · 간격 ${(lm.pacingMultiplier || 1).toFixed(1)}x
           </div>
         </div>
@@ -638,7 +799,7 @@ function renderTopAutoStatusBanner() {
           💡 수동으로 클릭해서 만든 워커든 스케줄러가 자동 신청한 워커든 <b>Admin 승인은 100% 서버가 약 1~1.8초 내에 자동으로 요청·승인</b>했습니다.
         </div>
       </div>
-      <div style="overflow-x:auto; max-height:240px; overflow-y:auto;">
+      <div id="topTimelineTableScrollWrap" style="overflow-x:auto; max-height:240px; overflow-y:auto;">
         <table style="margin:0;">
           <thead>
             <tr>
@@ -661,13 +822,71 @@ function renderTopAutoStatusBanner() {
     </div>
   `;
 
+  // Compute structural signature excluding 3-second tickCount / latency jitter so the banner doesn't flicker
+  const timelineSig = timeline
+    .slice(0, 12)
+    .map((it) => `${it.runId}:${it.runStatus}:${it.approvedAt}`)
+    .join(",");
+  const bannerStructuralSig = [
+    jf.jobId,
+    runningCnt,
+    pendingCnt,
+    activeCnt,
+    targetCnt,
+    remainingCnt,
+    excessPendingCnt,
+    isSchedOn,
+    isApprovalOn,
+    allocIntervalSec,
+    approvalIntervalSec,
+    lastAllocReqTime,
+    lastApprovalReqTime,
+    lastApprovedDoneTime,
+    lastApprovedRunId,
+    autoAllocTotal,
+    manualAllocTotal,
+    totalAutoApproved,
+    appStats.pendingCount || 0,
+    isLoadGuardOn,
+    maxPendingCap,
+    loadLevel,
+    inFlightPending,
+    timelineSig,
+  ].join("|");
+
+  if (banner.getAttribute("data-banner-sig") === bannerStructuralSig) {
+    // Only update volatile live telemetry spans in-place without touching the rest of the banner DOM!
+    const scanTimeEl = document.getElementById("topQueueScanTimeSpan");
+    if (scanTimeEl) scanTimeEl.textContent = formatPreciseTime(appStats.lastCheckedAt, true);
+    const scanTickEl = document.getElementById("topQueueScanTickSpan");
+    if (scanTickEl) scanTickEl.textContent = `(누적 스캔 #${appStats.tickCount || 0}회)`;
+    const latEl = document.getElementById("topApiLatencySpan");
+    if (latEl) {
+      latEl.innerHTML = `최근 ${lmApi.lastLatencyMs || 0}ms · 평균 ${lmApi.avgLatencyMs || 0}ms <span style="font-size:11px; color:#94a3b8;">(P95 ${lmApi.p95LatencyMs || 0}ms)</span>`;
+    }
+    const rpmEl = document.getElementById("topApiRpmSpan");
+    if (rpmEl) {
+      rpmEl.textContent = `분당 ${lmApi.requestsPerMinute || 0}회 호출 · 캐시절감 ${lmApi.cacheHitsPerMinute || 0}회/분`;
+    }
+    const cpuEl = document.getElementById("topHostCpuSpan");
+    if (cpuEl) {
+      cpuEl.textContent = `CPU ${lmHost.cpuLoadPct ?? 0}% (Load ${lmHost.loadAvg1m ?? 0}) · RAM ${lmHost.rssMb ?? 0}MB · 간격 ${(lm.pacingMultiplier || 1).toFixed(1)}x`;
+    }
+  } else {
+    const prevScroll = document.getElementById("topTimelineTableScrollWrap")?.scrollTop || 0;
+    banner.setAttribute("data-banner-sig", bannerStructuralSig);
+    banner.innerHTML = bannerHtml;
+    const newScrollWrap = document.getElementById("topTimelineTableScrollWrap");
+    if (newScrollWrap && prevScroll > 0) newScrollWrap.scrollTop = prevScroll;
+  }
+
   updateWorkerCountdownBadge();
   if (!workerCountdownTimerId) {
     workerCountdownTimerId = setInterval(updateWorkerCountdownBadge, 1000);
   }
 }
 
-function renderWorkerFleetBoard(fleet) {
+function renderWorkerFleetBoard(fleet, options = {}) {
   const panel = document.getElementById("workerFleetPanel");
   if (!panel) return;
   const activeElId = document.activeElement?.id || "";
@@ -679,6 +898,7 @@ function renderWorkerFleetBoard(fleet) {
     return;
   }
   if (!fleet || !Array.isArray(fleet.jobs) || fleet.jobs.length === 0) {
+    panel.removeAttribute("data-wf-skeleton");
     panel.innerHTML = `
       <div style="font-size:13px; color:var(--muted);">
         📊 등록된 자동 실행 규칙이 없습니다. 아래에서 규칙을 저장하면 실시간 워커 가동 수 및 자동 생성 예정 현황이 표시됩니다.
@@ -893,7 +1113,24 @@ function renderWorkerFleetBoard(fleet) {
           ? `<span style="font-size:10px; color:${isStraggler ? "#fdba74" : "#38bdf8"}; font-weight:700;">📈 ${escapeHtml(progParts.join(" · "))}${isStraggler ? ` (🐢느림 < 중앙값 ${prog.medianSpeed})` : ""}</span>`
           : "";
 
-      slotPills.push(`
+      const slotSig = [
+        seqNum,
+        stateIdx,
+        w.status,
+        isSelected ? 1 : 0,
+        isExcess ? 1 : 0,
+        hasErr ? 1 : 0,
+        isStraggler ? 1 : 0,
+        reqTimeShort,
+        doneTimeShort,
+        logLineShort,
+        progParts.join(","),
+      ].join("|");
+
+      slotPills.push({
+        key: `active-${wIdStr}`,
+        sig: slotSig,
+        html: `
         <div class="mono" onclick="viewRunLog('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}')"
           title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(wIdStr)}) · 상태: ${escapeHtml(w.status)} · ${pillHeaderLabel} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${bg}; border:${isSelected ? "2px" : "1px"} solid ${border}; ${isSelected ? "box-shadow:0 0 0 2px rgba(56,189,248,0.28);" : ""} color:${color}; font-weight:600;">
@@ -921,14 +1158,18 @@ function renderWorkerFleetBoard(fleet) {
               : ""
           }
         </div>
-      `);
+      `,
+      });
     } else {
       const isNext = i === activeCnt && remainingCnt > 0 && isAutoOn;
       const bg = isNext ? "rgba(59,130,246,0.22)" : "rgba(30,41,59,0.65)";
       const border = isNext ? "#60a5fa" : "rgba(148,163,184,0.25)";
       const color = isNext ? "#93c5fd" : "#94a3b8";
       const nextSlotNum = i + 1;
-      slotPills.push(`
+      slotPills.push({
+        key: `wait-slot-${nextSlotNum}`,
+        sig: `${nextSlotNum}|${isNext ? 1 : 0}|${targetCnt}|${jf.jobId}`,
+        html: `
         <div class="mono"
           title="${isNext ? "다음 차례에 자동 생성될 워커 슬롯입니다 (우측 🗑️삭제 클릭 시 목표 워커 수 -1 차감)" : "순차적으로 자동 생성 예정인 워커 슬롯입니다 (우측 🗑️삭제 클릭 시 목표 워커 수 -1 차감)"}"
           style="display:inline-flex; align-items:center; justify-content:space-between; gap:6px; padding:4px 8px; border-radius:6px; font-size:11.5px; background:${bg}; border:1px dashed ${border}; color:${color};">
@@ -937,7 +1178,8 @@ function renderWorkerFleetBoard(fleet) {
             onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${Math.max(1, targetCnt - 1)})"
             title="대기 슬롯 1개를 삭제하여 목표 워커 수를 ${Math.max(1, targetCnt - 1)}개로 줄입니다">🗑️-1</button>
         </div>
-      `);
+      `,
+      });
     }
   }
 
@@ -950,7 +1192,10 @@ function renderWorkerFleetBoard(fleet) {
       const pillBg = isSelected ? "rgba(56,189,248,0.28)" : isMine ? "rgba(56,189,248,0.16)" : "rgba(168,85,247,0.16)";
       const pillBorder = isSelected ? "#38bdf8" : isMine ? "rgba(56,189,248,0.55)" : "rgba(168,85,247,0.55)";
       const pillColor = isMine ? "#7dd3fc" : "#d8b4fe";
-      slotPills.push(`
+      slotPills.push({
+        key: `unmatched-${uIdStr}`,
+        sig: `${uIdStr}|${u.status}|${isSelected ? 1 : 0}|${u.coreCount}`,
+        html: `
         <div class="mono" onclick="viewRunLog('${escapeHtml(uIdStr)}', '${escapeHtml(u.name)}')"
           title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(uIdStr)}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${pillBg}; border:${isSelected ? "2px" : "1px"} solid ${pillBorder}; color:${pillColor}; font-weight:600;">
@@ -965,7 +1210,8 @@ function renderWorkerFleetBoard(fleet) {
           </div>
           <span style="font-size:10px; opacity:0.9;">${u.isRunning ? "🟢 Running" : `⏳ ${escapeHtml(u.status)}`} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
         </div>
-      `);
+      `,
+      });
     }
   }
 
@@ -1084,9 +1330,61 @@ function renderWorkerFleetBoard(fleet) {
     } 가동 중입니다! (워커 종료 시 자동으로 즉시 재생성)`;
   }
 
-  panel.innerHTML = `
-    ${multiRuleTabsHtml}
-    ${reconciliationBarHtml}
+  // Ensure persistent skeleton inside #workerFleetPanel so we never destroy scroll positions, hover states, or <details>
+  if (panel.getAttribute("data-wf-skeleton") !== "1") {
+    panel.setAttribute("data-wf-skeleton", "1");
+    panel.innerHTML = `
+      <div id="wfMultiRuleTabs"></div>
+      <div id="wfReconciliationBar"></div>
+      <div id="wfHeadlineSection"></div>
+      <div id="wfMetricCardsSection"></div>
+      <div id="wfProgressBarSection"></div>
+      <div id="wfSlotSelectionBar"></div>
+      <div id="wfSlotPillsGrid"
+        onmouseenter="setSlotGridHover(true)"
+        onmouseleave="setSlotGridHover(false)"
+        style="display:flex; flex-wrap:wrap; gap:6px; max-height:225px; overflow-y:auto; padding-top:4px;"></div>
+      <details id="wfAdvancedDetails" style="margin-top:10px; padding:8px 12px; border-radius:8px; background:rgba(15,23,42,0.65); border:1px solid rgba(59,130,246,0.3);">
+        <summary style="cursor:pointer; font-size:12px; font-weight:700; color:#93c5fd; user-select:none;">
+          ⚙️ 무인 운영 상세 도구 펼치기 (Watchdog · 슬롯샤딩 · 폴백 · 야간부스트 · 전체 로그 스캔 · GPU-Hours 리포트)
+        </summary>
+        <div id="wfAutomationToggles"></div>
+        <div id="wfLiveLogSummary"></div>
+        <div id="wfTelemetryBoard"></div>
+      </details>
+    `;
+  }
+
+  // 1. Multi-rule tabs (only update when job counts/focus change)
+  const multiTabsSig = fleet.jobs
+    .map((it) => `${it.jobId}:${it.enabled}:${it.runningCount}:${it.pendingCount}:${it.targetCount}:${String(it.jobId) === String(jf.jobId)}`)
+    .join(";");
+  updateHtmlIfSigChanged(document.getElementById("wfMultiRuleTabs"), multiTabsSig, multiRuleTabsHtml);
+
+  // 2. SPACE Reconciliation Bar (only update when counts or unmatched run IDs/statuses change)
+  const reconSig = recon
+    ? [
+        jf.jobName,
+        runningCnt,
+        pendingCnt,
+        activeCnt,
+        targetCnt,
+        excessPendingCnt,
+        recon.mySpaceRunningWorkers,
+        recon.mySpacePendingWorkers,
+        recon.mySpaceActiveWorkers,
+        recon.spaceTotalRunningWorkers,
+        recon.spaceTotalPendingWorkers,
+        recon.spaceTotalActiveWorkers,
+        (recon.myUnmatchedActiveRuns || []).map((u) => `${u.id}:${u.status}`).join(","),
+        (recon.otherUserActiveRuns || []).map((u) => `${u.id}:${u.status}`).join(","),
+      ].join("|")
+    : "none";
+  updateHtmlIfSigChanged(document.getElementById("wfReconciliationBar"), reconSig, reconciliationBarHtml);
+
+  // 3. Headline section
+  const headlineSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${remainingCnt}|${excessPendingCnt}|${isAutoOn}|${intervalSec}`;
+  const headlineHtml = `
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
       <div>
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
@@ -1109,8 +1407,12 @@ function renderWorkerFleetBoard(fleet) {
         <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all')">🛑 전체 워커 종료</button>
       </div>
     </div>
+  `;
+  updateHtmlIfSigChanged(document.getElementById("wfHeadlineSection"), headlineSig, headlineHtml);
 
-    <!-- 4 Key Metric Cards -->
+  // 4. Metric cards section (only update when worker/target/interval counts change)
+  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${remainingCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}`;
+  const metricHtml = `
     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(215px, 1fr)); gap:10px; margin-bottom:12px;">
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(16,185,129,0.45); border-radius:8px; padding:10px 12px;">
         <div style="font-size:11.5px; color:#94a3b8;">🟢 실제 가동 중(Running) 워커 수</div>
@@ -1176,21 +1478,49 @@ function renderWorkerFleetBoard(fleet) {
         </div>
       </div>
     </div>
+  `;
+  updateHtmlIfSigChanged(document.getElementById("wfMetricCardsSection"), metricSig, metricHtml);
 
-    <!-- Dual Progress Bar (Green = Running, Amber = Pending) -->
+  // 5. Dual Progress Bar (only update when percentages or load badge change)
+  const progSig = `${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${runningPct}|${pendingPct}|${fleet.loadMonitor?.loadBadgeText || ""}`;
+  const progHtml = `
     <div style="margin-bottom:10px;">
       <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1; margin-bottom:4px; flex-wrap:wrap; gap:6px;">
         <span>🟢 실제 Running 달성률: <b style="color:#34d399;">${runningCnt} / ${targetCnt} 워커 (${runningPct}%)</b> &nbsp;·&nbsp; ⏳ Pending 대기: <b style="color:#fde68a;">${pendingCnt}개</b> (전체 활성 ${activeCnt}/${targetCnt}개)</span>
-        <span>🛡️ 부하보호: <b>${escapeHtml(fleet.loadMonitor?.loadBadgeText || "🟢 쾌적 · 안전 할당")}</b> (API 평균 ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms)</span>
-        <span>📊 누적 가동: <b>${tel.totalGpuHours ?? 0} GPU-Hours</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)</span>
+        <span>🛡️ 부하보호: <b>${escapeHtml(fleet.loadMonitor?.loadBadgeText || "🟢 쾌적 · 안전 할당")}</b> <span id="wfAvgApiSpan">(API 평균 ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms)</span></span>
+        <span id="wfGpuHoursSpan">📊 누적 가동: <b>${tel.totalGpuHours ?? 0} GPU-Hours</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)</span>
       </div>
       <div style="width:100%; height:10px; background:rgba(15,23,42,0.8); border-radius:999px; overflow:hidden; border:1px solid rgba(148,163,184,0.25); display:flex;">
         <div style="width:${runningPct}%; height:100%; background:linear-gradient(90deg, #10b981, #34d399); transition:width 0.3s ease;" title="실제 Running: ${runningCnt}개"></div>
         <div style="width:${pendingPct}%; height:100%; background:linear-gradient(90deg, #f59e0b, #fbbf24); transition:width 0.3s ease;" title="Pending 대기: ${pendingCnt}개"></div>
       </div>
     </div>
+  `;
+  if (!updateHtmlIfSigChanged(document.getElementById("wfProgressBarSection"), progSig, progHtml)) {
+    const apiEl = document.getElementById("wfAvgApiSpan");
+    if (apiEl) apiEl.textContent = `(API 평균 ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms)`;
+    const gpuEl = document.getElementById("wfGpuHoursSpan");
+    if (gpuEl) gpuEl.innerHTML = `📊 누적 가동: <b>${tel.totalGpuHours ?? 0} GPU-Hours</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)`;
+  }
 
-    <!-- 🎯 특정 워커 슬롯 직접 선택 & 즉시 Kill(Stop) / 슬롯 영구 삭제(Delete) 컨트롤 바 -->
+  // 6. Slot Selection & Freeze Control Bar
+  const slotBarSig = [
+    jf.jobId,
+    activeWorkers.length,
+    runningCnt,
+    pendingCnt,
+    excessPendingCnt,
+    selectedWorkerRunIds.size,
+    instantKillWithoutConfirm ? 1 : 0,
+    autoFreezeOnSlotHover ? 1 : 0,
+    isSlotBoardFrozen ? 1 : 0,
+  ].join("|");
+  const freezeBadgeStyle =
+    isSlotBoardFrozen || (autoFreezeOnSlotHover && isMouseOverSlotGrid) ? "display:inline-flex;" : "display:none;";
+  const freezeBadgeText = isSlotBoardFrozen
+    ? "🔒 슬롯 화면 수동 고정 중"
+    : "⏸️ 마우스 올림 — 슬롯 움직임 일시 고정됨";
+  const slotBarHtml = `
     <div style="margin-bottom:8px; padding:8px 11px; border-radius:8px; background:rgba(15,23,42,0.88); border:1.5px solid rgba(244,63,94,0.45); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px;">
         <span style="font-weight:800; color:#fda4af;">🎯 특정 슬롯 직접 선택 &amp; 즉시 Kill:</span>
@@ -1216,12 +1546,27 @@ function renderWorkerFleetBoard(fleet) {
             onclick="applySlotSpecSelection('${escapeHtml(jf.jobId)}')"
             title="입력한 슬롯 번호(예: 1, 5, 58-62) 또는 #RunID를 즉시 체크 선택합니다">번호선택</button>
         </div>
+
+        <span id="wfSlotFreezeStatusBadge" class="mono" style="${freezeBadgeStyle} align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:10.5px; font-weight:800; background:rgba(245,158,11,0.22); border:1px solid #fbbf24; color:#fde68a;">
+          ${freezeBadgeText}
+        </span>
       </div>
 
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+        <label style="display:inline-flex; align-items:center; gap:4px; font-size:11px; color:#93c5fd; cursor:pointer; margin:0;" title="슬롯 영역에 마우스를 올리고 있을 때는 화면 새로고침이 일어나도 슬롯이 움직이거나 다시 그려지지 않게 자동 보호합니다">
+          <input type="checkbox" ${autoFreezeOnSlotHover ? "checked" : ""} onchange="toggleAutoFreezeOnSlotHover(this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" />
+          🖱️ 마우스 올릴 때 슬롯 고정
+        </label>
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px; font-weight:700; ${
+          isSlotBoardFrozen
+            ? "background:rgba(245,158,11,0.28); border-color:#fbbf24; color:#fef08a;"
+            : "border-color:rgba(148,163,184,0.4); color:#cbd5e1;"
+        }" onclick="toggleSlotBoardFreeze()" title="슬롯 화면을 수동으로 일시 고정하여 새로고침 시에도 전혀 움직이지 않게 합니다">
+          ${isSlotBoardFrozen ? "🔒 슬롯 고정 중 (해제)" : "🔓 슬롯 화면 고정"}
+        </button>
         <label style="display:inline-flex; align-items:center; gap:4px; font-size:11px; color:#fde68a; cursor:pointer; margin:0;" title="체크 시 각 슬롯의 [🛑Kill] / [🗑️삭제] 클릭 시 확인 팝업 없이 0.1초 만에 즉시 종료합니다">
           <input type="checkbox" ${instantKillWithoutConfirm ? "checked" : ""} onchange="toggleInstantKillMode(this.checked)" style="width:13px; height:13px; margin:0; accent-color:#f43f5e;" />
-          ⚡ 확인창 없이 원클릭 즉시 Kill
+          ⚡ 원클릭 즉시 Kill
         </label>
         <button type="button" class="danger sm" style="padding:4px 10px; font-size:11.5px; font-weight:800;"
           onclick="executeSelectedWorkersKill(false, '${escapeHtml(jf.jobId)}')"
@@ -1235,53 +1580,56 @@ function renderWorkerFleetBoard(fleet) {
         </button>
       </div>
     </div>
-
-    <!-- Slot Pills Grid -->
-    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:210px; overflow-y:auto; padding-top:4px;">
-      ${slotPills.join("")}
-    </div>
-
-    <!-- 고급 무인 자동화 토글 · 로그 요약 · GPU-Hours 리포트는 접기/펼치기로 깔끔하게 정리 -->
-    <details style="margin-top:10px; padding:8px 12px; border-radius:8px; background:rgba(15,23,42,0.65); border:1px solid rgba(59,130,246,0.3);">
-      <summary style="cursor:pointer; font-size:12px; font-weight:700; color:#93c5fd; user-select:none;">
-        ⚙️ 무인 운영 상세 도구 펼치기 (Watchdog · 슬롯샤딩 · 폴백 · 야간부스트 · 전체 로그 스캔 · GPU-Hours 리포트)
-      </summary>
-      <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px;">
-          <button type="button" class="${wd.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
-            onclick="quickUpdateAutomation({ watchdogEnabled: ${wd.enabled === false ? "true" : "false"} })">
-            🧟 Watchdog: ${wd.enabled !== false ? `ON (교체 ${wd.zombieTerminatedCount || 0}건)` : "OFF"}
-          </button>
-          <button type="button" class="${shardingOn ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
-            onclick="quickUpdateAutomation({ injectWorkerEnv: ${shardingOn ? "false" : "true"} })">
-            🔢 WORKER_SLOT: ${shardingOn ? "ON" : "OFF"}
-          </button>
-          <button type="button" class="${hf.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
-            onclick="quickUpdateAutomation({ hybridFallbackEnabled: ${hf.enabled === false ? "true" : "false"} })">
-            🔄 Spot↔Std 폴백: ${hf.enabled !== false ? "ON" : "OFF"}
-          </button>
-          <button type="button" class="${ts.enabled ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
-            onclick="quickUpdateAutomation({ timeScaleEnabled: ${ts.enabled ? "false" : "true"} })">
-            🌙 야간·주말 부스트: ${ts.enabled ? "ON" : "OFF"}
-          </button>
-          <button type="button" class="${bng.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
-            onclick="quickUpdateAutomation({ badNodeGuardEnabled: ${bng.enabled === false ? "true" : "false"} })">
-            🩺 불량노드 가드: ${bng.enabled !== false ? "ON" : "OFF"}
-          </button>
-          <button type="button" class="${pipe.autoStopOnComplete !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
-            onclick="quickUpdateAutomation({ autoStopOnComplete: ${pipe.autoStopOnComplete === false ? "true" : "false"} })">
-            ⛓️ 완료 자동정지: ${pipe.autoStopOnComplete !== false ? "ON" : "OFF"}
-          </button>
-        </div>
-        <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
-          <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px;" onclick="bulkControlWorkers('scan_logs')">🔍 전체 워커 로그 스캔</button>
-          <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px;" onclick="bulkControlWorkers('rolling_restart', { batchSize: 1 })">🔄 1개씩 롤링 재시작</button>
-        </div>
-      </div>
-      ${liveLogSummaryHtml}
-      ${telemetryBoardHtml}
-    </details>
   `;
+  updateHtmlIfSigChanged(document.getElementById("wfSlotSelectionBar"), slotBarSig, slotBarHtml);
+
+  // 7. Keyed Per-Slot DOM Patching (Unchanged slots are NEVER redrawn; paused while hovering or frozen)
+  const slotGridEl = document.getElementById("wfSlotPillsGrid");
+  patchSlotPillsGrid(slotGridEl, slotPills, Boolean(options.force));
+
+  // 8. Advanced details sub-sections (preserves <details> open/closed state!)
+  const autoTogglesSig = `${wd.enabled}|${wd.zombieTerminatedCount || 0}|${shardingOn}|${hf.enabled}|${ts.enabled}|${bng.enabled}|${pipe.autoStopOnComplete}`;
+  const autoTogglesHtml = `
+    <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px;">
+        <button type="button" class="${wd.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ watchdogEnabled: ${wd.enabled === false ? "true" : "false"} })">
+          🧟 Watchdog: ${wd.enabled !== false ? `ON (교체 ${wd.zombieTerminatedCount || 0}건)` : "OFF"}
+        </button>
+        <button type="button" class="${shardingOn ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ injectWorkerEnv: ${shardingOn ? "false" : "true"} })">
+          🔢 WORKER_SLOT: ${shardingOn ? "ON" : "OFF"}
+        </button>
+        <button type="button" class="${hf.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ hybridFallbackEnabled: ${hf.enabled === false ? "true" : "false"} })">
+          🔄 Spot↔Std 폴백: ${hf.enabled !== false ? "ON" : "OFF"}
+        </button>
+        <button type="button" class="${ts.enabled ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ timeScaleEnabled: ${ts.enabled ? "false" : "true"} })">
+          🌙 야간·주말 부스트: ${ts.enabled ? "ON" : "OFF"}
+        </button>
+        <button type="button" class="${bng.enabled !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ badNodeGuardEnabled: ${bng.enabled === false ? "true" : "false"} })">
+          🩺 불량노드 가드: ${bng.enabled !== false ? "ON" : "OFF"}
+        </button>
+        <button type="button" class="${pipe.autoStopOnComplete !== false ? "success" : "secondary"} sm" style="padding:3px 8px; font-size:11px;"
+          onclick="quickUpdateAutomation({ autoStopOnComplete: ${pipe.autoStopOnComplete === false ? "true" : "false"} })">
+          ⛓️ 완료 자동정지: ${pipe.autoStopOnComplete !== false ? "ON" : "OFF"}
+        </button>
+      </div>
+      <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px;" onclick="bulkControlWorkers('scan_logs')">🔍 전체 워커 로그 스캔</button>
+        <button type="button" class="secondary sm" style="padding:3px 8px; font-size:11px;" onclick="bulkControlWorkers('rolling_restart', { batchSize: 1 })">🔄 1개씩 롤링 재시작</button>
+      </div>
+    </div>
+  `;
+  updateHtmlIfSigChanged(document.getElementById("wfAutomationToggles"), autoTogglesSig, autoTogglesHtml);
+
+  const liveLogSig = workersWithLogs.map((w) => `${w.id}:${w.hasLogError}:${w.lastLogLine}`).join("||");
+  updateHtmlIfSigChanged(document.getElementById("wfLiveLogSummary"), liveLogSig, liveLogSummaryHtml);
+
+  const telSig = `${tel.totalGpuHours ?? 0}|${tel.todayGpuHours ?? 0}|${tsSeries.length}|${tsSeries[tsSeries.length - 1]?.time || ""}`;
+  updateHtmlIfSigChanged(document.getElementById("wfTelemetryBoard"), telSig, telemetryBoardHtml);
 
   updateWorkerCountdownBadge();
   if (!workerCountdownTimerId) {
@@ -2545,8 +2893,17 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
   if (fleet && Array.isArray(fleet.jobs)) {
     fleet.jobs.forEach((jf) => jobFleetMap.set(jf.jobId, jf));
   }
+  const jobsRenderSig =
+    `${currentFormJobId}|${focusedId}|${isNewJobMode ? 1 : 0}|` +
+    jobs
+      .map((j) => {
+        const jf = jobFleetMap.get(j.id);
+        return `${j.id}:${j.name}:${j.enabled}:${j.minConcurrentRuns}:${j.allowSpot}:${j.coreId}:${j.coreCount}:${j.executionCommand}:${j.lastStatus}:${jf?.runningCount}:${jf?.pendingCount}`;
+      })
+      .join(";");
+
   if (tbody) {
-    tbody.innerHTML = jobs
+    const setupRowsHtml = jobs
       .map((j) => {
         const isSelected = !isNewJobMode && String(j.id) === String(currentFormJobId);
         const jf = jobFleetMap.get(j.id);
@@ -2602,10 +2959,11 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
         `;
       })
       .join("");
+    updateHtmlIfSigChanged(tbody, jobsRenderSig, setupRowsHtml);
   }
 
   if (monTbody) {
-    monTbody.innerHTML = jobs
+    const monRowsHtml = jobs
       .map((j) => {
         const isFocused = String(j.id) === String(focusedId);
         const jf = jobFleetMap.get(j.id);
@@ -2658,6 +3016,7 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
         `;
       })
       .join("");
+    updateHtmlIfSigChanged(monTbody, jobsRenderSig, monRowsHtml);
   }
 
   if (!window.__initialJobLoaded && jobs[0]) {
@@ -3064,11 +3423,19 @@ async function loadApprovals() {
     });
 
     if (!rows.length) {
-      tbody.innerHTML = `<tr><td colspan="6" class="hint">현재 승인 대기 중(PENDING)이거나 최근 승인 내역이 없습니다.</td></tr>`;
+      updateHtmlIfSigChanged(
+        tbody,
+        "empty-approvals",
+        `<tr><td colspan="6" class="hint">현재 승인 대기 중(PENDING)이거나 최근 승인 내역이 없습니다.</td></tr>`
+      );
       return;
     }
 
-    tbody.innerHTML = rows
+    const appRowsSig = rows
+      .slice(0, 25)
+      .map((r) => `${r.source}:${r.approvalId}:${r.runId}:${r.stageLabel}:${r.isPending}`)
+      .join("|");
+    const appRowsHtml = rows
       .slice(0, 25)
       .map((row) => {
         const actionBtns = row.isPending
@@ -3089,6 +3456,7 @@ async function loadApprovals() {
         `;
       })
       .join("");
+    updateHtmlIfSigChanged(tbody, appRowsSig, appRowsHtml);
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="6" class="hint" style="color:#f87171;">승인 대기 목록 조회 실패: ${escapeHtml(e.message)}</td></tr>`;
   }
@@ -3157,8 +3525,8 @@ let slotSpecDraftText = "";
 
 function toggleInstantKillMode(checked) {
   instantKillWithoutConfirm = Boolean(checked);
-  renderWorkerFleetBoard(latestWorkerFleet);
-  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+  renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, { force: true });
 }
 
 function toggleSelectWorkerRun(runId, forceVal) {
@@ -3171,8 +3539,8 @@ function toggleSelectWorkerRun(runId, forceVal) {
     if (selectedWorkerRunIds.has(idStr)) selectedWorkerRunIds.delete(idStr);
     else selectedWorkerRunIds.add(idStr);
   }
-  renderWorkerFleetBoard(latestWorkerFleet);
-  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+  renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, { force: true });
 }
 
 function selectWorkerGroup(mode, jobId) {
@@ -3231,8 +3599,8 @@ function selectWorkerGroup(mode, jobId) {
         : "🟢 현재 에러나 속도 저하가 감지된 슬롯이 없습니다."
     );
   }
-  renderWorkerFleetBoard(latestWorkerFleet);
-  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+  renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, { force: true });
 }
 
 function parseSlotSpecToRunIds(specStr, jf = getFocusedJobFleet(latestWorkerFleet)) {
@@ -3319,8 +3687,8 @@ function applySlotSpecSelection(jobId) {
   }
   showToast(`🎯 ${matchedRunIds.length}개 슬롯 선택 추가됨: ${matchedLabels.slice(0, 6).join(", ")}${matchedLabels.length > 6 ? " 외" : ""}`);
   if (inputEl) inputEl.blur();
-  renderWorkerFleetBoard(latestWorkerFleet);
-  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+  renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, { force: true });
 }
 
 async function killSingleWorkerSlot(runId, runName = "", slotLabel = "", reduceTarget = false, jobId = "") {
@@ -3351,7 +3719,7 @@ async function killSingleWorkerSlot(runId, runName = "", slotLabel = "", reduceT
     selectedWorkerRunIds.delete(idStr);
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
-      renderWorkerFleetBoard(latestWorkerFleet);
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
     }
     if (res.targetAdjustment) {
       const adj = res.targetAdjustment;
@@ -3365,7 +3733,7 @@ async function killSingleWorkerSlot(runId, runName = "", slotLabel = "", reduceT
     } else {
       showToast(`🛑 [${label} (#${idStr})] 즉시 강제 종료(Kill) 완료!`);
     }
-    await loadSpaceRuns();
+    await loadSpaceRuns({ force: true });
     await loadServerState();
   } catch (e) {
     alert(`슬롯 종료 실패 (#${idStr}): ` + e.message);
@@ -3422,7 +3790,7 @@ async function executeSelectedWorkersKill(reduceTarget = false, jobId = "") {
 
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
-      renderWorkerFleetBoard(latestWorkerFleet);
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
     }
 
     if (res.targetAdjustment) {
@@ -3437,7 +3805,7 @@ async function executeSelectedWorkersKill(reduceTarget = false, jobId = "") {
     } else {
       showToast(`🛑 선택 슬롯 ${res.terminatedCount || targetIds.length}개 즉시 강제 종료(Stop/Kill) 완료!`);
     }
-    await loadSpaceRuns();
+    await loadSpaceRuns({ force: true });
     await loadServerState();
   } catch (e) {
     alert("선택 슬롯 일괄 종료 실패: " + e.message);
@@ -3446,7 +3814,7 @@ async function executeSelectedWorkersKill(reduceTarget = false, jobId = "") {
 
 function setSpaceRunsFilter(filterMode) {
   currentSpaceRunsFilter = filterMode || "active";
-  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, { force: true });
 }
 
 function classifyUiRunStatus(status) {
@@ -3460,10 +3828,19 @@ function classifyUiRunStatus(status) {
   return "FAILED";
 }
 
-function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFleet) {
+function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFleet, options = {}) {
   const tbody = document.getElementById("runsTableBody");
   const filterBar = document.getElementById("runsFilterSummaryBar");
   if (!tbody) return;
+  if (!tbody.getAttribute("data-hover-bound")) {
+    tbody.setAttribute("data-hover-bound", "1");
+    tbody.addEventListener("mouseenter", () => {
+      isMouseOverRunsTable = true;
+    });
+    tbody.addEventListener("mouseleave", () => {
+      isMouseOverRunsTable = false;
+    });
+  }
 
   const allRuns = Array.isArray(runs) ? runs : [];
   const recon = fleet?.spaceReconciliation || {};
@@ -3509,7 +3886,8 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
         isSel ? "background:#2563eb; border:1px solid #60a5fa; color:#fff;" : `color:${color};`
       }">${label}</button>`;
     };
-    filterBar.innerHTML = `
+    const filterBarSig = `${currentSpaceRunsFilter}|${orderedActiveRuns.length}|${runningRuns.length}|${pendingRuns.length}|${myActiveRuns.length}|${allRuns.length}|${selectedWorkerRunIds.size}`;
+    const filterBarHtml = `
       <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
         <span style="font-weight:800; color:#93c5fd; margin-right:2px;">🔍 표시 필터:</span>
         ${mkBtn("active", `전체 활성 (${orderedActiveRuns.length}개)`)}
@@ -3530,6 +3908,7 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
         </div>
       </div>
     `;
+    updateHtmlIfSigChanged(filterBar, filterBarSig, filterBarHtml);
   }
 
   let displayList = [];
@@ -3545,10 +3924,38 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
     displayList = orderedActiveRuns;
   }
 
-  if (!displayList.length) {
-    tbody.innerHTML = `<tr><td colspan="7" class="hint">선택한 필터(${currentSpaceRunsFilter})에 해당하는 워크로드가 없습니다.</td></tr>`;
+  if (!options.force && isMouseOverRunsTable) {
     return;
   }
+
+  if (!displayList.length) {
+    updateHtmlIfSigChanged(
+      tbody,
+      `empty:${currentSpaceRunsFilter}`,
+      `<tr><td colspan="7" class="hint">선택한 필터(${currentSpaceRunsFilter})에 해당하는 워크로드가 없습니다.</td></tr>`
+    );
+    return;
+  }
+
+  const tableSig =
+    currentSpaceRunsFilter +
+    "::" +
+    displayList
+      .map((r) => {
+        const idStr = String(r.id ?? r.runId ?? "");
+        const st = String(r.status ?? r.state ?? r.phase ?? "");
+        const appSt = String(r.approvalStatus ?? "");
+        const rsn = String(r.reason ?? "");
+        const sel = selectedWorkerRunIds.has(idStr) ? 1 : 0;
+        const mj = runToJobName.get(idStr) || "";
+        return `${idStr}:${st}:${appSt}:${rsn}:${sel}:${mj}`;
+      })
+      .join("|");
+
+  if (tbody.getAttribute("data-render-sig") === tableSig) {
+    return;
+  }
+  tbody.setAttribute("data-render-sig", tableSig);
 
   let runSeq = 0;
   let pendSeq = 0;
@@ -3633,20 +4040,20 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
     .join("");
 }
 
-async function loadSpaceRuns() {
+async function loadSpaceRuns(options = {}) {
   if (!sessionPassword) return;
   const tbody = document.getElementById("runsTableBody");
   try {
     const data = await api("/api/space/runs");
     if (data.workerFleet) {
       latestWorkerFleet = data.workerFleet;
-      renderWorkerFleetBoard(latestWorkerFleet);
+      renderWorkerFleetBoard(latestWorkerFleet, options);
       if (serverState?.jobs) {
         renderJobsTable(serverState.jobs, latestWorkerFleet);
       }
     }
     latestRawSpaceRuns = data.runs || [];
-    renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+    renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, options);
   } catch (e) {
     if (tbody) {
       tbody.innerHTML = `<tr><td colspan="7" class="hint" style="color:#f87171;">런 목록 조회 오류: ${escapeHtml(e.message)}</td></tr>`;
@@ -3679,11 +4086,17 @@ async function stopRun(runId, reduceTarget = false, jobId = "") {
 
 function renderHistoryTable(history) {
   const tbody = document.getElementById("historyTableBody");
+  if (!tbody) return;
   if (!history.length) {
-    tbody.innerHTML = `<tr><td colspan="3" class="hint">아직 기록된 스케줄러 이벤트가 없습니다.</td></tr>`;
+    updateHtmlIfSigChanged(
+      tbody,
+      "empty-history",
+      `<tr><td colspan="3" class="hint">아직 기록된 스케줄러 이벤트가 없습니다.</td></tr>`
+    );
     return;
   }
-  tbody.innerHTML = history
+  const histSig = `${history.length}:${history[0]?.time || ""}:${history[0]?.message || ""}`;
+  const histHtml = history
     .map((h) => {
       const lvl = String(h.level || "info").toUpperCase();
       const cls = lvl === "ERROR" ? "badge err" : lvl === "WARN" ? "badge warn" : "badge ok";
@@ -3697,6 +4110,7 @@ function renderHistoryTable(history) {
       `;
     })
     .join("");
+  updateHtmlIfSigChanged(tbody, histSig, histHtml);
 }
 
 // =========================================================================
