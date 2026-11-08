@@ -466,6 +466,8 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
     baseUrl = state.config.baseUrl,
     rawResponse = false,
     extraHeaders = {},
+    timeoutMs = 15000,
+    skipTelemetry = false,
   } = options;
 
   const jwt = decodeJwtPayload(state.config.accessToken);
@@ -511,6 +513,7 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
   const fetchOptions = {
     method: overrideMethod ? "POST" : method.toUpperCase(),
     headers,
+    ...(timeoutMs > 0 && typeof AbortSignal?.timeout === "function" ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   };
 
   if (body !== undefined && fetchOptions.method !== "GET") {
@@ -523,26 +526,30 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
   try {
     res = await fetch(url, fetchOptions);
   } catch (netErr) {
-    recordApiTelemetry({
-      endpoint,
-      latencyMs: Date.now() - reqStartMs,
-      status: 0,
-      ok: false,
-      errorMsg: netErr.message,
-    });
+    if (!skipTelemetry) {
+      recordApiTelemetry({
+        endpoint,
+        latencyMs: Date.now() - reqStartMs,
+        status: 0,
+        ok: false,
+        errorMsg: netErr.message,
+      });
+    }
     throw netErr;
   }
   const reqLatencyMs = Date.now() - reqStartMs;
 
   if (rawResponse) {
     const text = await res.text();
-    recordApiTelemetry({
-      endpoint,
-      latencyMs: reqLatencyMs,
-      status: res.status,
-      ok: res.ok,
-      errorMsg: res.ok ? null : text.slice(0, 200),
-    });
+    if (!skipTelemetry) {
+      recordApiTelemetry({
+        endpoint,
+        latencyMs: reqLatencyMs,
+        status: res.status,
+        ok: res.ok,
+        errorMsg: res.ok ? null : text.slice(0, 200),
+      });
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
     }
@@ -564,22 +571,26 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
 
   if (!res.ok) {
     const errMsg = typeof data === "object" && data !== null ? data.message || data.detail || data.error || JSON.stringify(data) : String(data);
+    if (!skipTelemetry) {
+      recordApiTelemetry({
+        endpoint,
+        latencyMs: reqLatencyMs,
+        status: res.status,
+        ok: false,
+        errorMsg: errMsg,
+      });
+    }
+    throw new Error(`SPACE API Error [${res.status}] ${endpoint}: ${errMsg}`);
+  }
+
+  if (!skipTelemetry) {
     recordApiTelemetry({
       endpoint,
       latencyMs: reqLatencyMs,
       status: res.status,
-      ok: false,
-      errorMsg: errMsg,
+      ok: true,
     });
-    throw new Error(`SPACE API Error [${res.status}] ${endpoint}: ${errMsg}`);
   }
-
-  recordApiTelemetry({
-    endpoint,
-    latencyMs: reqLatencyMs,
-    status: res.status,
-    ok: true,
-  });
 
   return data;
 }
@@ -902,10 +913,12 @@ const spaceApi = {
     spaceRequest(`/api/wlm/v2/runs/${runId}`, {
       params: { deleted: true },
     }),
-  getRunLog: (runId, params = { tailLines: 300 }) =>
+  getRunLog: (runId, params = { tailLines: 300 }, extraOptions = {}) =>
     spaceRequest(`/api/wlm/v2/runs/${runId}/log`, {
       params,
       rawResponse: true,
+      timeoutMs: 4500,
+      ...extraOptions,
     }),
   createRun: (payload) =>
     spaceRequest("/api/wlm/v2/runs", {
@@ -992,6 +1005,8 @@ let lastKnownRuns = [];
 let lastKnownRunsAt = null;
 let lastKnownRunsAtMs = 0;
 let runsInFlightPromise = null;
+const recentlyCreatedRunsMap = new Map(); // runId -> { runObj, expiresAtMs }
+const inFlightJobReservations = new Map(); // jobId -> Map<resId, { slotIndex, expiresAtMs }>
 const lastKnownApprovalsMap = new Map();
 let approvalSummaryCache = null;
 let approvalSummaryCacheAtMs = 0;
@@ -1000,6 +1015,26 @@ const inFlightApprovalIds = new Set();
 const recentlyApprovedIds = new Map(); // id/runId -> timestampMs
 let lastContainerSuffix = "";
 let sameSecondSeq = 0;
+
+function mergeWithRecentlyCreatedRuns(apiRuns = []) {
+  const now = Date.now();
+  for (const [k, entry] of recentlyCreatedRunsMap.entries()) {
+    if (!entry || entry.expiresAtMs <= now) {
+      recentlyCreatedRunsMap.delete(k);
+    }
+  }
+  if (recentlyCreatedRunsMap.size === 0) return apiRuns;
+  const seenIds = new Set(apiRuns.map((r) => String(r.id ?? r.runId ?? "")));
+  const prepended = [];
+  for (const [k, entry] of recentlyCreatedRunsMap.entries()) {
+    if (seenIds.has(k)) {
+      recentlyCreatedRunsMap.delete(k);
+    } else if (entry?.runObj) {
+      prepended.push(entry.runObj);
+    }
+  }
+  return prepended.length > 0 ? [...prepended, ...apiRuns] : apiRuns;
+}
 
 async function fetchCurrentRuns(forceFresh = false) {
   const now = Date.now();
@@ -1014,44 +1049,13 @@ async function fetchCurrentRuns(forceFresh = false) {
   }
 
   runsInFlightPromise = (async () => {
-    try {
-      const res = await spaceApi.getRunsPaginated({ page: 1, size: 100 });
-      const arr = extractItemsArray(res);
-      if (arr.length > 0) {
-        let merged = arr;
-        // If page 1 is full (100 items), also fetch page 2 so 40+ active workers are never hidden behind finished runs
-        if (arr.length >= 100) {
-          try {
-            const resPage2 = await spaceApi.getRunsPaginated({ page: 2, size: 100 });
-            const arr2 = extractItemsArray(resPage2);
-            if (arr2.length > 0) {
-              const seen = new Set(arr.map((r) => String(r.id ?? r.runId ?? "")));
-              for (const r of arr2) {
-                const k = String(r.id ?? r.runId ?? "");
-                if (k && !seen.has(k)) {
-                  seen.add(k);
-                  merged.push(r);
-                }
-              }
-            }
-          } catch {
-            // Ignore page 2 error
-          }
-        }
-        lastKnownRuns = merged;
-        lastKnownRunsAtMs = Date.now();
-        lastKnownRunsAt = new Date(lastKnownRunsAtMs).toISOString();
-        return merged;
-      }
-    } catch {
-      // Fallback
-    }
-    const res2 = await spaceApi.getRunsList();
-    const arr2 = extractItemsArray(res2);
-    lastKnownRuns = arr2;
+    const res = await spaceApi.getRunsList();
+    const arr = extractItemsArray(res);
+    const merged = mergeWithRecentlyCreatedRuns(arr);
+    lastKnownRuns = merged;
     lastKnownRunsAtMs = Date.now();
     lastKnownRunsAt = new Date(lastKnownRunsAtMs).toISOString();
-    return arr2;
+    return merged;
   })();
 
   try {
@@ -1700,7 +1704,7 @@ function classifyRunStatus(statusRaw) {
   if (["SUCCEEDED", "COMPLETED", "FINISHED", "DONE", "SUCCESS"].some((k) => s.includes(k))) {
     return "SUCCEEDED";
   }
-  if (["FAILED", "ERROR", "STOPPED", "KILLED", "TERMINATED", "CANCELED", "CANCELLED", "ABORTED", "OOM", "REJECTED"].some((k) => s.includes(k))) {
+  if (["FAILED", "ERROR", "STOPPED", "KILLED", "TERMINATED", "CANCELED", "CANCELLED", "ABORTED", "OOM", "REJECTED", "PREEMPTED", "EVICTED"].some((k) => s.includes(k))) {
     return "FAILED";
   }
   return "UNKNOWN";
@@ -2030,6 +2034,41 @@ function extractAssignedSlotFromRun(run) {
   return null;
 }
 
+function getInFlightReservationsForJob(jobId) {
+  if (!jobId) return [];
+  const map = inFlightJobReservations.get(String(jobId));
+  if (!map) return [];
+  const now = Date.now();
+  const active = [];
+  for (const [resId, entry] of map.entries()) {
+    if (!entry || entry.expiresAtMs <= now) {
+      map.delete(resId);
+    } else {
+      active.push(entry);
+    }
+  }
+  return active;
+}
+
+function reserveWorkerSlot(jobId, slotIndex, ttlMs = 15000) {
+  const key = String(jobId || "default");
+  if (!inFlightJobReservations.has(key)) {
+    inFlightJobReservations.set(key, new Map());
+  }
+  const resId = `res-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  inFlightJobReservations.get(key).set(resId, {
+    slotIndex: Number(slotIndex),
+    expiresAtMs: Date.now() + ttlMs,
+  });
+  return resId;
+}
+
+function releaseWorkerSlot(jobId, resId) {
+  if (!jobId || !resId) return;
+  const map = inFlightJobReservations.get(String(jobId));
+  if (map) map.delete(resId);
+}
+
 function pickNextWorkerSlot(job, activeRuns, targetCount) {
   const usedSlots = new Set();
   activeRuns.forEach((r, idx) => {
@@ -2040,10 +2079,15 @@ function pickNextWorkerSlot(job, activeRuns, targetCount) {
       usedSlots.add(idx + 1);
     }
   });
-  for (let s = 1; s <= Math.max(targetCount, activeRuns.length + 1); s++) {
+  const inFlight = getInFlightReservationsForJob(job?.id);
+  for (const r of inFlight) {
+    if (r.slotIndex >= 1) usedSlots.add(r.slotIndex);
+  }
+  const maxSlot = Math.max(targetCount, activeRuns.length + inFlight.length + 1);
+  for (let s = 1; s <= maxSlot; s++) {
     if (!usedSlots.has(s)) return s;
   }
-  return activeRuns.length + 1;
+  return activeRuns.length + inFlight.length + 1;
 }
 
 /**
@@ -2280,7 +2324,7 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
     }
 
     try {
-      const logRaw = await spaceApi.getRunLog(rId, { tailLines: 30 });
+      const logRaw = await spaceApi.getRunLog(rId, { tailLines: 30 }, { timeoutMs: 3000, skipTelemetry: true });
       const text = typeof logRaw === "string" ? logRaw : JSON.stringify(logRaw || "");
       const lines = text
         .split(/\r?\n/)
@@ -2451,7 +2495,10 @@ async function runWatchdogSweep(allRuns = lastKnownRuns) {
 
   const terminatedIds = [];
   for (const r of nonRunningActive) {
-    const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+    // Only auto-terminate if `startTime` is set (node assigned & container stuck in Creating/Initializing)
+    // OR if `watchdogKillQueuePending` is explicitly enabled. Do NOT kill normal Pending runs waiting in cluster queue.
+    const timeBasis = r.startTime || (state.config.watchdogKillQueuePending ? r.registerTime || r.createdAt : null);
+    const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
     if (!startMs || Number.isNaN(startMs)) continue;
     const stuckMs = now - startMs;
     if (stuckMs >= maxPendingMs) {
@@ -2715,7 +2762,8 @@ function computeServerLoadStatus(allRuns = lastKnownRuns) {
   let oldestPendingWaitSec = 0;
   let oldestPendingWorkerName = null;
   for (const r of nonRunningActiveRuns) {
-    const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+    const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
+    const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
     if (startMs && !Number.isNaN(startMs)) {
       const waitSec = Math.max(0, Math.floor((now - startMs) / 1000));
       if (waitSec >= oldestPendingWaitSec) {
@@ -2933,12 +2981,15 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
   let totalActiveWorkers = 0;
   let totalTargetWorkers = 0;
   let totalRemainingToCreate = 0;
+  let totalExcessPendingWorkers = 0;
   let totalRunningGpus = 0;
+  let totalPendingGpus = 0;
   let totalActiveGpus = 0;
   let totalTargetGpus = 0;
   let totalRemainingGpus = 0;
   let globalNextSpawnInSec = null;
   const anyJobEnabled = state.jobs.some((j) => j.enabled);
+  const matchedActiveRunIds = new Set();
 
   const jobFleetList = state.jobs.map((job) => {
     const matchingRuns = runsList.filter((r) => doesRunMatchJob(r, job, state.jobs));
@@ -2947,21 +2998,31 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       .filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE")
       .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
 
+    for (const r of activeRuns) {
+      const rId = String(r.id ?? r.runId ?? "");
+      if (rId) matchedActiveRunIds.add(rId);
+    }
+
     const runningRuns = activeRuns.filter((r) =>
       String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
     );
     const pendingRuns = activeRuns.filter(
       (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
     );
+    // Order all Running workers first (#1..#runningCount), followed by Pending workers (#runningCount+1..#activeCount)
+    const orderedActiveRuns = [...runningRuns, ...pendingRuns];
 
     const targetCount = Math.max(1, Number(job.minConcurrentRuns || 1));
     const activeCount = activeRuns.length;
     const runningCount = runningRuns.length;
     const pendingCount = pendingRuns.length;
     const remainingToCreate = Math.max(0, targetCount - activeCount);
+    const runningDeficit = Math.max(0, targetCount - runningCount);
+    const excessPendingCount = Math.max(0, Math.min(pendingCount, activeCount - targetCount));
 
     const coreCountPerWorker = Math.max(1, Number(job.coreCount || 1));
     const runningGpuCount = runningCount * coreCountPerWorker;
+    const pendingGpuCount = pendingCount * coreCountPerWorker;
     const activeGpuCount = activeCount * coreCountPerWorker;
     const targetGpuCount = targetCount * coreCountPerWorker;
     const remainingGpuToCreate = remainingToCreate * coreCountPerWorker;
@@ -2996,12 +3057,14 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     totalActiveWorkers += activeCount;
     totalTargetWorkers += countInGlobalTarget ? targetCount : activeCount;
     totalRemainingToCreate += countInGlobalTarget ? remainingToCreate : 0;
+    totalExcessPendingWorkers += excessPendingCount;
     totalRunningGpus += runningGpuCount;
+    totalPendingGpus += pendingGpuCount;
     totalActiveGpus += activeGpuCount;
     totalTargetGpus += countInGlobalTarget ? targetGpuCount : activeGpuCount;
     totalRemainingGpus += countInGlobalTarget ? remainingGpuToCreate : 0;
 
-    const activeWorkers = activeRuns.map((r, idx) => {
+    const activeWorkers = orderedActiveRuns.map((r, idx) => {
       const st = String(r.status || r.state || r.phase || "UNKNOWN");
       const isRunning = st.toUpperCase().includes("RUNNING");
       const rId = String(r.id ?? r.runId ?? "");
@@ -3009,24 +3072,31 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       const tl = timelineByRunId.get(rId) || timelineByName.get(rName) || null;
       const snippet = watchdogStats.workerLogSnippets[rId] || null;
       const assignedSlot = extractAssignedSlotFromRun(r) || idx + 1;
-      const startMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+      const stateOrderIndex = isRunning ? idx + 1 : idx - runningCount + 1;
+      const isExcessPending = !isRunning && idx + 1 > targetCount;
+      const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
+      const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
       const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
       const rawProgress = snippet?.progress ? { ...snippet.progress } : null;
       return {
         slotIndex: idx + 1,
+        stateOrderIndex,
         assignedSlot,
+        isExcessPending,
         id: r.id ?? r.runId,
         name: rName,
+        userName: r.userId || r.userName || r.user || null,
         status: st,
         isRunning,
         coreName: r.coreName || r.gpuName || (String(job.coreId) === "2" ? "H100" : `Core #${job.coreId || "-"}`),
         coreCount: Number(r.coreCount ?? r.coreNum ?? coreCountPerWorker),
         ip: r.ip || "-",
         startTime: r.startTime || null,
+        registerTime: r.registerTime || null,
         elapsedSec,
         approvalStatus: r.approvalStatus || tl?.approvalStatus || (isRunning ? "approved" : "pending"),
-        allocationRequestedAt: tl?.allocationRequestedAt || r.startTime || null,
-        createdAt: tl?.createdAt || r.startTime || null,
+        allocationRequestedAt: tl?.allocationRequestedAt || r.registerTime || r.startTime || null,
+        createdAt: tl?.createdAt || r.registerTime || r.startTime || null,
         autoApprovalRequestedAt: tl?.autoApprovalRequestedAt || null,
         approvedAt: tl?.approvedAt || null,
         approvalElapsedSec: tl?.approvalElapsedSec ?? null,
@@ -3067,6 +3137,15 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
 
     const nextAssignedSlot = pickNextWorkerSlot(job, activeRuns, targetCount);
 
+    // Keep `job.lastStatus` accurate even for disabled jobs so old/stale counts (e.g. "가동 40/40개" from days ago) never persist
+    if (!job.enabled && runsList.length > 0) {
+      if (activeCount === 0) {
+        job.lastStatus = `⚪ 일시정지됨 (현재 가동 0개 / 목표 ${targetCount}개 · 자동생성 OFF)`;
+      } else {
+        job.lastStatus = `⚪ 자동생성 OFF (현재 🟢 Running ${runningCount}개${pendingCount > 0 ? ` · ⏳ Pending ${pendingCount}개` : ""} 가동 중)`;
+      }
+    }
+
     return {
       jobId: job.id,
       jobName: job.name,
@@ -3087,11 +3166,15 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       runningCount,
       pendingCount,
       remainingToCreate,
+      runningDeficit,
+      excessPendingCount,
       runningGpuCount,
+      pendingGpuCount,
       activeGpuCount,
       targetGpuCount,
       remainingGpuToCreate,
       runningGpus: runningGpuCount,
+      pendingGpus: pendingGpuCount,
       activeGpus: activeGpuCount,
       targetGpus: targetGpuCount,
       remainingGpus: remainingGpuToCreate,
@@ -3105,6 +3188,83 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       activeWorkers,
     };
   });
+
+  // Compute exact SPACE Cluster Reconciliation (`Rule Workers` vs `My Account Total` vs `Group Total`)
+  const currentUserName = resolveCurrentUserName();
+  const allActiveSpaceRuns = runsList
+    .filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE")
+    .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
+  const allRunningSpaceRuns = allActiveSpaceRuns.filter((r) =>
+    String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const allPendingSpaceRuns = allActiveSpaceRuns.filter(
+    (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const isMyRun = (r) => {
+    const rUser = String(r.userId || r.userName || r.user || "").trim();
+    if (!currentUserName || currentUserName === "admin" || !rUser) return true;
+    return rUser.toLowerCase() === String(currentUserName).toLowerCase();
+  };
+  const myActiveSpaceRuns = allActiveSpaceRuns.filter(isMyRun);
+  const myRunningSpaceRuns = myActiveSpaceRuns.filter((r) =>
+    String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const myPendingSpaceRuns = myActiveSpaceRuns.filter(
+    (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const sumRunGpus = (arr) => arr.reduce((acc, r) => acc + Math.max(1, Number(r.coreCount ?? r.coreNum ?? 1)), 0);
+  const unmatchedActiveRuns = allActiveSpaceRuns
+    .filter((r) => !matchedActiveRunIds.has(String(r.id ?? r.runId ?? "")))
+    .map((r) => {
+      const st = String(r.status || r.state || r.phase || "UNKNOWN");
+      const isRunning = st.toUpperCase().includes("RUNNING");
+      const rId = String(r.id ?? r.runId ?? "");
+      const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
+      const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
+      const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
+      return {
+        id: r.id ?? r.runId,
+        name: r.containerName || r.name || `run-${rId}`,
+        userName: r.userId || r.userName || r.user || "-",
+        isMine: isMyRun(r),
+        status: st,
+        isRunning,
+        coreName: r.coreName || r.gpuName || "GPU",
+        coreCount: Math.max(1, Number(r.coreCount ?? r.coreNum ?? 1)),
+        ip: r.ip || "-",
+        startTime: r.startTime || null,
+        registerTime: r.registerTime || null,
+        elapsedSec,
+      };
+    });
+  const myUnmatchedActiveRuns = unmatchedActiveRuns.filter((u) => u.isMine);
+  const otherUserActiveRuns = unmatchedActiveRuns.filter((u) => !u.isMine);
+
+  const spaceReconciliation = {
+    currentUserName,
+    groupId: state.config.groupId || "",
+    ruleRunningWorkers: totalRunningWorkers,
+    rulePendingWorkers: totalPendingWorkers,
+    ruleActiveWorkers: totalActiveWorkers,
+    ruleRunningGpus: totalRunningGpus,
+    rulePendingGpus: totalPendingGpus,
+    ruleActiveGpus: totalActiveGpus,
+    mySpaceRunningWorkers: myRunningSpaceRuns.length,
+    mySpacePendingWorkers: myPendingSpaceRuns.length,
+    mySpaceActiveWorkers: myActiveSpaceRuns.length,
+    mySpaceRunningGpus: sumRunGpus(myRunningSpaceRuns),
+    mySpacePendingGpus: sumRunGpus(myPendingSpaceRuns),
+    mySpaceActiveGpus: sumRunGpus(myActiveSpaceRuns),
+    spaceTotalRunningWorkers: allRunningSpaceRuns.length,
+    spaceTotalPendingWorkers: allPendingSpaceRuns.length,
+    spaceTotalActiveWorkers: allActiveSpaceRuns.length,
+    spaceTotalRunningGpus: sumRunGpus(allRunningSpaceRuns),
+    spaceTotalPendingGpus: sumRunGpus(allPendingSpaceRuns),
+    spaceTotalActiveGpus: sumRunGpus(allActiveSpaceRuns),
+    unmatchedActiveRuns,
+    myUnmatchedActiveRuns,
+    otherUserActiveRuns,
+  };
 
   const timeScaleStatus = computeTimeScaleStatus();
   const telemetryStatus = updateGpuTelemetry(
@@ -3128,11 +3288,14 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     totalActiveWorkers,
     totalTargetWorkers,
     totalRemainingToCreate,
+    totalExcessPendingWorkers,
     totalRunningGpus,
+    totalPendingGpus,
     totalActiveGpus,
     totalTargetGpus,
     totalRemainingGpus,
     nextSpawnInSec: globalNextSpawnInSec,
+    spaceReconciliation,
     jobs: jobFleetList,
     autoApprovalTimeline: timelineList.slice(0, 40),
     loadMonitor: loadStatus,
@@ -3337,21 +3500,27 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
   }
 
   if (!forceTrigger) {
+    const inFlightSlots = getInFlightReservationsForJob(job.id);
+    const effectiveActiveCount = activeRuns.length + inFlightSlots.length;
     // Batch 2 - Feature 6: Enforce Bad-Node Cooldown before spawning replacement workers
     if (state.config.badNodeGuardEnabled !== false && badNodeStats.cooldownUntilMs > now) {
       const remainBadSec = Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000);
-      const deficit = Math.max(0, minConcurrent - activeRuns.length);
+      const deficit = Math.max(0, minConcurrent - effectiveActiveCount);
       job.lastStatus = `🩺 [불량 노드 회피 쿨다운] 직전 워커(${badNodeStats.lastBadRunName || "-"}) ${badNodeStats.lastReason || "조기 실패"} → 동일 노드 재당첨 방지를 위해 ${remainBadSec}초 후 +${deficit}개 안전 재배치`;
       saveState();
       return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
     }
-    if (activeRuns.length >= minConcurrent) {
-      const activeIds = activeRuns
-        .slice(0, 6)
-        .map((r) => `#${r.id || r.runId}(${r.status || r.state})`)
-        .join(", ");
-      const moreStr = activeRuns.length > 6 ? ` 외 ${activeRuns.length - 6}개` : "";
-      job.lastStatus = `✅ 목표 워커 수 달성 (가동 ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}/${minConcurrent}개): ${activeIds}${moreStr}`;
+    if (effectiveActiveCount >= minConcurrent) {
+      const excessPending = Math.max(0, Math.min(pendingJobRuns.length, activeRuns.length - minConcurrent));
+      const pendingStr =
+        pendingJobRuns.length > 0
+          ? ` · ⏳ Pending 대기 ${pendingJobRuns.length}개${excessPending > 0 ? `(목표초과 +${excessPending}개)` : ""}`
+          : "";
+      if (runningRuns.length >= minConcurrent) {
+        job.lastStatus = `✅ 목표 Running ${minConcurrent}개 전원 가동 중! (🟢 Running ${runningRuns.length}개${pendingStr} · 전체 활성 ${activeRuns.length}/${minConcurrent}개)`;
+      } else {
+        job.lastStatus = `⏳ 목표 수량(${minConcurrent}개) 제출 완료 — 클러스터 Running 전환 대기 중 (🟢 실제 가동 ${runningRuns.length}개 / 목표 ${minConcurrent}개${pendingStr} · 전체 활성 ${activeRuns.length}개)`;
+      }
       if (
         runningRuns.length >= minConcurrent &&
         job._lastNotifiedTarget !== minConcurrent &&
@@ -3368,7 +3537,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       saveState();
       return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
     }
-    if (activeRuns.length < minConcurrent) {
+    if (runningRuns.length < minConcurrent) {
       job._lastNotifiedTarget = null;
     }
 
@@ -3428,7 +3597,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
         loadStatus.enabled && effectiveCooldownSec > baseCooldownSec
           ? ` · 🛡️ 부하감지 안전간격 ${effectiveCooldownSec}초 적용`
           : "";
-      job.lastStatus = `⏳ 워커 안전 페이싱 증설 중 (현재 ${activeRuns.length}/${minConcurrent}개 · +${deficit}개 추가 예정 · ${remainWaitSec}초 후 다음 워커 생성${paceNote})`;
+      job.lastStatus = `⏳ 워커 안전 페이싱 증설 중 (🟢 가동 ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}/${minConcurrent}개 · +${deficit}개 추가 예정 · ${remainWaitSec}초 후 다음 워커 생성${paceNote})`;
       saveState();
       return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
     }
@@ -3472,155 +3641,167 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
     }
   }
 
-  // Feature 3: Pick lowest missing Worker Slot Index (1..minConcurrent)
+  // Feature 3: Pick lowest missing Worker Slot Index (1..minConcurrent) and reserve it across concurrent calls
   const nextWorkerSlot = pickNextWorkerSlot(job, activeRuns, minConcurrent);
+  const slotReservationKey = reserveWorkerSlot(job.id, nextWorkerSlot);
   const remainingAfterThis = Math.max(0, minConcurrent - (activeRuns.length + 1));
   const triggerSource = forceTrigger ? "manual" : "auto_scheduler";
   const triggerLabel = forceTrigger ? "👆 [수동 클릭 신청]" : "🤖 [무클릭 자동 신청]";
-  let payload = await buildRunPayload(job, {
-    slotIndex: nextWorkerSlot,
-    targetCount: minConcurrent,
-    overrideAllowSpot: preOverrideAllowSpot,
-  });
-  const reqIso = new Date().toISOString();
-  schedulerLoopStats.lastAllocationRequestAt = reqIso;
-  schedulerLoopStats.lastAutoAllocationRequestAt = reqIso;
-  schedulerLoopStats.lastTriggerSource = triggerSource;
-
-  addLog(
-    "info",
-    `${triggerLabel} [${job.name}] 워커 슬롯 #${nextWorkerSlot} (활성 ${activeRuns.length + 1}/${minConcurrent}) GPU 할당 요청 전송 (남은 자동생성 예정: +${remainingAfterThis}개 · cmd: ${payload.executionCommand})`,
-    {
-      containerName: payload.containerName,
-      workerSlot: `${nextWorkerSlot}/${minConcurrent}`,
-      remainingToCreate: remainingAfterThis,
-      groupPoolId: payload.groupPoolId,
-      coreId: payload.coreId,
-      coreCount: payload.coreCount,
-      executionCommand: payload.executionCommand,
-      triggerSource,
-      allocationRequestedAt: reqIso,
-    }
-  );
-
-  // Feature 4: Spot ↔ Standard / Fallback Core Auto-Retry on `createRun` failure
-  let createRes = null;
   try {
-    createRes = await spaceApi.createRun(payload);
-  } catch (primaryErr) {
-    if (state.config.hybridFallbackEnabled !== false) {
-      const altAllowSpot = !payload.allowSpot;
-      const altCoreId = state.config.fallbackCoreId ? Number(state.config.fallbackCoreId) : undefined;
-      const fallbackLabel = altAllowSpot ? "Standard ➔ Spot" : "Spot ➔ Standard";
-      addLog(
-        "warn",
-        `🔄 [하이브리드 자동 폴백 재시도] 1차 할당 실패 (${primaryErr.message}) → ${fallbackLabel}${altCoreId ? ` (Core #${altCoreId})` : ""} 모드로 즉시 재시도합니다.`
-      );
-      try {
-        payload = await buildRunPayload(job, {
-          slotIndex: nextWorkerSlot,
-          targetCount: minConcurrent,
-          overrideAllowSpot: altAllowSpot,
-          overrideCoreId: altCoreId || undefined,
-        });
-        createRes = await spaceApi.createRun(payload);
-        hybridFallbackStats.fallbackTriggeredCount += 1;
-        hybridFallbackStats.lastFallbackAt = new Date().toISOString();
-        hybridFallbackStats.lastFallbackReason = `1차 생성 오류(${primaryErr.message.slice(0, 60)}) → ${fallbackLabel} 폴백 성공`;
-        hybridFallbackStats.lastFallbackMode = fallbackLabel;
-      } catch {
+    let payload = await buildRunPayload(job, {
+      slotIndex: nextWorkerSlot,
+      targetCount: minConcurrent,
+      overrideAllowSpot: preOverrideAllowSpot,
+    });
+    const reqIso = new Date().toISOString();
+    schedulerLoopStats.lastAllocationRequestAt = reqIso;
+    schedulerLoopStats.lastAutoAllocationRequestAt = reqIso;
+    schedulerLoopStats.lastTriggerSource = triggerSource;
+
+    addLog(
+      "info",
+      `${triggerLabel} [${job.name}] 워커 슬롯 #${nextWorkerSlot} (활성 ${activeRuns.length + 1}/${minConcurrent}) GPU 할당 요청 전송 (남은 자동생성 예정: +${remainingAfterThis}개 · cmd: ${payload.executionCommand})`,
+      {
+        containerName: payload.containerName,
+        workerSlot: `${nextWorkerSlot}/${minConcurrent}`,
+        remainingToCreate: remainingAfterThis,
+        groupPoolId: payload.groupPoolId,
+        coreId: payload.coreId,
+        coreCount: payload.coreCount,
+        executionCommand: payload.executionCommand,
+        triggerSource,
+        allocationRequestedAt: reqIso,
+      }
+    );
+
+    // Feature 4: Spot ↔ Standard / Fallback Core Auto-Retry on `createRun` failure
+    let createRes = null;
+    try {
+      createRes = await spaceApi.createRun(payload);
+    } catch (primaryErr) {
+      if (state.config.hybridFallbackEnabled !== false) {
+        const altAllowSpot = !payload.allowSpot;
+        const altCoreId = state.config.fallbackCoreId ? Number(state.config.fallbackCoreId) : undefined;
+        const fallbackLabel = altAllowSpot ? "Standard ➔ Spot" : "Spot ➔ Standard";
+        addLog(
+          "warn",
+          `🔄 [하이브리드 자동 폴백 재시도] 1차 할당 실패 (${primaryErr.message}) → ${fallbackLabel}${altCoreId ? ` (Core #${altCoreId})` : ""} 모드로 즉시 재시도합니다.`
+        );
+        try {
+          payload = await buildRunPayload(job, {
+            slotIndex: nextWorkerSlot,
+            targetCount: minConcurrent,
+            overrideAllowSpot: altAllowSpot,
+            overrideCoreId: altCoreId || undefined,
+          });
+          createRes = await spaceApi.createRun(payload);
+          hybridFallbackStats.fallbackTriggeredCount += 1;
+          hybridFallbackStats.lastFallbackAt = new Date().toISOString();
+          hybridFallbackStats.lastFallbackReason = `1차 생성 오류(${primaryErr.message.slice(0, 60)}) → ${fallbackLabel} 폴백 성공`;
+          hybridFallbackStats.lastFallbackMode = fallbackLabel;
+        } catch {
+          throw primaryErr;
+        }
+      } else {
         throw primaryErr;
       }
-    } else {
-      throw primaryErr;
     }
-  }
-  const createdId = createRes?.id || createRes?.runId || createRes?.data?.id || createRes?.data?.runId || null;
-  const createdIso = new Date().toISOString();
+    const createdId = createRes?.id || createRes?.runId || createRes?.data?.id || createRes?.data?.runId || null;
+    const createdIso = new Date().toISOString();
 
-  job.lastTriggeredAt = new Date(now).toISOString();
-  if (createdId) job.lastRunId = createdId;
-  schedulerLoopStats.lastCreatedAt = createdIso;
-  schedulerLoopStats.lastCreatedRunId = createdId;
-  schedulerLoopStats.lastCreatedRunName = payload.containerName;
-  schedulerLoopStats.lastAutoAllocatedRunId = createdId;
-  schedulerLoopStats.lastAutoAllocatedRunName = payload.containerName;
-  if (forceTrigger) {
-    schedulerLoopStats.totalManualAllocatedCount = (schedulerLoopStats.totalManualAllocatedCount || 0) + 1;
-  } else {
-    schedulerLoopStats.totalAutoAllocatedCount = (schedulerLoopStats.totalAutoAllocatedCount || 0) + 1;
-  }
+    job.lastTriggeredAt = new Date(now).toISOString();
+    if (createdId) job.lastRunId = createdId;
+    schedulerLoopStats.lastCreatedAt = createdIso;
+    schedulerLoopStats.lastCreatedRunId = createdId;
+    schedulerLoopStats.lastCreatedRunName = payload.containerName;
+    schedulerLoopStats.lastAutoAllocatedRunId = createdId;
+    schedulerLoopStats.lastAutoAllocatedRunName = payload.containerName;
+    if (forceTrigger) {
+      schedulerLoopStats.totalManualAllocatedCount = (schedulerLoopStats.totalManualAllocatedCount || 0) + 1;
+    } else {
+      schedulerLoopStats.totalAutoAllocatedCount = (schedulerLoopStats.totalAutoAllocatedCount || 0) + 1;
+    }
 
-  job.lastStatus = `${triggerLabel} 제출 완료 [워커 ${nextWorkerSlot}/${minConcurrent} · 남은 자동생성 +${remainingAfterThis}개] (${payload.containerName} · #${createdId || "-"}) → Admin 승인 추적 중...`;
-  saveState();
+    job.lastStatus = `${triggerLabel} 제출 완료 [워커 ${nextWorkerSlot}/${minConcurrent} · 남은 자동생성 +${remainingAfterThis}개] (${payload.containerName} · #${createdId || "-"}) → Admin 승인 추적 중...`;
+    saveState();
 
-  // Optimistically append to `lastKnownRuns` so UI immediately reflects the newly created worker
-  if (createdId) {
-    lastKnownRuns = [
-      {
+    // Optimistically append to `lastKnownRuns` AND `recentlyCreatedRunsMap` so UI & subsequent polls never drop the newly created worker
+    if (createdId) {
+      const createdRunObj = {
         id: createdId,
         runId: createdId,
         containerName: payload.containerName,
         name: payload.containerName,
+        userName: resolveCurrentUserName(),
         status: "Pending",
         coreId: payload.coreId,
         coreName: String(payload.coreId) === "2" ? "H100" : `Core #${payload.coreId}`,
         coreCount: payload.coreCount,
         executionCommand: payload.executionCommand,
         containerImage: payload.containerImage,
-        startTime: createdIso,
-      },
-      ...lastKnownRuns.filter((r) => String(r.id ?? r.runId) !== String(createdId)),
-    ];
-    lastKnownRunsAt = createdIso;
-  }
+        registerTime: createdIso,
+        startTime: null,
+      };
+      recentlyCreatedRunsMap.set(String(createdId), {
+        createdAtMs: Date.now(),
+        run: createdRunObj,
+      });
+      lastKnownRuns = [
+        createdRunObj,
+        ...lastKnownRuns.filter((r) => String(r.id ?? r.runId) !== String(createdId)),
+      ];
+      lastKnownRunsAt = createdIso;
+    }
 
-  addLog(
-    "success",
-    `${triggerLabel} [${job.name}] 워커 #${nextWorkerSlot}/${minConcurrent} 생성됨: ${payload.containerName} (#${createdId || "-"} · 앞으로 +${remainingAfterThis}개 추가 자동생성 예정)`,
-    {
-      runId: createdId,
-      containerName: payload.containerName,
-      workerSlot: `${nextWorkerSlot}/${minConcurrent}`,
-      remainingToCreate: remainingAfterThis,
-      command: payload.executionCommand,
+    addLog(
+      "success",
+      `${triggerLabel} [${job.name}] 워커 #${nextWorkerSlot}/${minConcurrent} 생성됨: ${payload.containerName} (#${createdId || "-"} · 앞으로 +${remainingAfterThis}개 추가 자동생성 예정)`,
+      {
+        runId: createdId,
+        containerName: payload.containerName,
+        workerSlot: `${nextWorkerSlot}/${minConcurrent}`,
+        remainingToCreate: remainingAfterThis,
+        command: payload.executionCommand,
+        triggerSource,
+        allocationRequestedAt: reqIso,
+        createdAt: createdIso,
+      }
+    );
+
+    // Fast Admin Auto-Approval Tracker right after creation (runs for BOTH Standard AND Spot instances!)
+    let approvalResult = null;
+    const typeTag = payload.allowSpot ? "🟧 Spot" : "🟦 Standard";
+    if (job.autoApprove !== false) {
+      approvalResult = await trackAndApproveCreatedRun({
+        runId: createdId,
+        containerName: payload.containerName,
+        job,
+      });
+      if (approvalResult?.approved) {
+        job.lastStatus = `${typeTag} ${triggerLabel} 워커 ${nextWorkerSlot}/${minConcurrent} 제출 및 ✅ Admin 승인 완료 (${payload.containerName} · #${createdId || "-"} · 남은 자동생성: +${remainingAfterThis}개)`;
+      } else {
+        job.lastStatus = `${typeTag} ${triggerLabel} 워커 ${nextWorkerSlot}/${minConcurrent} 제출 완료 (${payload.containerName} · #${createdId || "-"} · 남은 자동생성: +${remainingAfterThis}개) — 실시간 자동 승인 추적 중`;
+      }
+      saveState();
+    } else {
+      job.lastStatus = `${typeTag} ${triggerLabel} 워커 ${nextWorkerSlot}/${minConcurrent} 제출 완료 (${payload.containerName} · #${createdId || "-"} · 수동 승인 모드)`;
+      saveState();
+    }
+
+    return {
+      triggered: true,
       triggerSource,
       allocationRequestedAt: reqIso,
       createdAt: createdIso,
-    }
-  );
-
-  // Fast Admin Auto-Approval Tracker right after creation (runs for BOTH Standard AND Spot instances!)
-  let approvalResult = null;
-  const typeTag = payload.allowSpot ? "🟧 Spot" : "🟦 Standard";
-  if (job.autoApprove !== false) {
-    approvalResult = await trackAndApproveCreatedRun({
-      runId: createdId,
-      containerName: payload.containerName,
-      job,
-    });
-    if (approvalResult?.approved) {
-      job.lastStatus = `${typeTag} ${triggerLabel} 워커 ${nextWorkerSlot}/${minConcurrent} 제출 및 ✅ Admin 승인 완료 (${payload.containerName} · #${createdId || "-"} · 남은 자동생성: +${remainingAfterThis}개)`;
-    } else {
-      job.lastStatus = `${typeTag} ${triggerLabel} 워커 ${nextWorkerSlot}/${minConcurrent} 제출 완료 (${payload.containerName} · #${createdId || "-"} · 남은 자동생성: +${remainingAfterThis}개) — 실시간 자동 승인 추적 중`;
-    }
-    saveState();
-  } else {
-    job.lastStatus = `${typeTag} ${triggerLabel} 워커 ${nextWorkerSlot}/${minConcurrent} 제출 완료 (${payload.containerName} · #${createdId || "-"} · 수동 승인 모드)`;
-    saveState();
+      payload,
+      response: createRes,
+      approvalResult,
+      nextWorkerSlot,
+      remainingAfterThis,
+    };
+  } finally {
+    releaseWorkerSlot(slotReservationKey);
   }
-
-  return {
-    triggered: true,
-    triggerSource,
-    allocationRequestedAt: reqIso,
-    createdAt: createdIso,
-    payload,
-    response: createRes,
-    approvalResult,
-    nextWorkerSlot,
-    remainingAfterThis,
-  };
 }
 
 /**
@@ -3679,13 +3860,14 @@ async function runSchedulerTick(manual = false) {
     if (manual || enabledJobs.length > 0 || state.config.watchdogEnabled !== false) {
       let allRuns = await fetchCurrentRuns();
 
-      // Feature 1 & 2: Run Zombie Watchdog Sweep & Round-Robin Live Worker Log Scan
+      // Feature 1: Run Zombie Watchdog Sweep first
       const sweepRes = await runWatchdogSweep(allRuns).catch(() => ({ terminatedIds: [] }));
       if (sweepRes?.terminatedIds?.length > 0) {
         allRuns = await fetchCurrentRuns(true).catch(() => allRuns);
       }
-      await scanWorkerLogsRoundRobin(allRuns, { scanAll: manual }).catch(() => {});
 
+      // Run `evaluateJobRule` on the fresh `allRuns` BEFORE `scanWorkerLogsRoundRobin`
+      // so log scanning latency can never make `allRuns` stale or cause over-spawning!
       for (const job of enabledJobs) {
         try {
           const res = await evaluateJobRule(job, allRuns, false);
@@ -3699,28 +3881,26 @@ async function runSchedulerTick(manual = false) {
       }
       // Refresh runs cache if any job triggered a new worker
       if (results.some((r) => r.triggered)) {
-        await fetchCurrentRuns(true).catch(() => {});
+        allRuns = await fetchCurrentRuns(true).catch(() => allRuns);
       }
+
+      // Feature 2: Round-Robin Live Worker Log Scan (runs after scheduling decisions with short per-call timeout)
+      await scanWorkerLogsRoundRobin(allRuns, { scanAll: manual }).catch(() => {});
 
       if (manual) {
         // Also update status summary for disabled jobs so the user sees live feedback
         for (const job of state.jobs.filter((j) => !j.enabled)) {
-          const prefix = String(job.name || "gpu-job")
-            .replace(/[^a-zA-Z0-9-]/g, "-")
-            .replace(/^-+|-+$/g, "")
-            .slice(0, 32);
-          const matchingActive = allRuns.filter((r) => {
-            const cName = String(r.containerName ?? r.name ?? "");
-            return (
-              (cName.startsWith(prefix) || (job.lastRunId && String(r.id ?? r.runId) === String(job.lastRunId))) &&
-              classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
-            );
-          });
+          const matchingActive = allRuns.filter(
+            (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
+          );
+          const runningCnt = matchingActive.filter((r) =>
+            String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+          ).length;
           job.lastCheckAt = new Date().toISOString();
           const typeTag = job.allowSpot ? "🟧 Spot" : "🟦 Standard";
           if (matchingActive.length > 0) {
             const ids = matchingActive.slice(0, 3).map((r) => `#${r.id ?? r.runId}`).join(", ");
-            job.lastStatus = `${typeTag} ✅ Admin 승인 완료 · 현재 ${matchingActive.length}개 실행 중 (${ids}) [주기 자동추가: OFF]`;
+            job.lastStatus = `${typeTag} ✅ Admin 승인 완료 · 🟢 Running ${runningCnt}개 (전체 활성 ${matchingActive.length}개: ${ids}) [주기 자동추가: OFF]`;
           }
         }
         saveState();
@@ -3729,7 +3909,7 @@ async function runSchedulerTick(manual = false) {
         const pendCnt = approvalTickResult?.pendingApprovalsTotal || 0;
         addLog(
           "info",
-          `🔍 [루프 즉시 점검 완료] 현재 가동 워커: ${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers}개 (앞으로 +${fleet.totalRemainingToCreate}개 자동생성 예정) · Admin 승인 처리: ${appCnt}건 (대기: ${pendCnt}건) · 부하상태: ${fleet.loadMonitor?.loadBadgeText || "정상"}`
+          `🔍 [루프 즉시 점검 완료] 🟢 실제 가동(Running): ${fleet.totalRunningWorkers}개 · ⏳ Pending 대기: ${fleet.totalPendingWorkers}개 (전체 활성 ${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers}개) · Admin 승인 처리: ${appCnt}건 (대기: ${pendCnt}건) · 부하상태: ${fleet.loadMonitor?.loadBadgeText || "정상"}`
         );
       }
     }
@@ -4327,8 +4507,10 @@ const server = http.createServer(async (req, res) => {
       const parts = pathname.split("/");
       const runId = parts[parts.length - 2];
       const out = await spaceApi.terminateRun(runId);
+      recentlyCreatedRunsMap.delete(String(runId));
+      await fetchCurrentRuns(true).catch(() => {});
       addLog("warn", `사용자가 Run #${runId} 강제 종료 요청`, { runId });
-      return sendJson(res, 200, { ok: true, data: out });
+      return sendJson(res, 200, { ok: true, data: out, workerFleet: computeWorkerFleetStats(lastKnownRuns) });
     }
 
     // 8-A. Feature 2: Bulk Worker Control (`scan_logs`, `stop_pending`, `rolling_restart`, `stop_all`)
@@ -4354,6 +4536,50 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           action,
           scannedCount: scanRes.scannedCount,
+          workerFleet: fleet,
+        });
+      }
+
+      if (action === "trim_excess_pending") {
+        const targetJobId = body.jobId ? String(body.jobId) : null;
+        const targetJobs = targetJobId ? state.jobs.filter((j) => String(j.id) === targetJobId) : state.jobs;
+        const terminatedIds = [];
+        const terminatedNames = [];
+        for (const job of targetJobs) {
+          const matchingActive = activeRuns.filter((r) => doesRunMatchJob(r, job, state.jobs));
+          const matchingPending = matchingActive
+            .filter((r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING"))
+            .sort((a, b) => Number(b.id ?? b.runId ?? 0) - Number(a.id ?? a.runId ?? 0)); // newest Pending first
+          const targetCnt = Math.max(1, Number(job.minConcurrentRuns || 1));
+          const excessCnt = Math.max(0, Math.min(matchingPending.length, matchingActive.length - targetCnt));
+          const toTerminate = matchingPending.slice(0, excessCnt);
+          for (const r of toTerminate) {
+            const rId = String(r.id ?? r.runId ?? "");
+            if (!rId) continue;
+            try {
+              await spaceApi.terminateRun(rId);
+              terminatedIds.push(rId);
+              terminatedNames.push(r.containerName || r.name || `#${rId}`);
+              recentlyCreatedRunsMap.delete(rId);
+              await sleep(200);
+            } catch {
+              // ignore
+            }
+          }
+        }
+        const updatedRuns = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+        const fleet = computeWorkerFleetStats(updatedRuns);
+        addLog(
+          "warn",
+          `✂️ [초과 Pending 워커 자동 정리] 목표 워커 수를 초과한 대기(Pending) 워커 ${terminatedIds.length}개(${terminatedNames.join(", ") || "-"})를 정리하여 목표 수량에 맞췄습니다.`,
+          { terminatedIds, terminatedNames }
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          terminatedCount: terminatedIds.length,
+          terminatedIds,
+          terminatedNames,
           workerFleet: fleet,
         });
       }

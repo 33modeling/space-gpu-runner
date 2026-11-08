@@ -294,14 +294,16 @@ function getFocusedJobFleet(fleet = latestWorkerFleet) {
   if (jobs.length === 0) {
     return (serverState?.jobs && serverState.jobs[0]) || {};
   }
-  const formJobId = document.getElementById("jobId")?.value || "";
-  const preferredId = focusedFleetJobId || (!isNewJobMode ? formJobId : "");
-  if (preferredId) {
-    const matched = jobs.find((j) => String(j.jobId || j.id) === String(preferredId));
+  if (focusedFleetJobId) {
+    const matched = jobs.find((j) => String(j.jobId || j.id) === String(focusedFleetJobId));
     if (matched) return matched;
   }
+  const activeEnabled = jobs.find((j) => j.enabled && (j.activeCount || 0) > 0);
+  if (activeEnabled) return activeEnabled;
   const firstEnabled = jobs.find((j) => j.enabled);
-  return firstEnabled || jobs[0];
+  if (firstEnabled) return firstEnabled;
+  const anyActive = jobs.find((j) => (j.activeCount || 0) > 0);
+  return anyActive || jobs[0];
 }
 
 function selectFleetJobTab(jobId) {
@@ -356,7 +358,9 @@ function renderTopAutoStatusBanner() {
   const pendingCnt = jf.pendingCount ?? fleet.totalPendingWorkers ?? 0;
   const targetCnt = jf.targetCount ?? jf.minConcurrentRuns ?? fleet.totalTargetWorkers ?? 1;
   const remainingCnt = jf.remainingToCreate ?? Math.max(0, targetCnt - activeCnt);
+  const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
   const gpusPerWorker = jf.coreCountPerWorker ?? jf.coreCount ?? 4;
+  const runningGpus = jf.runningGpuCount ?? runningCnt * gpusPerWorker;
   const activeGpus = jf.activeGpuCount ?? activeCnt * gpusPerWorker;
   const targetGpus = jf.targetGpuCount ?? targetCnt * gpusPerWorker;
   const remainingGpus = jf.remainingGpuToCreate ?? remainingCnt * gpusPerWorker;
@@ -459,22 +463,35 @@ function renderTopAutoStatusBanner() {
 
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
           <div style="background:rgba(30,41,59,0.75); border-radius:8px; padding:9px 11px; border:1px solid rgba(59,130,246,0.3);">
-            <div style="font-size:11px; color:#94a3b8;">현재 가동 워커 / 목표 워커</div>
-            <div class="mono" style="font-size:20px; font-weight:800; color:#60a5fa; margin-top:2px;">
-              ${activeCnt}개 <span style="font-size:14px; color:#cbd5e1;">/ 목표 ${targetCnt}개</span>
+            <div style="font-size:11px; color:#94a3b8;">🟢 실제 가동 중(Running) / 목표 워커</div>
+            <div class="mono" style="font-size:20px; font-weight:800; color:#34d399; margin-top:2px;">
+              ${runningCnt}개 <span style="font-size:14px; color:#cbd5e1;">/ 목표 ${targetCnt}개</span>
+              <span style="font-size:12px; color:#a7f3d0;">(가동 GPU ${runningGpus}장)</span>
             </div>
-            <div style="font-size:11px; color:#a7f3d0; margin-top:2px;">
-              🟢 Running ${runningCnt}개 · ⏳ 대기 ${pendingCnt}개 (총 GPU ${activeGpus}장)
+            <div style="font-size:11px; color:#fde68a; margin-top:2px;">
+              ⏳ Pending 대기: <b>${pendingCnt}개</b>${excessPendingCnt > 0 ? ` <span style="color:#fbbf24;">(초과 +${excessPendingCnt}개)</span>` : ""} &nbsp;|&nbsp; <span style="color:#93c5fd;">전체 활성 합계: <b>${activeCnt}개</b> (${activeGpus}장)</span>
             </div>
           </div>
 
           <div style="background:rgba(30,41,59,0.75); border-radius:8px; padding:9px 11px; border:1px solid rgba(245,158,11,0.35);">
-            <div style="font-size:11px; color:#94a3b8;">앞으로 무클릭 자동 신청될 워커</div>
-            <div class="mono" style="font-size:20px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : "#34d399"}; margin-top:2px;">
-              +${remainingCnt}개 <span style="font-size:12.5px; color:#fde68a;">(GPU +${remainingGpus}장)</span>
+            <div style="font-size:11px; color:#94a3b8;">${remainingCnt > 0 ? "앞으로 무클릭 자동 신청될 워커" : runningCnt < targetCnt ? "⏳ 클러스터 Running 전환 대기 현황" : "앞으로 무클릭 자동 신청될 워커"}</div>
+            <div class="mono" style="font-size:20px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : runningCnt < targetCnt ? "#fde68a" : "#34d399"}; margin-top:2px;">
+              ${
+                remainingCnt > 0
+                  ? `+${remainingCnt}개 <span style="font-size:12.5px; color:#fde68a;">(GPU +${remainingGpus}장)</span>`
+                  : runningCnt < targetCnt
+                  ? `⏳ 대기 ${pendingCnt}개 <span style="font-size:12.5px; color:#cbd5e1;">(Running 부족 ${targetCnt - runningCnt}개)</span>`
+                  : `+0개 <span style="font-size:12.5px; color:#6ee7b7;">(전원 Running!)</span>`
+              }
             </div>
             <div style="font-size:11px; color:#cbd5e1; margin-top:2px;">
-              ${remainingCnt > 0 ? `${allocIntervalSec}초마다 1개씩 클릭 없이 자동 신청됨` : `목표치 달성 완료! (종료 시 즉시 자동 재신청)`}
+              ${
+                remainingCnt > 0
+                  ? `${allocIntervalSec}초마다 1개씩 클릭 없이 자동 신청됨`
+                  : runningCnt < targetCnt
+                  ? `목표 ${targetCnt}개 모두 신청 완료 · 클러스터 노드 배정 시 Running 전환`
+                  : `목표 Running ${targetCnt}개 100% 가동 중! (종료 시 즉시 자동 재신청)`
+              }
             </div>
           </div>
         </div>
@@ -669,13 +686,71 @@ function renderWorkerFleetBoard(fleet) {
   const pendingCnt = jf.pendingCount ?? 0;
   const targetCnt = jf.targetCount ?? 1;
   const remainingCnt = jf.remainingToCreate ?? Math.max(0, targetCnt - activeCnt);
+  const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
   const gpusPerWorker = jf.coreCountPerWorker ?? jf.gpusPerWorker ?? 1;
+  const runningGpus = jf.runningGpuCount ?? jf.runningGpus ?? runningCnt * gpusPerWorker;
+  const pendingGpus = jf.pendingGpuCount ?? jf.pendingGpus ?? pendingCnt * gpusPerWorker;
   const activeGpus = jf.activeGpuCount ?? jf.activeGpus ?? activeCnt * gpusPerWorker;
   const targetGpus = jf.targetGpuCount ?? jf.targetGpus ?? targetCnt * gpusPerWorker;
   const remainingGpus = jf.remainingGpuToCreate ?? jf.remainingGpus ?? remainingCnt * gpusPerWorker;
+  const runningPct = targetCnt > 0 ? Math.min(100, Math.round((runningCnt / targetCnt) * 100)) : 100;
+  const pendingPct = targetCnt > 0 ? Math.min(Math.max(0, 100 - runningPct), Math.round((pendingCnt / targetCnt) * 100)) : 0;
   const pct = targetCnt > 0 ? Math.min(100, Math.round((activeCnt / targetCnt) * 100)) : 100;
   const isAutoOn = Boolean(fleet.schedulerEnabled && jf.enabled);
   const intervalSec = jf.scaleUpIntervalSec || 15;
+  const recon = fleet.spaceReconciliation || null;
+
+  // Build exact SPACE Cluster Reconciliation Bar so user sees why Rule vs My Account vs Group numbers differ
+  let reconciliationBarHtml = "";
+  if (recon) {
+    const myUnmatched = Array.isArray(recon.myUnmatchedActiveRuns) ? recon.myUnmatchedActiveRuns : [];
+    const otherUsers = Array.isArray(recon.otherUserActiveRuns) ? recon.otherUserActiveRuns : [];
+    const myUnmatchedBadges = myUnmatched
+      .map(
+        (u) =>
+          `<span class="mono" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')" style="cursor:pointer; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.5); color:#7dd3fc; padding:1px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="현재 규칙 이름과 다른 내 계정 워크로드 (클릭 시 로그 보기)">📌 규칙외 내 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>`
+      )
+      .join(" ");
+    const otherUserBadges = otherUsers
+      .map(
+        (u) =>
+          `<span class="mono" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')" style="cursor:pointer; background:rgba(168,85,247,0.18); border:1px solid rgba(168,85,247,0.5); color:#d8b4fe; padding:1px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="그룹 내 다른 사용자 워크로드 (클릭 시 로그 보기)">👥 타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>`
+      )
+      .join(" ");
+
+    reconciliationBarHtml = `
+      <div style="margin-bottom:12px; padding:10px 13px; border-radius:9px; background:rgba(2,6,23,0.78); border:1.5px solid rgba(56,189,248,0.42); display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12.5px;">
+            <span style="font-weight:800; color:#38bdf8;">📊 SPACE 실제 워커 실시간 대조표:</span>
+            <span class="mono" style="background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.45); padding:3px 8px; border-radius:6px; color:#d1fae5;">
+              ① 규칙 <b>[${escapeHtml(jf.jobName)}]</b>: <b style="color:#34d399;">🟢 Running ${runningCnt}개</b>(${runningGpus}GPU) + <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>(${pendingGpus}GPU) = <b>활성 ${activeCnt}개</b> / 목표 ${targetCnt}개
+            </span>
+            <span class="mono" style="background:rgba(59,130,246,0.15); border:1px solid rgba(59,130,246,0.45); padding:3px 8px; border-radius:6px; color:#dbeafe;">
+              ② 내 계정 전체(<code>${escapeHtml(recon.currentUserName || "me")}</code>): <b style="color:#60a5fa;">🟢 Running ${recon.mySpaceRunningWorkers}개</b>(${recon.mySpaceRunningGpus}GPU) + ⏳ Pending ${recon.mySpacePendingWorkers}개 = <b>총 ${recon.mySpaceActiveWorkers}개</b>
+            </span>
+            <span class="mono" style="background:rgba(148,163,184,0.14); border:1px solid rgba(148,163,184,0.35); padding:3px 8px; border-radius:6px; color:#e2e8f0;">
+              ③ 그룹 전체(<code>${escapeHtml(recon.groupId || "Group")}</code>): <b>🟢 Running ${recon.spaceTotalRunningWorkers}개</b>(${recon.spaceTotalRunningGpus}GPU) + ⏳ Pending ${recon.spaceTotalPendingWorkers}개 = <b>총 ${recon.spaceTotalActiveWorkers}개</b>
+            </span>
+          </div>
+          ${
+            excessPendingCnt > 0
+              ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800; padding:4px 10px;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending +${excessPendingCnt}개 자동 정리 (${targetCnt}개 맞춤)</button>`
+              : ""
+          }
+        </div>
+        ${
+          myUnmatched.length > 0 || otherUsers.length > 0
+            ? `<div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px; color:#cbd5e1;">
+                <span style="color:#94a3b8;">💡 규칙 외 SPACE 가동 워크로드 안내:</span>
+                ${myUnmatchedBadges}
+                ${otherUserBadges}
+              </div>`
+            : ""
+        }
+      </div>
+    `;
+  }
 
   const multiRuleTabsHtml =
     fleet.jobs.length > 1
@@ -694,14 +769,14 @@ function renderWorkerFleetBoard(fleet) {
                       ? "background:#2563eb; border:1px solid #60a5fa; color:#fff;"
                       : "border-color:rgba(148,163,184,0.35);"
                   }">
-                  ${item.enabled ? "🟢" : "⚪"} ${escapeHtml(item.jobName)} (${item.activeCount}/${item.targetCount})
+                  ${item.enabled ? "🟢" : "⚪"} ${escapeHtml(item.jobName)} (Running ${item.runningCount ?? 0}${item.pendingCount ? `+대기${item.pendingCount}` : ""}/${item.targetCount})
                 </button>
               `;
             })
             .join("")}
         </div>
         <div class="mono" style="font-size:11.5px; color:#a7f3d0;">
-          전체 활성 규칙 합계: <b>${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers} 워커</b> (총 GPU <b>${fleet.totalActiveGpus}장</b> 가동 중)
+          전체 활성 규칙 합계: <b>🟢 Running ${fleet.totalRunningWorkers}개</b> + ⏳ 대기 ${fleet.totalPendingWorkers}개 = <b>${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers} 워커</b> (가동 GPU <b>${fleet.totalRunningGpus}장</b>)
         </div>
       </div>
     `
@@ -725,27 +800,38 @@ function renderWorkerFleetBoard(fleet) {
     if (w) {
       const stUpper = String(w.status || "").toUpperCase();
       const isRun = stUpper.includes("RUN");
+      const isExcess = Boolean(w.isExcessPending);
       const hasErr = Boolean(w.hasLogError);
       const prog = w.progress || null;
       const isStraggler = Boolean(prog?.isStraggler);
-      const dot = hasErr ? "🚨" : isStraggler ? "🐢" : isRun ? "🟢" : "⏳";
+      const dot = hasErr ? "🚨" : isStraggler ? "🐢" : isRun ? "🟢" : isExcess ? "⚠️" : "⏳";
       const bg = hasErr
         ? "rgba(239,68,68,0.22)"
         : isStraggler
         ? "rgba(249,115,22,0.22)"
         : isRun
         ? "rgba(16,185,129,0.18)"
-        : "rgba(245,158,11,0.20)";
+        : isExcess
+        ? "rgba(245,158,11,0.28)"
+        : "rgba(245,158,11,0.18)";
       const border = hasErr
         ? "#f87171"
         : isStraggler
         ? "#fb923c"
         : isRun
         ? "rgba(16,185,129,0.5)"
+        : isExcess
+        ? "#fbbf24"
         : "rgba(245,158,11,0.5)";
       const color = hasErr ? "#fecaca" : isStraggler ? "#fed7aa" : isRun ? "#6ee7b7" : "#fde68a";
       const srcTag = w.triggerSource === "auto_scheduler" ? "🤖자동" : "👆수동";
-      const slotNum = w.assignedSlot || i + 1;
+      const seqNum = i + 1;
+      const stateIdx = w.stateOrderIndex || (isRun ? seqNum : seqNum - runningCnt);
+      const pillHeaderLabel = isRun
+        ? `워커 #${stateIdx}`
+        : isExcess
+        ? `초과Pending #${seqNum} (대기#${stateIdx})`
+        : `Pending대기 #${seqNum} (대기#${stateIdx})`;
       const reqTimeShort = w.autoApprovalRequestedAt ? formatPreciseTime(w.autoApprovalRequestedAt, false).slice(0, 8) : "";
       const doneTimeShort = w.approvedAt ? formatPreciseTime(w.approvedAt, false).slice(0, 8) : "";
       const logLineShort = w.lastLogLine ? String(w.lastLogLine).slice(0, 44) : "";
@@ -765,10 +851,10 @@ function renderWorkerFleetBoard(fleet) {
 
       slotPills.push(`
         <span class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
-          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(String(w.id))}) · 슬롯 #${slotNum} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
+          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(String(w.id))}) · 상태: ${escapeHtml(w.status)} · ${pillHeaderLabel} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:2px; padding:4px 8px; border-radius:6px; font-size:11px; background:${bg}; border:1px solid ${border}; color:${color}; font-weight:600;">
-          <span>${dot} 슬롯#${slotNum} <span style="opacity:0.88;">(#${escapeHtml(String(w.id))} · ${srcTag})</span></span>
-          ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)}</span>` : ""}
+          <span>${dot} ${pillHeaderLabel} <span style="opacity:0.9;">(#${escapeHtml(String(w.id))} · ${escapeHtml(w.name.slice(0, 14))})</span></span>
+          ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)} (${srcTag})</span>` : `<span style="font-size:10px; opacity:0.85;">상태: ${escapeHtml(w.status)} (${srcTag})</span>`}
           ${progBadgeHtml}
           ${
             hasErr
@@ -784,12 +870,30 @@ function renderWorkerFleetBoard(fleet) {
       const bg = isNext ? "rgba(59,130,246,0.22)" : "rgba(30,41,59,0.65)";
       const border = isNext ? "#60a5fa" : "rgba(148,163,184,0.25)";
       const color = isNext ? "#93c5fd" : "#94a3b8";
-      const nextSlotNum = isNext && jf.nextAssignedSlot ? jf.nextAssignedSlot : i + 1;
+      const nextSlotNum = i + 1;
       slotPills.push(`
         <span class="mono"
           title="${isNext ? "다음 차례에 자동 생성될 워커 슬롯입니다" : "순차적으로 자동 생성 예정인 워커 슬롯입니다"}"
           style="display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:6px; font-size:11.5px; background:${bg}; border:1px dashed ${border}; color:${color};">
-          ${isNext ? "⚡" : "🔄"} 슬롯#${nextSlotNum} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span>
+          ${isNext ? "⚡" : "🔄"} 워커 #${nextSlotNum} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span>
+        </span>
+      `);
+    }
+  }
+
+  // Also append unmatched active SPACE runs (e.g. `fss #352713` or other user runs) so all 64 SPACE active runs are visible
+  if (recon && Array.isArray(recon.unmatchedActiveRuns) && recon.unmatchedActiveRuns.length > 0) {
+    for (const u of recon.unmatchedActiveRuns) {
+      const isMine = Boolean(u.isMine);
+      const pillBg = isMine ? "rgba(56,189,248,0.16)" : "rgba(168,85,247,0.16)";
+      const pillBorder = isMine ? "rgba(56,189,248,0.55)" : "rgba(168,85,247,0.55)";
+      const pillColor = isMine ? "#7dd3fc" : "#d8b4fe";
+      slotPills.push(`
+        <span class="mono" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')"
+          title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}"
+          style="cursor:pointer; display:inline-flex; flex-direction:column; gap:2px; padding:4px 8px; border-radius:6px; font-size:11px; background:${pillBg}; border:1px solid ${pillBorder}; color:${pillColor}; font-weight:600;">
+          <span>${isMine ? "📌 규칙외(내 런)" : `👥 타유저(${escapeHtml(u.userName)})`} <b>${escapeHtml(u.name)}</b> (#${escapeHtml(String(u.id))})</span>
+          <span style="font-size:10px; opacity:0.9;">${u.isRunning ? "🟢 Running" : `⏳ ${escapeHtml(u.status)}`} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
         </span>
       `);
     }
@@ -886,23 +990,38 @@ function renderWorkerFleetBoard(fleet) {
   `;
 
   let statusHeadline = "";
+  let statusBadgeClass = "ok";
+  let statusBadgeLabel = "";
   if (remainingCnt > 0) {
+    statusBadgeClass = "warn";
+    statusBadgeLabel = `🚀 자동 스케일업 진행 중 (🟢 Running ${runningCnt} · ⏳ 대기 ${pendingCnt} · 활성 ${activeCnt}/${targetCnt})`;
     if (isAutoOn) {
-      statusHeadline = `🔄 현재 <b>${activeCnt}개</b> 워커 가동 중 → 목표 <b>${targetCnt}개</b>까지 앞으로 <b style="color:#fde68a; font-size:15px;">+${remainingCnt}개</b> 워커(GPU <b>+${remainingGpus}장</b>)가 <b>${intervalSec}초 간격</b>으로 자동 생성됩니다!`;
+      statusHeadline = `🔄 현재 <b>🟢 Running ${runningCnt}개</b> + ⏳ 대기 ${pendingCnt}개(활성 ${activeCnt}개) → 목표 <b>${targetCnt}개</b>까지 앞으로 <b style="color:#fde68a; font-size:15px;">+${remainingCnt}개</b> 워커(GPU <b>+${remainingGpus}장</b>)가 <b>${intervalSec}초 간격</b>으로 자동 생성됩니다!`;
     } else {
-      statusHeadline = `⏸️ 현재 <b>${activeCnt}개</b> 워커 가동 중 (목표 <b>${targetCnt}개</b> · 미달 <b>+${remainingCnt}개</b>) — 현재 자동 생성이 일시정지(OFF) 상태입니다.`;
+      statusHeadline = `⏸️ 현재 <b>🟢 Running ${runningCnt}개</b> + ⏳ 대기 ${pendingCnt}개(활성 ${activeCnt}/${targetCnt}개 · 미달 <b>+${remainingCnt}개</b>) — 현재 자동 생성이 일시정지(OFF) 상태입니다.`;
     }
+  } else if (runningCnt < targetCnt) {
+    statusBadgeClass = "warn";
+    statusBadgeLabel = `⏳ 클러스터 노드 대기 중 (🟢 Running ${runningCnt} / 목표 ${targetCnt}개 · Pending ${pendingCnt}개)`;
+    statusHeadline = `🟢 현재 실제 가동(Running) <b>${runningCnt}개</b>(GPU <b>${runningGpus}장</b>) + ⏳ 클러스터 대기(Pending) <b style="color:#fde68a;">${pendingCnt}개</b>(GPU <b>${pendingGpus}장</b>) = 전체 활성 <b>${activeCnt}개</b> (목표 <b>${targetCnt}개</b> 신청 완료${
+      excessPendingCnt > 0 ? ` · <span style="color:#fbbf24;">초과 Pending +${excessPendingCnt}개</span>` : ""
+    })`;
   } else {
-    statusHeadline = `✅ 목표 워커 <b>${targetCnt}개</b> (현재 가동 <b>${activeCnt}개</b> · 총 GPU <b>${activeGpus}장</b>) 모두 가동 중입니다! (워커 종료 시 자동으로 즉시 재생성)`;
+    statusBadgeClass = "ok";
+    statusBadgeLabel = `✅ 목표 Running 100% 달성 (🟢 Running ${runningCnt}/${targetCnt}개${pendingCnt > 0 ? ` · 대기 ${pendingCnt}개` : ""})`;
+    statusHeadline = `✅ 목표 워커 <b>${targetCnt}개</b> 중 <b>🟢 실제 가동(Running) ${runningCnt}개</b> (총 GPU <b>${runningGpus}장</b>)${
+      pendingCnt > 0 ? ` + ⏳ 대기 ${pendingCnt}개` : ""
+    } 가동 중입니다! (워커 종료 시 자동으로 즉시 재생성)`;
   }
 
   panel.innerHTML = `
     ${multiRuleTabsHtml}
+    ${reconciliationBarHtml}
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
       <div>
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-          <span class="badge ${remainingCnt > 0 ? "warn" : "ok"}" style="font-size:12.5px; padding:4px 10px;">
-            ${remainingCnt > 0 ? `🚀 자동 스케일업 진행 중 (${activeCnt} / ${targetCnt} 워커)` : `✅ 목표 워커 수 도달 (${activeCnt} / ${targetCnt} 워커)`}
+          <span class="badge ${statusBadgeClass}" style="font-size:12.5px; padding:4px 10px;">
+            ${statusBadgeLabel}
           </span>
           <span style="font-size:14px; color:#e2e8f0;">${statusHeadline}</span>
         </div>
@@ -911,33 +1030,47 @@ function renderWorkerFleetBoard(fleet) {
       <div class="btn-row">
         <button type="button" class="success sm" onclick="spawnExtraWorkers('${escapeHtml(jf.jobId)}', 1)">➕ 지금 즉시 +1개 생성</button>
         <button type="button" class="success sm" style="background:#059669;" onclick="spawnExtraWorkers('${escapeHtml(jf.jobId)}', 4)">⚡ 지금 즉시 +4개 연속 생성</button>
-        <button type="button" class="secondary sm" style="border-color:rgba(245,158,11,0.5); color:#fde68a;" onclick="bulkControlWorkers('stop_pending')">⏳ Pending(${pendingCnt}개) 취소</button>
+        ${
+          excessPendingCnt > 0
+            ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending(+${excessPendingCnt}개) 정리</button>`
+            : ""
+        }
+        <button type="button" class="secondary sm" style="border-color:rgba(245,158,11,0.5); color:#fde68a;" onclick="bulkControlWorkers('stop_pending')">⏳ Pending(${pendingCnt}개) 전체취소</button>
         <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all')">🛑 전체 워커 종료</button>
       </div>
     </div>
 
     <!-- 4 Key Metric Cards -->
-    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px; margin-bottom:12px;">
-      <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(16,185,129,0.4); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">🟢 현재 가동 중인 워커 수</div>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(215px, 1fr)); gap:10px; margin-bottom:12px;">
+      <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(16,185,129,0.45); border-radius:8px; padding:10px 12px;">
+        <div style="font-size:11.5px; color:#94a3b8;">🟢 실제 가동 중(Running) 워커 수</div>
         <div class="mono" style="font-size:22px; font-weight:800; color:#34d399; margin-top:2px;">
-          ${activeCnt}개 <span style="font-size:13px; font-weight:600; color:#a7f3d0;">(총 GPU ${activeGpus}장)</span>
+          ${runningCnt}개 <span style="font-size:14px; color:#cbd5e1;">/ 목표 ${targetCnt}개</span>
+          <span style="font-size:12.5px; font-weight:600; color:#a7f3d0;">(가동 GPU ${runningGpus}장)</span>
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
-          Running: <b>${runningCnt}개</b> &nbsp;|&nbsp; Pending/시작중: <b>${pendingCnt}개</b>
+          ⏳ Pending 대기: <b style="color:#fde68a;">${pendingCnt}개</b>(${pendingGpus}장) &nbsp;|&nbsp; 전체 활성: <b>${activeCnt}개</b>(${activeGpus}장)
         </div>
       </div>
 
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(245,158,11,0.45); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">🔄 앞으로 자동 생성될 워커 수</div>
-        <div class="mono" style="font-size:22px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : "#6ee7b7"}; margin-top:2px;">
-          +${remainingCnt}개 <span style="font-size:13px; font-weight:600; color:#fde68a;">(추가 GPU +${remainingGpus}장)</span>
+        <div style="font-size:11.5px; color:#94a3b8;">${remainingCnt > 0 ? "🔄 앞으로 자동 생성될 워커 수" : "⏳ 클러스터 Pending 대기 및 추가 생성"}</div>
+        <div class="mono" style="font-size:21px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : pendingCnt > 0 ? "#fde68a" : "#6ee7b7"}; margin-top:2px;">
+          ${
+            remainingCnt > 0
+              ? `+${remainingCnt}개 생성 예정 <span style="font-size:12.5px; font-weight:600; color:#fde68a;">(GPU +${remainingGpus}장)</span>`
+              : pendingCnt > 0
+              ? `⏳ Pending ${pendingCnt}개 대기 <span style="font-size:12.5px; font-weight:600; color:#cbd5e1;">(${excessPendingCnt > 0 ? `목표초과 +${excessPendingCnt}개` : `Running 전환 대기`})</span>`
+              : `대기 0개 <span style="font-size:12.5px; font-weight:600; color:#6ee7b7;">(전원 Running!)</span>`
+          }
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
           ${
             remainingCnt > 0
               ? `<b>${intervalSec}초</b>마다 1개씩 자동 생성 · 약 <b>${Math.ceil((remainingCnt * intervalSec) / 60)}분</b> 내 전부 생성`
-              : `추가 생성 대기 없음 (목표치 100% 충족)`
+              : pendingCnt > 0
+              ? `목표 ${targetCnt}개 신청 완료 · 클러스터 GPU 노드 배정 시 Running 진입`
+              : `추가 생성 대기 없음 (목표 Running 100% 충족)`
           }
         </div>
       </div>
@@ -948,8 +1081,8 @@ function renderWorkerFleetBoard(fleet) {
           <span class="mono" style="font-size:20px; font-weight:800; color:#60a5fa; margin-right:4px;">${targetCnt}개</span>
           <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${Math.max(1, targetCnt - 4)})">-4</button>
           <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${targetCnt + 4})">+4</button>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 16)">16</button>
           <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 48)">48</button>
+          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 56)">56</button>
           <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" style="width:64px; padding:3px 6px; font-size:12.5px;" />
           <button type="button" class="sm" style="padding:3px 8px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetInput').value || 1))">적용</button>
         </div>
@@ -974,20 +1107,21 @@ function renderWorkerFleetBoard(fleet) {
       </div>
     </div>
 
-    <!-- Progress Bar -->
+    <!-- Dual Progress Bar (Green = Running, Amber = Pending) -->
     <div style="margin-bottom:10px;">
       <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1; margin-bottom:4px; flex-wrap:wrap; gap:6px;">
-        <span>워커 가동 달성률: <b>${activeCnt} / ${targetCnt} 워커 (${pct}%)</b></span>
+        <span>🟢 실제 Running 달성률: <b style="color:#34d399;">${runningCnt} / ${targetCnt} 워커 (${runningPct}%)</b> &nbsp;·&nbsp; ⏳ Pending 대기: <b style="color:#fde68a;">${pendingCnt}개</b> (전체 활성 ${activeCnt}/${targetCnt}개)</span>
         <span>🛡️ 부하보호: <b>${escapeHtml(fleet.loadMonitor?.loadBadgeText || "🟢 쾌적 · 안전 할당")}</b> (API 평균 ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms)</span>
         <span>📊 누적 가동: <b>${tel.totalGpuHours ?? 0} GPU-Hours</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)</span>
       </div>
-      <div style="width:100%; height:10px; background:rgba(15,23,42,0.8); border-radius:999px; overflow:hidden; border:1px solid rgba(148,163,184,0.25);">
-        <div style="width:${pct}%; height:100%; background:linear-gradient(90deg, #3b82f6, #10b981); transition:width 0.3s ease;"></div>
+      <div style="width:100%; height:10px; background:rgba(15,23,42,0.8); border-radius:999px; overflow:hidden; border:1px solid rgba(148,163,184,0.25); display:flex;">
+        <div style="width:${runningPct}%; height:100%; background:linear-gradient(90deg, #10b981, #34d399); transition:width 0.3s ease;" title="실제 Running: ${runningCnt}개"></div>
+        <div style="width:${pendingPct}%; height:100%; background:linear-gradient(90deg, #f59e0b, #fbbf24); transition:width 0.3s ease;" title="Pending 대기: ${pendingCnt}개"></div>
       </div>
     </div>
 
     <!-- Slot Pills Grid -->
-    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:145px; overflow-y:auto; padding-top:4px;">
+    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:165px; overflow-y:auto; padding-top:4px;">
       ${slotPills.join("")}
     </div>
 
@@ -1065,6 +1199,11 @@ function updateWorkerCountdownBadge() {
   if (!latestWorkerFleet || !latestWorkerFleet.jobs || !latestWorkerFleet.jobs[0]) return;
   const jf = getFocusedJobFleet(latestWorkerFleet);
   const remainingCnt = jf.remainingToCreate ?? 0;
+  const runningCnt = jf.runningCount ?? 0;
+  const pendingCnt = jf.pendingCount ?? 0;
+  const activeCnt = jf.activeCount ?? 0;
+  const targetCnt = jf.targetCount ?? 1;
+  const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
   const isAutoOn = Boolean(latestWorkerFleet.schedulerEnabled && jf.enabled);
   const schedStats = latestSchedulerStats || {};
   const effSchedSec = schedStats.effectiveIntervalSec || jf.scaleUpIntervalSec || 30;
@@ -1074,11 +1213,19 @@ function updateWorkerCountdownBadge() {
   }
 
   if (remainingCnt <= 0) {
-    if (el) {
-      el.innerHTML = `✨ 현재 모든 목표 워커(<b>${jf.targetCount}개</b>)가 정상 가동 중입니다. (다음 자동 감시 점검: <b>${nextSchedCheckSec}초 후</b> · 종료 발생 시 즉시 자동 충원)`;
-    }
-    if (topAllocEl) {
-      topAllocEl.innerHTML = `✅ 목표 워커 <b>${jf.targetCount}개</b> 달성 유지 중! (다음 무클릭 자동 감시 점검까지: <b style="color:#6ee7b7;">${nextSchedCheckSec}초</b> · 워커 종료 시 자동 재신청)`;
+    if (runningCnt < targetCnt) {
+      const waitMsg = `⏳ 목표 워커 <b>${targetCnt}개</b> 모두 신청 완료 — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> 가동 중이며 <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>가 클러스터 GPU 노드 배정을 기다리고 있습니다.${
+        excessPendingCnt > 0 ? ` (목표 대비 초과 Pending +${excessPendingCnt}개)` : ""
+      } (다음 감시 점검: <b>${nextSchedCheckSec}초 후</b>)`;
+      if (el) el.innerHTML = waitMsg;
+      if (topAllocEl) topAllocEl.innerHTML = waitMsg;
+    } else {
+      if (el) {
+        el.innerHTML = `✨ 현재 목표 워커(<b>🟢 Running ${runningCnt}/${targetCnt}개</b>)가 전원 정상 가동 중입니다. (다음 자동 감시 점검: <b>${nextSchedCheckSec}초 후</b> · 종료 발생 시 즉시 자동 충원)`;
+      }
+      if (topAllocEl) {
+        topAllocEl.innerHTML = `✅ 목표 Running 워커 <b>${runningCnt}/${targetCnt}개</b> 100% 가동 유지 중! (다음 무클릭 자동 감시 점검까지: <b style="color:#6ee7b7;">${nextSchedCheckSec}초</b> · 워커 종료 시 자동 재신청)`;
+      }
     }
     return;
   }
@@ -1496,6 +1643,8 @@ async function bulkControlWorkers(action, extra = {}) {
     } else if (action === "stop_pending") {
       const ok = confirm("현재 Pending / 준비 대기 중인 워커들을 모두 취소하시겠습니까?");
       if (!ok) return;
+    } else if (action === "trim_excess_pending") {
+      showToast("✂️ 목표 워커 수를 초과한 Pending 대기 워커만 정리하여 목표 수량에 맞춥니다...");
     } else if (action === "rolling_restart") {
       showToast("🔄 가장 오래된 Running 워커 1개를 종료하고 최신 스크립트로 무중단 교체합니다...");
     } else if (action === "scan_logs") {
@@ -1514,6 +1663,8 @@ async function bulkControlWorkers(action, extra = {}) {
       showToast(`✅ 워커 ${res.scannedCount || 0}개의 실시간 로그 스캔 완료!`);
     } else if (action === "rolling_restart") {
       showToast(`🔄 롤링 재시작: 워커 ${res.terminatedCount || 0}개 종료 완료 → 곧 새 워커가 자동 생성됩니다.`);
+    } else if (action === "trim_excess_pending") {
+      showToast(`✂️ 초과 Pending 워커 ${res.terminatedCount || 0}개 정리 완료!`);
     } else if (action === "stop_pending") {
       showToast(`⏳ Pending 워커 ${res.terminatedCount || 0}개 일괄 취소 완료!`);
     } else if (action === "stop_all") {
@@ -2254,7 +2405,10 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
   const navSetBadge = document.getElementById("navSetupBadge");
 
   if (navMonBadge && fleet) {
-    navMonBadge.textContent = `가동 ${fleet.totalActiveWorkers ?? 0}/${fleet.totalTargetWorkers ?? 0}워커`;
+    const rCnt = fleet.totalRunningWorkers ?? 0;
+    const pCnt = fleet.totalPendingWorkers ?? 0;
+    const tCnt = fleet.totalTargetWorkers ?? 0;
+    navMonBadge.textContent = `🟢 Running ${rCnt}/${tCnt}워커${pCnt > 0 ? ` (+대기 ${pCnt})` : ""}`;
   }
   if (navSetBadge) {
     navSetBadge.textContent = `규칙 ${jobs.length}개`;
@@ -2280,16 +2434,26 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
       .map((j) => {
         const isSelected = !isNewJobMode && String(j.id) === String(currentFormJobId);
         const jf = jobFleetMap.get(j.id);
+        const runningCnt = jf ? jf.runningCount : "?";
+        const pendingCnt = jf ? jf.pendingCount : 0;
         const activeCnt = jf ? jf.activeCount : "?";
         const targetCnt = j.minConcurrentRuns || 1;
         const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
+        const excessCnt = jf ? jf.excessPendingCount || 0 : 0;
         const fleetBadges = jf
           ? `<div style="margin-top:4px; display:flex; gap:5px; flex-wrap:wrap;">
-              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">가동: ${activeCnt} / 목표: ${targetCnt}개</span>
+              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개</span>
+              ${
+                pendingCnt > 0
+                  ? `<span class="badge warn">⏳ Pending 대기: ${pendingCnt}개 (활성 ${activeCnt}개${excessCnt > 0 ? ` · 초과+${excessCnt}` : ""})</span>`
+                  : ""
+              }
               ${
                 remCnt > 0
-                  ? `<span class="badge warn">🔄 +${remCnt}개 대기</span>`
-                  : `<span class="badge ok">✅ 충족</span>`
+                  ? `<span class="badge warn">🔄 +${remCnt}개 추가생성 예정</span>`
+                  : runningCnt >= targetCnt
+                  ? `<span class="badge ok">✅ 전원 Running</span>`
+                  : ""
               }
             </div>`
           : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
@@ -2329,16 +2493,26 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
       .map((j) => {
         const isFocused = String(j.id) === String(focusedId);
         const jf = jobFleetMap.get(j.id);
+        const runningCnt = jf ? jf.runningCount : "?";
+        const pendingCnt = jf ? jf.pendingCount : 0;
         const activeCnt = jf ? jf.activeCount : "?";
         const targetCnt = j.minConcurrentRuns || 1;
         const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
+        const excessCnt = jf ? jf.excessPendingCount || 0 : 0;
         const fleetBadges = jf
           ? `<div style="display:flex; gap:5px; flex-wrap:wrap; align-items:center;">
-              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">가동: ${activeCnt} / 목표: ${targetCnt}개</span>
+              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개</span>
+              ${
+                pendingCnt > 0
+                  ? `<span class="badge warn">⏳ Pending 대기: ${pendingCnt}개 (활성 ${activeCnt}개${excessCnt > 0 ? ` · 초과+${excessCnt}` : ""})</span>`
+                  : ""
+              }
               ${
                 remCnt > 0
-                  ? `<span class="badge warn">🔄 +${remCnt}개 대기</span>`
-                  : `<span class="badge ok">✅ 충족</span>`
+                  ? `<span class="badge warn">🔄 +${remCnt}개 추가생성 예정</span>`
+                  : runningCnt >= targetCnt
+                  ? `<span class="badge ok">✅ 전원 Running</span>`
+                  : ""
               }
             </div>`
           : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
@@ -2859,6 +3033,179 @@ async function approveAllPending() {
   }
 }
 
+let latestRawSpaceRuns = [];
+let currentSpaceRunsFilter = "active"; // "active" | "running" | "pending" | "mine" | "all"
+
+function setSpaceRunsFilter(filterMode) {
+  currentSpaceRunsFilter = filterMode || "active";
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+}
+
+function classifyUiRunStatus(status) {
+  const s = String(status || "").toUpperCase();
+  if (["RUNNING", "PENDING", "CREATING", "STAGING", "INITIALIZING", "QUEUED", "STARTING", "APPROVED", "ADMITTED", "SCHEDULED", "WAITING"].some((k) => s.includes(k))) {
+    return "ACTIVE";
+  }
+  if (["SUCCEEDED", "COMPLETED", "FINISHED", "DONE"].some((k) => s.includes(k))) {
+    return "SUCCEEDED";
+  }
+  return "FAILED";
+}
+
+function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFleet) {
+  const tbody = document.getElementById("runsTableBody");
+  const filterBar = document.getElementById("runsFilterSummaryBar");
+  if (!tbody) return;
+
+  const allRuns = Array.isArray(runs) ? runs : [];
+  const recon = fleet?.spaceReconciliation || {};
+  const myUser = String(recon.currentUserName || serverState?.config?.userName || serverState?.config?.resolvedUserName || "").trim();
+
+  // Map runId -> matched rule name
+  const runToJobName = new Map();
+  if (fleet && Array.isArray(fleet.jobs)) {
+    for (const jf of fleet.jobs) {
+      for (const w of jf.activeWorkers || []) {
+        if (w.id !== undefined && w.id !== null) {
+          runToJobName.set(String(w.id), jf.jobName || jf.name || "규칙");
+        }
+      }
+    }
+  }
+
+  const activeRunsRaw = allRuns
+    .filter((r) => classifyUiRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE")
+    .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
+  const runningRuns = activeRunsRaw.filter((r) =>
+    String(r.status ?? r.state ?? r.phase ?? "").toUpperCase().includes("RUNNING")
+  );
+  const pendingRuns = activeRunsRaw.filter(
+    (r) => !String(r.status ?? r.state ?? r.phase ?? "").toUpperCase().includes("RUNNING")
+  );
+  // Active runs ordered: all Running first (#1..#runningCount), then Pending (#runningCount+1..#activeCount)
+  const orderedActiveRuns = [...runningRuns, ...pendingRuns];
+  const isMyRun = (r) => {
+    const u = String(r.userId || r.userName || r.user || "").trim();
+    if (!myUser || myUser === "admin" || !u) return true;
+    return u.toLowerCase() === myUser.toLowerCase();
+  };
+  const myActiveRuns = orderedActiveRuns.filter(isMyRun);
+  const terminatedRuns = allRuns.filter((r) => classifyUiRunStatus(r.status ?? r.state ?? r.phase) !== "ACTIVE");
+
+  if (filterBar) {
+    const mkBtn = (mode, label, color = "#e2e8f0") => {
+      const isSel = currentSpaceRunsFilter === mode;
+      return `<button type="button" class="${isSel ? "" : "secondary"} sm" onclick="setSpaceRunsFilter('${mode}')" style="padding:3px 9px; font-size:11.5px; font-weight:700; ${
+        isSel ? "background:#2563eb; border:1px solid #60a5fa; color:#fff;" : `color:${color};`
+      }">${label}</button>`;
+    };
+    filterBar.innerHTML = `
+      <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+        <span style="font-weight:800; color:#93c5fd; margin-right:2px;">🔍 표시 필터:</span>
+        ${mkBtn("active", `전체 활성 (${orderedActiveRuns.length}개)`)}
+        ${mkBtn("running", `🟢 Running (${runningRuns.length}개)`, "#6ee7b7")}
+        ${mkBtn("pending", `⏳ Pending 대기 (${pendingRuns.length}개)`, "#fde68a")}
+        ${mkBtn("mine", `👤 내 계정 활성 (${myActiveRuns.length}개)`, "#93c5fd")}
+        ${mkBtn("all", `📜 종료 포함 (${allRuns.length}개)`, "#cbd5e1")}
+      </div>
+      <div class="mono" style="font-size:11.5px; color:#cbd5e1;">
+        🟢 가동: <b style="color:#34d399;">${runningRuns.length}개</b> &nbsp;|&nbsp; ⏳ 대기: <b style="color:#fde68a;">${pendingRuns.length}개</b> &nbsp;|&nbsp; 전체 활성: <b>${orderedActiveRuns.length}개</b> (잘림 없이 전체 표시)
+      </div>
+    `;
+  }
+
+  let displayList = [];
+  if (currentSpaceRunsFilter === "running") {
+    displayList = runningRuns;
+  } else if (currentSpaceRunsFilter === "pending") {
+    displayList = pendingRuns;
+  } else if (currentSpaceRunsFilter === "mine") {
+    displayList = myActiveRuns;
+  } else if (currentSpaceRunsFilter === "all") {
+    displayList = [...orderedActiveRuns, ...terminatedRuns.slice(0, 80)];
+  } else {
+    displayList = orderedActiveRuns;
+  }
+
+  if (!displayList.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="hint">선택한 필터(${currentSpaceRunsFilter})에 해당하는 워크로드가 없습니다.</td></tr>`;
+    return;
+  }
+
+  let runSeq = 0;
+  let pendSeq = 0;
+  tbody.innerHTML = displayList
+    .map((r, idx) => {
+      const id = r.id ?? r.runId;
+      const name = r.containerName ?? r.name ?? `run-${id}`;
+      const userName = r.userId || r.userName || r.user || "-";
+      const mine = isMyRun(r);
+      const matchedJob = runToJobName.get(String(id)) || null;
+      const st = String(r.status ?? r.state ?? r.phase ?? "UNKNOWN");
+      const stUpper = st.toUpperCase();
+      const isRun = stUpper.includes("RUNNING");
+      const isAct = classifyUiRunStatus(st) === "ACTIVE";
+      if (isRun) runSeq += 1;
+      else if (isAct) pendSeq += 1;
+
+      const seqBadge = isRun
+        ? `<span class="mono" style="color:#34d399; font-weight:800;">🟢 #${runSeq}</span>`
+        : isAct
+        ? `<span class="mono" style="color:#fde68a; font-weight:800;">⏳ 대기#${pendSeq}</span><div class="mono" style="font-size:10px; color:#94a3b8;">(활성#${idx + 1})</div>`
+        : `<span class="mono" style="color:#94a3b8;">종료 #${idx + 1}</span>`;
+
+      const isAlreadyApproved = String(r.approvalStatus || "").toLowerCase() === "approved";
+      let cls = "badge";
+      if (isRun) cls = "badge ok";
+      else if (isAct) cls = "badge warn";
+      else if (["SUCCEEDED", "COMPLETED"].some((k) => stUpper.includes(k))) cls = "badge ok";
+      else cls = "badge err";
+
+      const displayStatus = isRun
+        ? "🟢 Running (실제 가동 중)"
+        : stUpper.includes("PENDING") && isAlreadyApproved
+        ? `⏳ Pending (✅ 승인완료 · 클러스터 노드 대기)`
+        : isAct
+        ? `⏳ ${st}`
+        : st;
+      const gpuInfo = `${r.coreName || r.gpuName || r.coreId || "-"} ×${r.coreCount ?? r.coreNum ?? 1}`;
+      const cmd = r.executionCommand || r.execCommand || r.containerImage || "-";
+      const reasonText = r.reason ? `<div class="hint" style="margin-top:2px; font-size:11px; color:${cls.includes("err") ? "#f87171" : "var(--muted)"};">${escapeHtml(r.reason)}</div>` : "";
+      const ruleTagHtml = matchedJob
+        ? `<span style="background:rgba(16,185,129,0.18); border:1px solid rgba(16,185,129,0.45); color:#6ee7b7; padding:1px 5px; border-radius:4px; font-size:10px; margin-left:4px;">규칙:${escapeHtml(matchedJob)}</span>`
+        : isAct
+        ? `<span style="background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.45); color:#7dd3fc; padding:1px 5px; border-radius:4px; font-size:10px; margin-left:4px;">📌 규칙외</span>`
+        : "";
+      const approveBtn =
+        stUpper.includes("PENDING") && !isAlreadyApproved
+          ? `<button class="success sm" onclick="approveSingleItem('', '${escapeHtml(String(id))}')">✅ Admin 승인</button>`
+          : "";
+      return `
+        <tr style="${!mine && isAct ? "background:rgba(168,85,247,0.08);" : ""}">
+          <td>${seqBadge}</td>
+          <td class="mono">
+            <b>#${escapeHtml(String(id))}</b>
+            <div style="font-size:10.5px; color:${mine ? "#93c5fd" : "#d8b4fe"};">${escapeHtml(userName)}${!mine ? " (타유저)" : ""}</div>
+          </td>
+          <td class="mono">
+            <b>${escapeHtml(name)}</b>${ruleTagHtml}
+          </td>
+          <td><span class="${cls}">${escapeHtml(displayStatus)}</span>${reasonText}</td>
+          <td class="mono">${escapeHtml(gpuInfo)}</td>
+          <td class="mono" style="max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(cmd)}">${escapeHtml(cmd)}</td>
+          <td>
+            <div class="btn-row">
+              ${approveBtn}
+              <button class="secondary sm" onclick="viewRunLog('${id}', '${escapeHtml(name)}')">📜 로그</button>
+              ${isAct ? `<button class="danger sm" onclick="stopRun('${id}')">중지</button>` : ""}
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
 async function loadSpaceRuns() {
   if (!sessionPassword) return;
   const tbody = document.getElementById("runsTableBody");
@@ -2871,52 +3218,12 @@ async function loadSpaceRuns() {
         renderJobsTable(serverState.jobs, latestWorkerFleet);
       }
     }
-    const runs = data.runs || [];
-    if (!runs.length) {
-      tbody.innerHTML = `<tr><td colspan="6" class="hint">현재 조회된 WLM 워크로드(Run)가 없습니다.</td></tr>`;
-      return;
-    }
-    tbody.innerHTML = runs
-      .slice(0, 30)
-      .map((r) => {
-        const id = r.id ?? r.runId;
-        const name = r.containerName ?? r.name ?? `run-${id}`;
-        const st = String(r.status ?? r.state ?? r.phase ?? "UNKNOWN");
-        const stUpper = st.toUpperCase();
-        const isAlreadyApproved = String(r.approvalStatus || "").toLowerCase() === "approved";
-        let cls = "badge";
-        if (stUpper.includes("PENDING") && !isAlreadyApproved) cls = "badge warn";
-        else if (["RUNNING", "CREATING", "STAGING", "APPROVED", "ADMITTED", "SCHEDULED"].some((k) => stUpper.includes(k)) || isAlreadyApproved) cls = "badge ok";
-        else if (["FAILED", "ERROR", "STOPPED", "KILLED", "REJECTED"].some((k) => stUpper.includes(k))) cls = "badge err";
-        const displayStatus =
-          stUpper.includes("PENDING") && isAlreadyApproved ? `${st} (✅ Admin 승인됨 · 시작 중)` : st;
-        const gpuInfo = `${r.coreName || r.gpuName || r.coreId || "-"} x${r.coreCount ?? r.coreNum ?? 1}`;
-        const cmd = r.executionCommand || r.execCommand || r.containerImage || "-";
-        const reasonText = r.reason ? `<div class="hint" style="margin-top:2px; font-size:11px; color:${cls.includes("err") ? "#f87171" : "var(--muted)"};">${escapeHtml(r.reason)}</div>` : "";
-        const approveBtn =
-          stUpper.includes("PENDING") && !isAlreadyApproved
-            ? `<button class="success sm" onclick="approveSingleItem('', '${escapeHtml(String(id))}')">✅ Admin 승인</button>`
-            : "";
-        return `
-          <tr>
-            <td class="mono">#${id}</td>
-            <td class="mono"><b>${escapeHtml(name)}</b></td>
-            <td><span class="${cls}">${escapeHtml(displayStatus)}</span>${reasonText}</td>
-            <td class="mono">${escapeHtml(gpuInfo)}</td>
-            <td class="mono" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(cmd)}">${escapeHtml(cmd)}</td>
-            <td>
-              <div class="btn-row">
-                ${approveBtn}
-                <button class="secondary sm" onclick="viewRunLog('${id}', '${escapeHtml(name)}')">📜 로그 보기</button>
-                <button class="danger sm" onclick="stopRun('${id}')">중지</button>
-              </div>
-            </td>
-          </tr>
-        `;
-      })
-      .join("");
+    latestRawSpaceRuns = data.runs || [];
+    renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="6" class="hint" style="color:#f87171;">런 목록 조회 오류: ${escapeHtml(e.message)}</td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="7" class="hint" style="color:#f87171;">런 목록 조회 오류: ${escapeHtml(e.message)}</td></tr>`;
+    }
   }
 }
 
