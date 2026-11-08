@@ -24,6 +24,10 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const DEFAULT_STATE = {
   config: {
     baseUrl: "https://mlp.n9.sr-cloud.com",
@@ -2507,7 +2511,8 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
 /**
  * Feature 1: Zombie / Stuck Pending Worker Watchdog Sweep
  * Automatically terminates non-Running active workers (`Pending`/`Creating`/`Approved`)
- * stuck longer than `maxPendingTimeoutMin` minutes so the scheduler spawns a fresh worker.
+ * stuck longer than `maxPendingTimeoutMin` minutes (or stuck >= 5 minutes when newer runs are already Running)
+ * so the scheduler can immediately spawn a fresh worker on a healthy node.
  */
 async function runWatchdogSweep(allRuns = lastKnownRuns) {
   watchdogStats.lastSweepAt = new Date().toISOString();
@@ -2518,26 +2523,33 @@ async function runWatchdogSweep(allRuns = lastKnownRuns) {
   const now = Date.now();
   const runsList = Array.isArray(allRuns) ? allRuns : [];
 
-  const nonRunningActive = runsList.filter(
-    (r) =>
-      classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
-      !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  const activeRuns = runsList.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
+  const runningRuns = activeRuns.filter((r) =>
+    String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const highestRunningId = runningRuns.reduce((maxId, r) => Math.max(maxId, Number(r.id ?? r.runId ?? 0)), 0);
+
+  const nonRunningActive = activeRuns.filter(
+    (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
 
   const terminatedIds = [];
   for (const r of nonRunningActive) {
-    // Only auto-terminate if `startTime` is set (node assigned & container stuck in Creating/Initializing)
-    // OR if `watchdogKillQueuePending` is explicitly enabled. Do NOT kill normal Pending runs waiting in cluster queue.
-    const timeBasis = r.startTime || (state.config.watchdogKillQueuePending ? r.registerTime || r.createdAt : null);
+    // Use `startTime || registerTime || createdAt` so Pending runs without `startTime` (e.g. stuck WLM pods) are also caught!
+    const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
     const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
     if (!startMs || Number.isNaN(startMs)) continue;
     const stuckMs = now - startMs;
-    if (stuckMs >= maxPendingMs) {
+    const numId = Number(r.id ?? r.runId ?? 0);
+    // If newer runs (higher runId) have already entered RUNNING, a Pending run stuck >= 5 minutes is bypassed/zombie
+    const bypassedByNewerRunning = highestRunningId > numId && stuckMs >= 5 * 60 * 1000;
+    if (stuckMs >= maxPendingMs || bypassedByNewerRunning) {
       const rId = String(r.id ?? r.runId ?? "");
       const rName = r.containerName || r.name || `#${rId}`;
       const stuckMin = Math.round(stuckMs / 60000);
       try {
         await spaceApi.terminateRun(rId);
+        markRunRecentlyTerminated(rId);
         terminatedIds.push(rId);
         watchdogStats.zombieTerminatedCount += 1;
         watchdogStats.lastActionMessage = `먹통 Pending 워커 ${rName} (#${rId}, ${stuckMin}분 경과) 자동 종료`;
@@ -2789,18 +2801,33 @@ function computeServerLoadStatus(allRuns = lastKnownRuns) {
     (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
 
-  // Measure how long the oldest non-Running active worker has been waiting in Pending/Creating/Approved
+  // Separate genuinely in-flight newly created runs (`waitSec <= 90s`) from older Pending runs (`waitSec > 90s`).
+  // Older Pending runs are waiting in the K8s cluster queue or stuck (handled by Watchdog) and create ZERO SPACE API load,
+  // so they must NEVER cause head-of-line blocking that freezes auto-allocation when below target worker count!
+  const recentInFlightPendingRuns = [];
+  const stalePendingRuns = [];
   let oldestPendingWaitSec = 0;
   let oldestPendingWorkerName = null;
+  let oldestRecentPendingWaitSec = 0;
+  let oldestRecentPendingWorkerName = null;
+
   for (const r of nonRunningActiveRuns) {
     const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
     const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
-    if (startMs && !Number.isNaN(startMs)) {
-      const waitSec = Math.max(0, Math.floor((now - startMs) / 1000));
-      if (waitSec >= oldestPendingWaitSec) {
-        oldestPendingWaitSec = waitSec;
-        oldestPendingWorkerName = r.containerName || r.name || `#${r.id || r.runId}`;
+    const waitSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
+    const rName = r.containerName || r.name || `#${r.id || r.runId}`;
+    if (waitSec >= oldestPendingWaitSec) {
+      oldestPendingWaitSec = waitSec;
+      oldestPendingWorkerName = rName;
+    }
+    if (waitSec <= 90) {
+      recentInFlightPendingRuns.push(r);
+      if (waitSec >= oldestRecentPendingWaitSec) {
+        oldestRecentPendingWaitSec = waitSec;
+        oldestRecentPendingWorkerName = rName;
       }
+    } else {
+      stalePendingRuns.push(r);
     }
   }
 
@@ -2856,28 +2883,17 @@ function computeServerLoadStatus(allRuns = lastKnownRuns) {
     reasons.push(`SPACE API 응답 다소 느림 (최근 ${lastLat}ms · 평균 ${avgLat}ms) → 생성 간격 1.4x 완만 조절`);
   }
 
-  // In-flight Pending/Creating worker congestion check
-  if (nonRunningActiveRuns.length >= maxPendingWorkers) {
+  // In-flight Pending/Creating worker congestion check (ONLY for recently created workers <= 90s)
+  if (recentInFlightPendingRuns.length >= maxPendingWorkers) {
     if (loadLevel === "GREEN" || loadLevel === "YELLOW") {
       loadLevel = "YELLOW";
-      loadBadgeText = `🟡 준비중 워커 ${nonRunningActiveRuns.length}/${maxPendingWorkers}개 대기 · 순차 보호`;
+      loadBadgeText = `🟡 최근 생성 워커 ${recentInFlightPendingRuns.length}/${maxPendingWorkers}개 준비중 · 순차 보호`;
     }
     if (enabled) {
       holdCreation = true;
     }
     reasons.push(
-      `현재 Running 전환 대기 중인 워커 ${nonRunningActiveRuns.length}개 (상한 ${maxPendingWorkers}개) → 기존 워커가 Running 진입할 때까지 추가 생성 일시 대기`
-    );
-  } else if (stepByStepRunningCheck && nonRunningActiveRuns.length > 0 && oldestPendingWaitSec >= 45) {
-    if (loadLevel === "GREEN") {
-      loadLevel = "YELLOW";
-      loadBadgeText = `🟡 클러스터 할당 대기 (${oldestPendingWaitSec}초) · 대기 보호`;
-    }
-    if (enabled) {
-      holdCreation = true;
-    }
-    reasons.push(
-      `선행 워커(${oldestPendingWorkerName})가 ${oldestPendingWaitSec}초째 Pending/승인후 대기 중 → 클러스터 과부하/큐 적체 방지를 위해 Running 진입 시까지 대기`
+      `최근 90초 내 생성되어 준비 중인 워커 ${recentInFlightPendingRuns.length}개 (상한 ${maxPendingWorkers}개) → Running 진입 또는 90초 경과 시 이어서 자동 할당`
     );
   }
 
@@ -2891,7 +2907,7 @@ function computeServerLoadStatus(allRuns = lastKnownRuns) {
 
   if (reasons.length === 0) {
     reasons.push(
-      `SPACE API 응답 쾌적 (평균 ${avgLat || lastLat || 0}ms) · 준비 대기 워커 ${nonRunningActiveRuns.length}/${maxPendingWorkers}개 · Running 가동 ${runningRuns.length}개`
+      `SPACE API 응답 쾌적 (평균 ${avgLat || lastLat || 0}ms) · 최근 준비중 ${recentInFlightPendingRuns.length}/${maxPendingWorkers}개 (전체 Pending ${nonRunningActiveRuns.length}개) · Running 가동 ${runningRuns.length}개`
     );
   }
 
@@ -2904,11 +2920,15 @@ function computeServerLoadStatus(allRuns = lastKnownRuns) {
     extraDelaySec,
     maxPendingWorkers,
     stepByStepRunningCheck,
-    inFlightPendingCount: nonRunningActiveRuns.length,
+    inFlightPendingCount: recentInFlightPendingRuns.length,
+    totalPendingCount: nonRunningActiveRuns.length,
+    stalePendingCount: stalePendingRuns.length,
     runningWorkerCount: runningRuns.length,
     activeWorkerCount: activeRuns.length,
     oldestPendingWaitSec,
     oldestPendingWorkerName,
+    oldestRecentPendingWaitSec,
+    oldestRecentPendingWorkerName,
     api: {
       lastLatencyMs: lastLat,
       avgLatencyMs: avgLat,
@@ -3071,7 +3091,8 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
     if (job.enabled && state.config.schedulerEnabled && remainingToCreate > 0) {
       const lastTriggerMs = job.lastTriggeredAt ? new Date(job.lastTriggeredAt).getTime() : 0;
       const nextByCooldownMs = lastTriggerMs ? lastTriggerMs + effectiveCooldownSec * 1000 : now;
-      const nextBySchedMs = lastSchedulerTickTime ? lastSchedulerTickTime + effectiveTickSec * 1000 : now;
+      const loopCheckSec = Math.min(4, effectiveTickSec);
+      const nextBySchedMs = lastSchedulerTickTime ? lastSchedulerTickTime + loopCheckSec * 1000 : now;
       const backoffMs = loadStatus.api.backoffRemainingSec > 0 ? now + loadStatus.api.backoffRemainingSec * 1000 : now;
       const holdExtraMs = loadStatus.holdCreation ? Math.max(nextBySchedMs, now + 5000) : now;
       const nextSpawnMs = Math.max(now, nextByCooldownMs, nextBySchedMs, backoffMs, holdExtraMs);
@@ -3583,33 +3604,17 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
     }
 
-    // 🛡️ Smart Load-Safe Guard #2: In-Flight Pending / Creating Worker Congestion Protection
+    // 🛡️ Smart Load-Safe Guard #2: In-Flight Pending / Creating Worker Congestion Protection (ONLY for recent creations <= 90s)
     if (loadStatus.enabled && loadStatus.inFlightPendingCount >= loadStatus.maxPendingWorkers) {
       const deficit = Math.max(0, minConcurrent - activeRuns.length);
       const pendingNames = pendingJobRuns
         .slice(0, 3)
         .map((r) => `${r.containerName || r.name || `#${r.id || r.runId}`}(${r.status || r.state})`)
         .join(", ");
-      loadMonitorStats.throttleCount += 1;
+      loadMonitorStats.throttleCount = (loadMonitorStats.throttleCount || 0) + 1;
       loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
-      loadMonitorStats.lastThrottleReason = `동시 준비중 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 상한 도달`;
-      job.lastStatus = `🛡️ [서버 부하 보호 · 순차 할당] 현재 준비중 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 (${pendingNames || "승인/컨테이너 준비중"}) → Running 진입 확인 후 +${deficit}개 이어서 자동 할당`;
-      saveState();
-      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
-    }
-
-    // 🛡️ Smart Load-Safe Guard #3: Step-by-Step Running Check when an already-submitted worker is waiting in cluster queue >= 45s
-    if (
-      loadStatus.enabled &&
-      loadStatus.stepByStepRunningCheck &&
-      loadStatus.inFlightPendingCount > 0 &&
-      loadStatus.oldestPendingWaitSec >= 45
-    ) {
-      const deficit = Math.max(0, minConcurrent - activeRuns.length);
-      loadMonitorStats.throttleCount += 1;
-      loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
-      loadMonitorStats.lastThrottleReason = `선행 워커(${loadStatus.oldestPendingWorkerName}) ${loadStatus.oldestPendingWaitSec}초째 클러스터 대기 중`;
-      job.lastStatus = `🛡️ [클러스터 큐 적체 보호] 선행 워커(${loadStatus.oldestPendingWorkerName})가 ${loadStatus.oldestPendingWaitSec}초째 Running 대기 중 → 서버 무리 방지를 위해 Running 전환 즉시 +${deficit}개 자동 할당 재개`;
+      loadMonitorStats.lastThrottleReason = `최근 준비중 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 상한 도달`;
+      job.lastStatus = `🛡️ [서버 부하 보호 · 순차 할당] 최근 생성되어 준비 중인 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 (${pendingNames || "승인/컨테이너 준비중"}) → Running 진입 또는 90초 경과 시 +${deficit}개 이어서 자동 할당`;
       saveState();
       return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
     }
@@ -3831,7 +3836,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       remainingAfterThis,
     };
   } finally {
-    releaseWorkerSlot(slotReservationKey);
+    releaseWorkerSlot(job.id, slotReservationKey);
   }
 }
 
@@ -4024,16 +4029,26 @@ setInterval(async () => {
     return;
   }
   const configuredSchedSec = Math.max(1, Number(state.config.checkIntervalSec || 15));
-  const enabledJobIntervals = state.jobs
-    .filter((j) => j.enabled)
-    .map((j) => Math.max(1, Number(j.cooldownSec || configuredSchedSec)));
+  const enabledJobs = state.jobs.filter((j) => j.enabled);
+  const enabledJobIntervals = enabledJobs.map((j) => Math.max(1, Number(j.cooldownSec || configuredSchedSec)));
   let effectiveSchedSec =
     enabledJobIntervals.length > 0 ? Math.min(configuredSchedSec, ...enabledJobIntervals) : configuredSchedSec;
+
+  // When any enabled job is below its target worker count, check every <= 4s (using cached runs when fresh)
+  // so cooldown expiration is detected within 1~3s instead of slipping by a full 30s cycle!
+  const hasWorkerDeficit = enabledJobs.some((job) => {
+    const activeForJob = lastKnownRuns.filter(
+      (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+    ).length;
+    return activeForJob < Math.max(1, Number(job.minConcurrentRuns || 1));
+  });
+  const loopCheckSec = hasWorkerDeficit ? Math.min(4, effectiveSchedSec) : effectiveSchedSec;
+
   if (loadMonitorStats.backoffUntilMs > now) {
     effectiveSchedSec = Math.max(effectiveSchedSec, 10);
   }
   schedulerLoopStats.effectiveIntervalSec = effectiveSchedSec;
-  const schedIntervalMs = effectiveSchedSec * 1000;
+  const schedIntervalMs = loopCheckSec * 1000;
   if (lastSchedulerTickTime) {
     schedulerLoopStats.nextCheckAt = new Date(lastSchedulerTickTime + schedIntervalMs).toISOString();
   }
