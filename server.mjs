@@ -593,6 +593,11 @@ async function refreshAccessToken() {
   if (rt === lastDeadRefreshToken) {
     return false;
   }
+  const rtJwt = decodeJwtPayload(rt);
+  if (rtJwt?.exp && rtJwt.exp * 1000 < Date.now()) {
+    lastDeadRefreshToken = rt;
+    return false;
+  }
   if (refreshInFlightPromise) {
     return refreshInFlightPromise;
   }
@@ -1995,7 +2000,8 @@ function applyTimeScaleToJobs() {
   const ts = computeTimeScaleStatus();
   if (!ts.enabled) return ts;
   let changed = false;
-  for (const job of state.jobs) {
+  const targetJobs = state.jobs.filter((j) => j.enabled);
+  for (const job of targetJobs) {
     if (Number(job.minConcurrentRuns) !== ts.desiredTarget) {
       const prev = job.minConcurrentRuns;
       job.minConcurrentRuns = ts.desiredTarget;
@@ -2337,7 +2343,10 @@ async function scanWorkerLogsRoundRobin(allRuns = lastKnownRuns, options = {}) {
 
       // Feature 3: Goal Completion / Stage 1 ➔ Stage 2 Pipeline Chaining
       if (matchedCompleteKw && !existing?.matchedCompleteKw && state.config.autoStopOnComplete !== false) {
-        const activeJob = state.jobs[0];
+        const activeJob =
+          state.jobs.find((j) => j.enabled && doesRunMatchJob(run, j, state.jobs)) ||
+          state.jobs.find((j) => j.enabled) ||
+          state.jobs[0];
         if (activeJob && activeJob.enabled) {
           const nextCmd = String(activeJob.nextStageCommand || state.config.nextStageCommand || "").trim();
           if (nextCmd && !activeJob._stage2Transitioned && activeJob.executionCommand !== nextCmd) {
@@ -2856,6 +2865,52 @@ function computeServerLoadStatus(allRuns = lastKnownRuns) {
   };
 }
 
+function getJobContainerPrefix(job) {
+  return String(job?.name || "gpu-job")
+    .replace(/[^a-zA-Z0-9-]/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 28);
+}
+
+function doesRunMatchJob(run, job, allJobs = state.jobs) {
+  if (!run || !job) return false;
+  const rId = String(run.id || run.runId || "");
+  if (job.lastRunId && rId && rId === String(job.lastRunId)) return true;
+
+  const rName = String(run.containerName || run.name || "");
+  if (!rName) return false;
+
+  const prefix28 = getJobContainerPrefix(job);
+  const prefix32 = String(job.name || "gpu-job")
+    .replace(/[^a-zA-Z0-9-]/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+
+  const matchesPrefix = (p) => Boolean(p && (rName === p || rName.startsWith(p + "-")));
+  if (!matchesPrefix(prefix28) && !matchesPrefix(prefix32)) return false;
+
+  const matchedLen = matchesPrefix(prefix32) ? prefix32.length : prefix28.length;
+
+  // Prevent shorter rule prefix (e.g. `worker-spot`) from stealing runs belonging to a longer rule prefix (e.g. `worker-spot-2`)
+  if (Array.isArray(allJobs) && allJobs.length > 1) {
+    for (const other of allJobs) {
+      if (!other || other.id === job.id) continue;
+      if (other.lastRunId && rId && rId === String(other.lastRunId)) return false;
+      const otherP28 = getJobContainerPrefix(other);
+      const otherP32 = String(other.name || "gpu-job")
+        .replace(/[^a-zA-Z0-9-]/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 32);
+      const otherLen = matchesPrefix(otherP32) ? otherP32.length : matchesPrefix(otherP28) ? otherP28.length : 0;
+      if (otherLen > matchedLen) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 /**
  * Compute real-time Worker Fleet & Auto-Creation progress statistics for the UI
  */
@@ -2883,18 +2938,10 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
   let totalTargetGpus = 0;
   let totalRemainingGpus = 0;
   let globalNextSpawnInSec = null;
+  const anyJobEnabled = state.jobs.some((j) => j.enabled);
 
   const jobFleetList = state.jobs.map((job) => {
-    const prefix = String(job.name || "gpu-job")
-      .replace(/[^a-zA-Z0-9-]/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 32);
-
-    const matchingRuns = runsList.filter((r) => {
-      const rName = String(r.containerName || r.name || "");
-      const rId = String(r.id || r.runId || "");
-      return rName.startsWith(prefix) || (job.lastRunId && rId === String(job.lastRunId));
-    });
+    const matchingRuns = runsList.filter((r) => doesRunMatchJob(r, job, state.jobs));
 
     const activeRuns = matchingRuns
       .filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE")
@@ -2943,15 +2990,16 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       }
     }
 
+    const countInGlobalTarget = !anyJobEnabled || Boolean(job.enabled);
     totalRunningWorkers += runningCount;
     totalPendingWorkers += pendingCount;
     totalActiveWorkers += activeCount;
-    totalTargetWorkers += targetCount;
-    totalRemainingToCreate += remainingToCreate;
+    totalTargetWorkers += countInGlobalTarget ? targetCount : activeCount;
+    totalRemainingToCreate += countInGlobalTarget ? remainingToCreate : 0;
     totalRunningGpus += runningGpuCount;
     totalActiveGpus += activeGpuCount;
-    totalTargetGpus += targetGpuCount;
-    totalRemainingGpus += remainingGpuToCreate;
+    totalTargetGpus += countInGlobalTarget ? targetGpuCount : activeGpuCount;
+    totalRemainingGpus += countInGlobalTarget ? remainingGpuToCreate : 0;
 
     const activeWorkers = activeRuns.map((r, idx) => {
       const st = String(r.status || r.state || r.phase || "UNKNOWN");
@@ -3026,6 +3074,7 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       allowSpot: Boolean(job.allowSpot),
       coreId: job.coreId,
       coreCountPerWorker,
+      gpusPerWorker: coreCountPerWorker,
       executionCommand: job.executionCommand,
       nextStageCommand: job.nextStageCommand || state.config.nextStageCommand || "",
       stage2Transitioned: Boolean(job._stage2Transitioned),
@@ -3042,6 +3091,10 @@ function computeWorkerFleetStats(allRuns = lastKnownRuns) {
       activeGpuCount,
       targetGpuCount,
       remainingGpuToCreate,
+      runningGpus: runningGpuCount,
+      activeGpus: activeGpuCount,
+      targetGpus: targetGpuCount,
+      remainingGpus: remainingGpuToCreate,
       scaleUpIntervalSec,
       configuredCheckIntervalSec: configuredSchedSec,
       configuredCooldownSec: Number(job.cooldownSec || 15),
@@ -3186,16 +3239,9 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
   const now = Date.now();
   job.lastCheckAt = new Date(now).toISOString();
 
-  const prefix = String(job.name || "gpu-job")
-    .replace(/[^a-zA-Z0-9-]/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32);
+  const prefix = getJobContainerPrefix(job);
 
-  const matchingRuns = allRuns.filter((r) => {
-    const rName = String(r.containerName || r.name || "");
-    const rId = String(r.id || r.runId || "");
-    return rName.startsWith(prefix) || (job.lastRunId && rId === String(job.lastRunId));
-  });
+  const matchingRuns = allRuns.filter((r) => doesRunMatchJob(r, job, state.jobs));
 
   const activeRuns = matchingRuns.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
   const runningRuns = activeRuns.filter((r) =>
@@ -4493,7 +4539,11 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/presets" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!Array.isArray(state.presets)) state.presets = [];
-      const activeJob = state.jobs[0] || {};
+      const activeJob =
+        (body.jobId && state.jobs.find((j) => j.id === body.jobId)) ||
+        state.jobs.find((j) => j.enabled) ||
+        state.jobs[0] ||
+        {};
       const newPreset = {
         id: body.id || `preset-${Date.now()}`,
         name: String(body.name || "새 실험 프리셋").trim(),
@@ -4524,28 +4574,73 @@ const server = http.createServer(async (req, res) => {
       if (!preset) {
         return sendJson(res, 404, { error: "해당 프리셋을 찾을 수 없습니다." });
       }
-      const job = state.jobs[0];
-      if (job) {
-        job.executionCommand = preset.executionCommand || job.executionCommand;
-        job.minConcurrentRuns = Math.max(1, Number(preset.minConcurrentRuns || 1));
-        job.coreCount = Math.max(1, Number(preset.coreCount || 1));
-        job.allowSpot = Boolean(preset.allowSpot);
-        if (preset.expectedRunTime) job.expectedRunTime = preset.expectedRunTime;
-        if (preset.injectWorkerEnv !== undefined) {
-          job.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
-          state.config.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
-        }
-        if (preset.nextStageCommand !== undefined) {
-          job.nextStageCommand = preset.nextStageCommand;
-          state.config.nextStageCommand = preset.nextStageCommand;
-        }
-        job._stage2Transitioned = false;
-        job.enabled = true;
+      const refJob = state.jobs[0] || {};
+      let job = null;
+      if (body.createAsNew) {
+        const cleanRuleBase = String(preset.name || "preset-worker")
+          .replace(/[^a-zA-Z0-9-]/g, "-")
+          .replace(/-+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 18) || "preset-worker";
+        job = {
+          id: `job-${Date.now()}`,
+          name: `${cleanRuleBase}-${state.jobs.length + 1}`,
+          enabled: true,
+          mode: "ensure_running",
+          useSpecId: refJob.useSpecId || "",
+          groupPoolId: refJob.groupPoolId || "",
+          coreId: refJob.coreId || "",
+          coreCount: Math.max(1, Number(preset.coreCount || 1)),
+          quotaId: refJob.quotaId || "",
+          allowSpot: Boolean(preset.allowSpot),
+          autoApprove: true,
+          containerImage: refJob.containerImage || "",
+          experimentId: refJob.experimentId || "",
+          executionCommand: preset.executionCommand || "bash /group-volume/run.sh",
+          expectedRunTime: preset.expectedRunTime || "8h",
+          enableWebConsole: true,
+          minConcurrentRuns: Math.max(1, Number(preset.minConcurrentRuns || 1)),
+          restartOnSuccess: true,
+          restartOnFail: true,
+          cooldownSec: 15,
+          volumeClaim: refJob.volumeClaim || [],
+          injectWorkerEnv: Boolean(preset.injectWorkerEnv ?? state.config.injectWorkerEnv),
+          nextStageCommand: preset.nextStageCommand || "",
+          _stage2Transitioned: false,
+          lastCheckAt: null,
+          lastTriggeredAt: null,
+          lastRunId: null,
+          lastStatus: `프리셋 [${preset.name}]으로 신규 생성됨`,
+        };
+        state.jobs.push(job);
         saveState();
+      } else {
+        job =
+          (body.jobId && state.jobs.find((j) => j.id === body.jobId)) ||
+          state.jobs.find((j) => j.enabled) ||
+          state.jobs[0];
+        if (job) {
+          job.executionCommand = preset.executionCommand || job.executionCommand;
+          job.minConcurrentRuns = Math.max(1, Number(preset.minConcurrentRuns || 1));
+          job.coreCount = Math.max(1, Number(preset.coreCount || 1));
+          job.allowSpot = Boolean(preset.allowSpot);
+          if (preset.expectedRunTime) job.expectedRunTime = preset.expectedRunTime;
+          if (preset.injectWorkerEnv !== undefined) {
+            job.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
+            state.config.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
+          }
+          if (preset.nextStageCommand !== undefined) {
+            job.nextStageCommand = preset.nextStageCommand;
+            state.config.nextStageCommand = preset.nextStageCommand;
+          }
+          job._stage2Transitioned = false;
+          job.enabled = true;
+          saveState();
+        }
       }
       addLog(
         "info",
-        `⚡ [프리셋 원클릭 적용] '${preset.name}' 적용 완료 → 목표 워커 ${preset.minConcurrentRuns}개 (${preset.allowSpot ? "Spot" : "Standard"}) · 명령어: ${preset.executionCommand}`
+        `⚡ [프리셋 원클릭 적용] '${preset.name}' → 규칙 [${job?.name || "-"}] (${body.createAsNew ? "신규 규칙 추가" : "적용 완료"} · 목표 워커 ${preset.minConcurrentRuns}개 · ${preset.allowSpot ? "Spot" : "Standard"} · 명령어: ${preset.executionCommand})`
       );
       let triggerRes = null;
       if (body.triggerImmediately && job) {
@@ -4556,6 +4651,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         preset,
+        appliedJob: job,
         jobs: state.jobs,
         config: state.config,
         triggerRes,
@@ -4731,20 +4827,22 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/jobs" && req.method === "POST") {
       const body = await readJsonBody(req);
       const idx = state.jobs.findIndex((j) => j.id === body.id);
+      const existingJob = idx >= 0 ? state.jobs[idx] : null;
+      const fallbackJob = state.jobs[0] || {};
       const jobObj = {
         id: body.id || `job-${Date.now()}`,
         name: String(body.name || "group-vol-worker").trim(),
         enabled: Boolean(body.enabled),
         mode: body.mode || "ensure_running",
         useSpecId: String(body.useSpecId || "").trim(),
-        groupPoolId: String(body.groupPoolId || "").trim(),
-        coreId: String(body.coreId || "").trim(),
+        groupPoolId: String(body.groupPoolId || existingJob?.groupPoolId || fallbackJob.groupPoolId || "").trim(),
+        coreId: String(body.coreId || existingJob?.coreId || fallbackJob.coreId || "").trim(),
         coreCount: Math.max(1, Number(body.coreCount || 1)),
-        quotaId: String(body.quotaId || "").trim(),
+        quotaId: String(body.quotaId || existingJob?.quotaId || fallbackJob.quotaId || "").trim(),
         allowSpot: Boolean(body.allowSpot),
         autoApprove: body.autoApprove !== false,
-        containerImage: String(body.containerImage || "").trim(),
-        experimentId: String(body.experimentId || "").trim(),
+        containerImage: String(body.containerImage || existingJob?.containerImage || fallbackJob.containerImage || "").trim(),
+        experimentId: String(body.experimentId || existingJob?.experimentId || fallbackJob.experimentId || "").trim(),
         executionCommand: String(body.executionCommand || "bash /group-volume/run.sh").trim(),
         expectedRunTime: String(body.expectedRunTime || "8h").trim(),
         enableWebConsole: body.enableWebConsole !== false,
@@ -4752,11 +4850,16 @@ const server = http.createServer(async (req, res) => {
         restartOnSuccess: body.restartOnSuccess !== false,
         restartOnFail: body.restartOnFail !== false,
         cooldownSec: Math.max(1, Number(body.cooldownSec || 15)),
-        volumeClaim: Array.isArray(body.volumeClaim) ? body.volumeClaim : [],
-        lastCheckAt: idx >= 0 ? state.jobs[idx].lastCheckAt : null,
-        lastTriggeredAt: idx >= 0 ? state.jobs[idx].lastTriggeredAt : null,
-        lastRunId: idx >= 0 ? state.jobs[idx].lastRunId : null,
-        lastStatus: idx >= 0 ? state.jobs[idx].lastStatus : "대기 중",
+        volumeClaim: Array.isArray(body.volumeClaim) ? body.volumeClaim : existingJob?.volumeClaim || fallbackJob.volumeClaim || [],
+        injectWorkerEnv: body.injectWorkerEnv !== undefined ? Boolean(body.injectWorkerEnv) : existingJob?.injectWorkerEnv,
+        maxTotalSucceededRuns:
+          body.maxTotalSucceededRuns !== undefined ? Number(body.maxTotalSucceededRuns) : existingJob?.maxTotalSucceededRuns,
+        nextStageCommand: body.nextStageCommand !== undefined ? String(body.nextStageCommand) : existingJob?.nextStageCommand,
+        _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
+        lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
+        lastTriggeredAt: existingJob ? existingJob.lastTriggeredAt : null,
+        lastRunId: existingJob ? existingJob.lastRunId : null,
+        lastStatus: existingJob ? existingJob.lastStatus : "대기 중",
       };
       if (idx >= 0) {
         state.jobs[idx] = jobObj;
@@ -4784,7 +4887,10 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/jobs/target" && req.method === "POST") {
       const body = await readJsonBody(req);
-      const job = state.jobs.find((j) => j.id === body.jobId) || state.jobs[0];
+      const job =
+        (body.jobId && state.jobs.find((j) => j.id === body.jobId)) ||
+        state.jobs.find((j) => j.enabled) ||
+        state.jobs[0];
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
       if (body.minConcurrentRuns !== undefined) {
         job.minConcurrentRuns = Math.max(1, Number(body.minConcurrentRuns || 1));
@@ -4871,41 +4977,66 @@ const server = http.createServer(async (req, res) => {
     // 10. Immediate Manual Trigger of a Job Rule (supports `spawnCount` 1..64) or Scheduler Tick
     if (pathname === "/api/jobs/trigger" && req.method === "POST") {
       const body = await readJsonBody(req);
-      let job = state.jobs.find((j) => j.id === body.jobId) || state.jobs[0];
+      let job =
+        (body.jobId && state.jobs.find((j) => j.id === body.jobId)) ||
+        state.jobs.find((j) => j.enabled) ||
+        state.jobs[0];
       // If the UI passes `jobData` (current form values), apply and persist them BEFORE triggering so edited executionCommand / image / spot settings are never ignored!
       if (body.jobData && typeof body.jobData === "object") {
         const d = body.jobData;
         const targetId = body.jobId || d.id || job?.id || `job-${Date.now()}`;
         const idx = state.jobs.findIndex((j) => j.id === targetId);
+        const existingJob = idx >= 0 ? state.jobs[idx] : null;
+        const fallbackJob = existingJob || state.jobs[0] || {};
         const updatedJob = {
           id: targetId,
-          name: String(d.name || job?.name || "group-vol-worker").trim(),
-          enabled: d.enabled !== undefined ? Boolean(d.enabled) : Boolean(job?.enabled),
-          mode: d.mode || job?.mode || "ensure_running",
-          useSpecId: d.useSpecId !== undefined ? String(d.useSpecId || "").trim() : String(job?.useSpecId || ""),
-          groupPoolId: d.groupPoolId !== undefined ? String(d.groupPoolId || "").trim() : String(job?.groupPoolId || ""),
-          coreId: d.coreId !== undefined ? String(d.coreId || "").trim() : String(job?.coreId || ""),
-          coreCount: Math.max(1, Number(d.coreCount ?? job?.coreCount ?? 1)),
-          quotaId: d.quotaId !== undefined ? String(d.quotaId || "").trim() : String(job?.quotaId || ""),
-          allowSpot: d.allowSpot !== undefined ? Boolean(d.allowSpot) : Boolean(job?.allowSpot),
-          autoApprove: d.autoApprove !== undefined ? d.autoApprove !== false : job?.autoApprove !== false,
-          containerImage: d.containerImage !== undefined ? String(d.containerImage || "").trim() : String(job?.containerImage || ""),
-          experimentId: d.experimentId !== undefined ? String(d.experimentId || "").trim() : String(job?.experimentId || ""),
+          name: String(d.name || existingJob?.name || "group-vol-worker").trim(),
+          enabled: d.enabled !== undefined ? Boolean(d.enabled) : Boolean(existingJob?.enabled ?? true),
+          mode: d.mode || existingJob?.mode || "ensure_running",
+          useSpecId: d.useSpecId !== undefined ? String(d.useSpecId || "").trim() : String(existingJob?.useSpecId || ""),
+          groupPoolId:
+            d.groupPoolId !== undefined && String(d.groupPoolId).trim()
+              ? String(d.groupPoolId).trim()
+              : String(fallbackJob.groupPoolId || ""),
+          coreId:
+            d.coreId !== undefined && String(d.coreId).trim()
+              ? String(d.coreId).trim()
+              : String(fallbackJob.coreId || ""),
+          coreCount: Math.max(1, Number(d.coreCount ?? existingJob?.coreCount ?? 1)),
+          quotaId:
+            d.quotaId !== undefined && String(d.quotaId).trim()
+              ? String(d.quotaId).trim()
+              : String(fallbackJob.quotaId || ""),
+          allowSpot: d.allowSpot !== undefined ? Boolean(d.allowSpot) : Boolean(existingJob?.allowSpot),
+          autoApprove: d.autoApprove !== undefined ? d.autoApprove !== false : existingJob?.autoApprove !== false,
+          containerImage:
+            d.containerImage !== undefined && String(d.containerImage).trim()
+              ? String(d.containerImage).trim()
+              : String(fallbackJob.containerImage || ""),
+          experimentId:
+            d.experimentId !== undefined && String(d.experimentId).trim()
+              ? String(d.experimentId).trim()
+              : String(fallbackJob.experimentId || ""),
           executionCommand:
             d.executionCommand !== undefined && String(d.executionCommand).trim()
               ? String(d.executionCommand).trim()
-              : String(job?.executionCommand || "bash /group-volume/run.sh").trim(),
-          expectedRunTime: d.expectedRunTime !== undefined ? String(d.expectedRunTime || "8h").trim() : String(job?.expectedRunTime || "8h"),
-          enableWebConsole: d.enableWebConsole !== undefined ? d.enableWebConsole !== false : job?.enableWebConsole !== false,
-          minConcurrentRuns: Math.max(1, Number(d.minConcurrentRuns ?? job?.minConcurrentRuns ?? 1)),
-          restartOnSuccess: d.restartOnSuccess !== undefined ? d.restartOnSuccess !== false : job?.restartOnSuccess !== false,
-          restartOnFail: d.restartOnFail !== undefined ? d.restartOnFail !== false : job?.restartOnFail !== false,
-          cooldownSec: Math.max(1, Number(d.cooldownSec ?? job?.cooldownSec ?? 15)),
-          volumeClaim: Array.isArray(d.volumeClaim) ? d.volumeClaim : job?.volumeClaim || [],
-          lastCheckAt: job?.lastCheckAt || null,
-          lastTriggeredAt: job?.lastTriggeredAt || null,
-          lastRunId: job?.lastRunId || null,
-          lastStatus: job?.lastStatus || "대기 중",
+              : String(existingJob?.executionCommand || "bash /group-volume/run.sh").trim(),
+          expectedRunTime:
+            d.expectedRunTime !== undefined ? String(d.expectedRunTime || "8h").trim() : String(existingJob?.expectedRunTime || "8h"),
+          enableWebConsole: d.enableWebConsole !== undefined ? d.enableWebConsole !== false : existingJob?.enableWebConsole !== false,
+          minConcurrentRuns: Math.max(1, Number(d.minConcurrentRuns ?? existingJob?.minConcurrentRuns ?? 1)),
+          restartOnSuccess: d.restartOnSuccess !== undefined ? d.restartOnSuccess !== false : existingJob?.restartOnSuccess !== false,
+          restartOnFail: d.restartOnFail !== undefined ? d.restartOnFail !== false : existingJob?.restartOnFail !== false,
+          cooldownSec: Math.max(1, Number(d.cooldownSec ?? existingJob?.cooldownSec ?? 15)),
+          volumeClaim: Array.isArray(d.volumeClaim) ? d.volumeClaim : fallbackJob.volumeClaim || [],
+          injectWorkerEnv: existingJob?.injectWorkerEnv,
+          maxTotalSucceededRuns: existingJob?.maxTotalSucceededRuns,
+          nextStageCommand: existingJob?.nextStageCommand,
+          _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
+          lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
+          lastTriggeredAt: existingJob ? existingJob.lastTriggeredAt : null,
+          lastRunId: existingJob ? existingJob.lastRunId : null,
+          lastStatus: existingJob ? existingJob.lastStatus : "대기 중",
         };
         if (idx >= 0) {
           state.jobs[idx] = updatedJob;

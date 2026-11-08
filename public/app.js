@@ -224,6 +224,35 @@ async function loadServerState() {
   }
 }
 
+let focusedFleetJobId = "";
+
+function getFocusedJobFleet(fleet = latestWorkerFleet) {
+  const jobs = Array.isArray(fleet?.jobs) ? fleet.jobs : [];
+  if (jobs.length === 0) {
+    return (serverState?.jobs && serverState.jobs[0]) || {};
+  }
+  const formJobId = document.getElementById("jobId")?.value || "";
+  const preferredId = focusedFleetJobId || (!isNewJobMode ? formJobId : "");
+  if (preferredId) {
+    const matched = jobs.find((j) => String(j.jobId || j.id) === String(preferredId));
+    if (matched) return matched;
+  }
+  const firstEnabled = jobs.find((j) => j.enabled);
+  return firstEnabled || jobs[0];
+}
+
+function selectFleetJobTab(jobId) {
+  if (!jobId) return;
+  focusedFleetJobId = String(jobId);
+  const jobObj = (serverState?.jobs || []).find((j) => String(j.id) === String(jobId));
+  if (jobObj) {
+    loadJobToForm(jobObj, false, false);
+  } else {
+    if (latestWorkerFleet) renderWorkerFleetBoard(latestWorkerFleet);
+    renderTopAutoStatusBanner();
+  }
+}
+
 function renderTopAutoStatusBanner() {
   const banner = document.getElementById("topAutoStatusBanner");
   if (!banner) return;
@@ -231,7 +260,7 @@ function renderTopAutoStatusBanner() {
 
   const cfg = serverState?.config || {};
   const fleet = latestWorkerFleet || {};
-  const jf = (fleet.jobs && fleet.jobs[0]) || (serverState?.jobs && serverState.jobs[0]) || {};
+  const jf = getFocusedJobFleet(fleet);
   const schedStats = latestSchedulerStats || {};
   const appStats = latestApprovalStats || {};
   const timeline = latestAutoApprovalTimeline || [];
@@ -360,7 +389,7 @@ function renderTopAutoStatusBanner() {
       <div style="background:rgba(15,23,42,0.85); border:1.5px solid rgba(59,130,246,0.55); border-radius:10px; padding:14px 16px;">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
           <div style="font-weight:800; font-size:14.5px; color:#93c5fd;">
-            🤖 [1단계] 무클릭 워커 자동 신청(할당) 엔진
+            🤖 [1단계] 무클릭 워커 자동 신청(할당) 엔진 <span class="mono" style="font-size:12px; color:#fde68a;">[${escapeHtml(jf.jobName || jf.name || " 기본 규칙")}]</span>
           </div>
           <span class="badge ${isSchedOn ? "ok" : "err"}">${isSchedOn ? `🟢 자동 신청 ON (${allocIntervalSec}초 주기)` : "⚪ 자동 신청 OFF"}</span>
         </div>
@@ -571,19 +600,49 @@ function renderWorkerFleetBoard(fleet) {
     return;
   }
 
-  const jf = fleet.jobs[0];
+  const jf = getFocusedJobFleet(fleet);
   const activeCnt = jf.activeCount ?? 0;
   const runningCnt = jf.runningCount ?? 0;
   const pendingCnt = jf.pendingCount ?? 0;
   const targetCnt = jf.targetCount ?? 1;
   const remainingCnt = jf.remainingToCreate ?? Math.max(0, targetCnt - activeCnt);
-  const gpusPerWorker = jf.gpusPerWorker ?? 1;
-  const activeGpus = jf.activeGpus ?? activeCnt * gpusPerWorker;
-  const targetGpus = jf.targetGpus ?? targetCnt * gpusPerWorker;
-  const remainingGpus = jf.remainingGpus ?? remainingCnt * gpusPerWorker;
+  const gpusPerWorker = jf.coreCountPerWorker ?? jf.gpusPerWorker ?? 1;
+  const activeGpus = jf.activeGpuCount ?? jf.activeGpus ?? activeCnt * gpusPerWorker;
+  const targetGpus = jf.targetGpuCount ?? jf.targetGpus ?? targetCnt * gpusPerWorker;
+  const remainingGpus = jf.remainingGpuToCreate ?? jf.remainingGpus ?? remainingCnt * gpusPerWorker;
   const pct = targetCnt > 0 ? Math.min(100, Math.round((activeCnt / targetCnt) * 100)) : 100;
   const isAutoOn = Boolean(fleet.schedulerEnabled && jf.enabled);
   const intervalSec = jf.scaleUpIntervalSec || 15;
+
+  const multiRuleTabsHtml =
+    fleet.jobs.length > 1
+      ? `
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px; padding:8px 12px; border-radius:8px; background:rgba(15,23,42,0.82); border:1px solid rgba(59,130,246,0.4);">
+        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+          <span style="font-size:12px; font-weight:800; color:#93c5fd;">📋 규칙별 현황 선택:</span>
+          ${fleet.jobs
+            .map((item) => {
+              const isFocused = String(item.jobId) === String(jf.jobId);
+              return `
+                <button type="button" class="${isFocused ? "" : "secondary"} sm"
+                  onclick="selectFleetJobTab('${escapeHtml(item.jobId)}')"
+                  style="padding:4px 10px; font-size:12px; font-weight:700; ${
+                    isFocused
+                      ? "background:#2563eb; border:1px solid #60a5fa; color:#fff;"
+                      : "border-color:rgba(148,163,184,0.35);"
+                  }">
+                  ${item.enabled ? "🟢" : "⚪"} ${escapeHtml(item.jobName)} (${item.activeCount}/${item.targetCount})
+                </button>
+              `;
+            })
+            .join("")}
+        </div>
+        <div class="mono" style="font-size:11.5px; color:#a7f3d0;">
+          전체 활성 규칙 합계: <b>${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers} 워커</b> (총 GPU <b>${fleet.totalActiveGpus}장</b> 가동 중)
+        </div>
+      </div>
+    `
+      : "";
 
   // Build slot pills (up to 256 visual pills so UI stays clean and fast)
   const maxVisualSlots = Math.min(Math.max(targetCnt, activeCnt), 256);
@@ -775,6 +834,7 @@ function renderWorkerFleetBoard(fleet) {
   }
 
   panel.innerHTML = `
+    ${multiRuleTabsHtml}
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
       <div>
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
@@ -940,7 +1000,7 @@ function updateWorkerCountdownBadge() {
   }
 
   if (!latestWorkerFleet || !latestWorkerFleet.jobs || !latestWorkerFleet.jobs[0]) return;
-  const jf = latestWorkerFleet.jobs[0];
+  const jf = getFocusedJobFleet(latestWorkerFleet);
   const remainingCnt = jf.remainingToCreate ?? 0;
   const isAutoOn = Boolean(latestWorkerFleet.schedulerEnabled && jf.enabled);
   const schedStats = latestSchedulerStats || {};
@@ -1974,9 +2034,15 @@ function populateCoresForPool(poolId) {
     const defaultCoreId = preferredGpuCore.id ?? preferredGpuCore.coreId;
     const coreInput = document.getElementById("jobCoreId");
     const matchesCurrent = cores.some((c) => String(c.id ?? c.coreId) === String(coreInput.value));
-    if (!coreInput.value || !matchesCurrent) {
+    if (!coreInput.value) {
       onSelectCoreIdChange(defaultCoreId);
     } else {
+      if (!matchesCurrent) {
+        const customOpt = document.createElement("option");
+        customOpt.value = coreInput.value;
+        customOpt.textContent = `${isSpot ? "[Spot] " : "[Standard] "}Core ID: ${coreInput.value}`;
+        cSel.appendChild(customOpt);
+      }
       cSel.value = coreInput.value;
     }
   }
@@ -2099,6 +2165,13 @@ function updateJobFormModeBanner(isNew, jobName = "") {
   }
 }
 
+function selectAndEditJobRule(jobId, scrollToForm = true) {
+  const jobObj = (serverState?.jobs || []).find((j) => String(j.id) === String(jobId));
+  if (jobObj) {
+    loadJobToForm(jobObj, scrollToForm, false);
+  }
+}
+
 function renderJobsTable(jobs, fleet = latestWorkerFleet) {
   const tbody = document.getElementById("jobsTableBody");
   if (!jobs.length) {
@@ -2128,28 +2201,28 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
           </div>`
         : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
       const badge = j.enabled
-        ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${j.id}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
-        : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${j.id}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
+        ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
+        : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
       const runTypeBadge = j.allowSpot
         ? `<span class="badge warn" style="margin-right:4px;">🟧 Spot</span>`
         : `<span class="badge ok" style="margin-right:4px; background:rgba(59,130,246,0.2); color:#93c5fd;">🟦 Std</span>`;
       return `
         <tr style="${isSelected ? "background:rgba(59,130,246,0.14); outline:1px solid rgba(59,130,246,0.45);" : ""}">
           <td>${badge}</td>
-          <td class="mono">
+          <td class="mono" style="cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)" title="클릭하면 이 규칙을 선택합니다">
             <b>${escapeHtml(j.name)}</b>
-            ${isSelected ? `<div style="font-size:10px; color:#60a5fa; font-weight:700;">✏️ 아래 폼에서 편집 중</div>` : ""}
+            ${isSelected ? `<div style="font-size:10px; color:#60a5fa; font-weight:700;">✏️ 현재 선택/편집 중</div>` : ""}
           </td>
           <td>${fleetBadges}</td>
-          <td class="mono" style="font-size:11.5px;">${runTypeBadge}Core:${j.coreId || "자동"} × ${j.coreCount || 1}GPU</td>
-          <td class="mono" style="color:#93c5fd; font-size:12px;">${escapeHtml(j.executionCommand)}</td>
+          <td class="mono" style="font-size:11.5px;">${runTypeBadge}Core:${escapeHtml(String(j.coreId || "자동"))} × ${j.coreCount || 1}GPU</td>
+          <td class="mono" style="color:#93c5fd; font-size:12px; cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)">${escapeHtml(j.executionCommand)}</td>
           <td style="font-size:11.5px;">${escapeHtml(j.lastStatus || "대기 중")}</td>
           <td>
             <div class="btn-row" style="gap:4px;">
-              <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${j.id}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">▶ +1 실행</button>
-              <button class="secondary sm" style="padding:4px 8px;" onclick='loadJobToForm(${JSON.stringify(j).replace(/'/g, "&#39;")}, true)'>✏️ 수정</button>
-              <button class="secondary sm" style="padding:4px 8px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;" onclick="duplicateJobRule('${j.id}')" title="이 규칙을 복제하여 새 규칙으로 바로 추가합니다">📋 복제추가</button>
-              <button class="danger sm" style="padding:4px 8px;" onclick="deleteJob('${j.id}')">삭제</button>
+              <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeHtml(j.id)}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">▶ +1 실행</button>
+              <button class="secondary sm" style="padding:4px 8px;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', true)">✏️ 수정</button>
+              <button class="secondary sm" style="padding:4px 8px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;" onclick="duplicateJobRule('${escapeHtml(j.id)}')" title="이 규칙을 복제하여 새 규칙으로 바로 추가합니다">📋 복제추가</button>
+              <button class="danger sm" style="padding:4px 8px;" onclick="deleteJob('${escapeHtml(j.id)}')">삭제</button>
             </div>
           </td>
         </tr>
@@ -2159,12 +2232,16 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
 
   if (!window.__initialJobLoaded && jobs[0]) {
     window.__initialJobLoaded = true;
-    loadJobToForm(jobs[0], false);
+    const initialJob = jobs.find((j) => j.enabled) || jobs[0];
+    loadJobToForm(initialJob, false, false);
   }
 }
 
 async function toggleJobEnabled(jobId, enabled) {
   try {
+    if (enabled) {
+      focusedFleetJobId = String(jobId);
+    }
     await api("/api/jobs/toggle", {
       method: "POST",
       body: JSON.stringify({ jobId, enabled }),
@@ -2185,6 +2262,10 @@ async function toggleJobEnabled(jobId, enabled) {
 }
 
 function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
+  if (!j) return;
+  if (!asNewMode && j.id) {
+    focusedFleetJobId = String(j.id);
+  }
   document.getElementById("jobId").value = j.id;
   document.getElementById("jobName").value = j.name || "group-vol-worker";
   document.getElementById("jobMode").value = j.mode || "ensure_running";
@@ -2216,6 +2297,10 @@ function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   updateJobFormModeBanner(asNewMode, j.name);
   if (serverState?.jobs) {
     renderJobsTable(serverState.jobs, latestWorkerFleet);
+  }
+  if (!asNewMode && latestWorkerFleet) {
+    renderWorkerFleetBoard(latestWorkerFleet);
+    renderTopAutoStatusBanner();
   }
   if (scrollToForm) {
     const formBox = document.getElementById("jobRuleFormBox");
@@ -2309,6 +2394,7 @@ async function saveAsNewJobRule() {
       document.getElementById("jobName").value = payload.name;
     }
     document.getElementById("jobId").value = payload.id;
+    focusedFleetJobId = payload.id;
     await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
     updateJobFormModeBanner(false, payload.name);
     showToast(`➕ 신규 규칙 [${payload.name}]이(가) 규칙 목록에 추가되었습니다!`);
@@ -2329,6 +2415,7 @@ async function duplicateJobRule(jobId) {
       name: `${target.name}-${existingJobs.length + 1}`,
       lastStatus: "신규 복제됨 (대기 중)",
     };
+    focusedFleetJobId = cloned.id;
     await api("/api/jobs", { method: "POST", body: JSON.stringify(cloned) });
     await loadServerState();
     loadJobToForm(cloned, true, false);
@@ -2341,6 +2428,7 @@ async function duplicateJobRule(jobId) {
 async function saveJobRule() {
   try {
     const payload = collectJobFormPayload();
+    focusedFleetJobId = payload.id;
     await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
     updateJobFormModeBanner(false, payload.name);
     showToast(`✅ [${payload.name}] 규칙이 저장되었습니다! (cmd: ${payload.executionCommand})`);
@@ -2353,6 +2441,7 @@ async function saveJobRule() {
 async function deleteJob(id) {
   if (!confirm("이 자동 실행 규칙을 삭제하시겠습니까?")) return;
   await api(`/api/jobs/${id}`, { method: "DELETE" });
+  if (focusedFleetJobId === id) focusedFleetJobId = "";
   await loadServerState();
   if (serverState?.jobs?.[0]) {
     loadJobToForm(serverState.jobs[0], false, false);
@@ -2365,6 +2454,10 @@ async function triggerJobNow(jobId) {
     const targetJobId = jobId || formPayload.id;
     // Always sync the form's latest executionCommand/image/runType if this job is currently open in the form!
     const includeFormData = !jobId || formPayload.id === jobId;
+    if (includeFormData) {
+      focusedFleetJobId = targetJobId;
+      updateJobFormModeBanner(false, formPayload.name);
+    }
     showToast(
       `🚀 [${includeFormData ? formPayload.executionCommand : targetJobId}] 명령어로 GPU 할당 요청 및 Admin 승인 중...`
     );
@@ -2841,12 +2934,15 @@ function renderPresetsBar(presets = []) {
       (p) => `
       <div style="display:inline-flex; align-items:center; gap:4px; background:rgba(15,23,42,0.82); border:1px solid rgba(245,158,11,0.45); border-radius:6px; padding:4px 8px;">
         <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11.5px; border:none; background:transparent; color:#fde68a; font-weight:700;"
-          onclick="applyJobPreset('${escapeHtml(p.id)}', false)"
-          title="클릭 시 [${escapeHtml(p.name)}] 설정 적용 (명령어: ${escapeHtml(p.executionCommand || "")} · 목표 ${p.minConcurrentRuns}워커)">
+          onclick="applyJobPreset('${escapeHtml(p.id)}', false, false)"
+          title="클릭 시 현재 선택된 규칙에 [${escapeHtml(p.name)}] 설정 적용 (명령어: ${escapeHtml(p.executionCommand || "")} · 목표 ${p.minConcurrentRuns}워커)">
           ${escapeHtml(p.name)} <span class="mono" style="font-size:10.5px; color:#93c5fd;">[${escapeHtml(p.badge || `${p.minConcurrentRuns}W`)}]</span>
         </button>
+        <button type="button" class="secondary sm" style="padding:2px 6px; font-size:10.5px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;"
+          onclick="applyJobPreset('${escapeHtml(p.id)}', false, true)"
+          title="이 프리셋으로 새 규칙을 목록에 바로 추가합니다">➕새규칙</button>
         <button type="button" class="success sm" style="padding:2px 6px; font-size:10.5px;"
-          onclick="applyJobPreset('${escapeHtml(p.id)}', true)"
+          onclick="applyJobPreset('${escapeHtml(p.id)}', true, false)"
           title="프리셋 적용과 동시에 즉시 할당 트리거">🚀적용+실행</button>
         <button type="button" class="secondary sm" style="padding:1px 5px; font-size:10px; color:#94a3b8;"
           onclick="deleteJobPreset('${escapeHtml(p.id)}')"
@@ -2866,21 +2962,30 @@ function renderPresetsBar(presets = []) {
   `;
 }
 
-async function applyJobPreset(presetId, triggerImmediately = false) {
+async function applyJobPreset(presetId, triggerImmediately = false, createAsNew = false) {
   try {
+    const currentJobId = document.getElementById("jobId")?.value || "";
+    const shouldCreateNew = Boolean(createAsNew || isNewJobMode);
     const res = await api("/api/presets/apply", {
       method: "POST",
-      body: JSON.stringify({ presetId, triggerImmediately }),
+      body: JSON.stringify({
+        presetId,
+        jobId: currentJobId,
+        createAsNew: shouldCreateNew,
+        triggerImmediately,
+      }),
     });
-    if (res.jobs && res.jobs[0]) {
-      populateJobForm(res.jobs[0]);
+    const targetJob = res.appliedJob || (res.jobs && res.jobs[0]);
+    if (targetJob) {
+      focusedFleetJobId = targetJob.id;
+      loadJobToForm(targetJob, false, false);
     }
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
       renderWorkerFleetBoard(latestWorkerFleet);
     }
     showToast(
-      `⚡ 프리셋 [${res.preset?.name || presetId}] 적용 완료! (목표 ${res.preset?.minConcurrentRuns}워커 · ${
+      `⚡ 프리셋 [${res.preset?.name || presetId}] ${shouldCreateNew ? "신규 규칙으로 추가" : `[${targetJob?.name || "현재 규칙"}]에 적용`} 완료! (목표 ${res.preset?.minConcurrentRuns}워커 · ${
         res.preset?.allowSpot ? "Spot" : "Standard"
       })${triggerImmediately ? " + 즉시 실행 요청됨!" : ""}`
     );
