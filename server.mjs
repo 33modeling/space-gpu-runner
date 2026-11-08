@@ -1006,6 +1006,7 @@ let lastKnownRunsAt = null;
 let lastKnownRunsAtMs = 0;
 let runsInFlightPromise = null;
 const recentlyCreatedRunsMap = new Map(); // runId -> { runObj, expiresAtMs }
+const recentlyTerminatedRunsMap = new Map(); // runId -> expiresAtMs
 const inFlightJobReservations = new Map(); // jobId -> Map<resId, { slotIndex, expiresAtMs }>
 const lastKnownApprovalsMap = new Map();
 let approvalSummaryCache = null;
@@ -1016,24 +1017,54 @@ const recentlyApprovedIds = new Map(); // id/runId -> timestampMs
 let lastContainerSuffix = "";
 let sameSecondSeq = 0;
 
+function markRunRecentlyTerminated(runId) {
+  const idStr = String(runId ?? "").trim();
+  if (!idStr) return;
+  recentlyCreatedRunsMap.delete(idStr);
+  recentlyTerminatedRunsMap.set(idStr, Date.now() + 18_000);
+  if (Array.isArray(lastKnownRuns) && lastKnownRuns.length > 0) {
+    lastKnownRuns = lastKnownRuns.map((r) =>
+      String(r.id ?? r.runId ?? "") === idStr ? { ...r, status: "Stopped", state: "Stopped" } : r
+    );
+  }
+}
+
 function mergeWithRecentlyCreatedRuns(apiRuns = []) {
   const now = Date.now();
+  for (const [k, expMs] of recentlyTerminatedRunsMap.entries()) {
+    if (!expMs || expMs <= now) {
+      recentlyTerminatedRunsMap.delete(k);
+    }
+  }
   for (const [k, entry] of recentlyCreatedRunsMap.entries()) {
-    if (!entry || entry.expiresAtMs <= now) {
+    const exp = entry?.expiresAtMs || (entry?.createdAtMs ? entry.createdAtMs + 20_000 : 0);
+    if (!entry || exp <= now || recentlyTerminatedRunsMap.has(k)) {
       recentlyCreatedRunsMap.delete(k);
     }
   }
-  if (recentlyCreatedRunsMap.size === 0) return apiRuns;
-  const seenIds = new Set(apiRuns.map((r) => String(r.id ?? r.runId ?? "")));
+  const normalizedRuns =
+    recentlyTerminatedRunsMap.size > 0
+      ? apiRuns.map((r) => {
+          const rId = String(r.id ?? r.runId ?? "");
+          if (rId && recentlyTerminatedRunsMap.has(rId) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE") {
+            return { ...r, status: "Stopped", state: "Stopped" };
+          }
+          return r;
+        })
+      : apiRuns;
+
+  if (recentlyCreatedRunsMap.size === 0) return normalizedRuns;
+  const seenIds = new Set(normalizedRuns.map((r) => String(r.id ?? r.runId ?? "")));
   const prepended = [];
   for (const [k, entry] of recentlyCreatedRunsMap.entries()) {
+    const rObj = entry?.runObj || entry?.run;
     if (seenIds.has(k)) {
       recentlyCreatedRunsMap.delete(k);
-    } else if (entry?.runObj) {
-      prepended.push(entry.runObj);
+    } else if (rObj) {
+      prepended.push(rObj);
     }
   }
-  return prepended.length > 0 ? [...prepended, ...apiRuns] : apiRuns;
+  return prepended.length > 0 ? [...prepended, ...normalizedRuns] : normalizedRuns;
 }
 
 async function fetchCurrentRuns(forceFresh = false) {
@@ -4502,18 +4533,55 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { runId, log: logText });
     }
 
-    // 8. Stop/Terminate a WLM Run
+    // 8. Stop/Terminate a WLM Run (optionally decrementing rule target count when `reduceTarget: true` / "슬롯 삭제")
     if (pathname.startsWith("/api/space/runs/") && pathname.endsWith("/stop") && req.method === "POST") {
       const parts = pathname.split("/");
       const runId = parts[parts.length - 2];
+      const body = await readJsonBody(req).catch(() => ({}));
+      const reduceTarget = Boolean(body?.reduceTarget);
+      const targetRun = (lastKnownRuns || []).find((r) => String(r.id ?? r.runId ?? "") === String(runId)) || null;
+      const runName = targetRun?.containerName || targetRun?.name || `#${runId}`;
       const out = await spaceApi.terminateRun(runId);
-      recentlyCreatedRunsMap.delete(String(runId));
+      markRunRecentlyTerminated(runId);
+
+      let updatedJob = null;
+      if (reduceTarget) {
+        const matchedJob =
+          (body?.jobId && state.jobs.find((j) => String(j.id) === String(body.jobId))) ||
+          (targetRun && state.jobs.find((j) => doesRunMatchJob(targetRun, j, state.jobs))) ||
+          state.jobs.find((j) => j.enabled) ||
+          state.jobs[0];
+        if (matchedJob) {
+          const prevTarget = Math.max(1, Number(matchedJob.minConcurrentRuns || 1));
+          const nextTarget = Math.max(1, prevTarget - 1);
+          matchedJob.minConcurrentRuns = nextTarget;
+          if (prevTarget === 1) {
+            matchedJob.enabled = false;
+          }
+          updatedJob = matchedJob;
+          saveState();
+        }
+      }
+
       await fetchCurrentRuns(true).catch(() => {});
-      addLog("warn", `사용자가 Run #${runId} 강제 종료 요청`, { runId });
-      return sendJson(res, 200, { ok: true, data: out, workerFleet: computeWorkerFleetStats(lastKnownRuns) });
+      addLog(
+        "warn",
+        reduceTarget && updatedJob
+          ? `🗑️ [워커 슬롯 삭제] ${runName} (#${runId}) 강제 종료 + [${updatedJob.name}] 목표 워커 수 ${updatedJob.minConcurrentRuns}개로 자동 축소 (재생성 방지)`
+          : `🛑 [워커 즉시 Kill] ${runName} (#${runId}) 강제 종료 완료`,
+        { runId, runName, reduceTarget, newTarget: updatedJob?.minConcurrentRuns }
+      );
+      return sendJson(res, 200, {
+        ok: true,
+        data: out,
+        reduceTarget,
+        updatedJob,
+        jobs: state.jobs,
+        workerFleet: computeWorkerFleetStats(lastKnownRuns),
+      });
     }
 
-    // 8-A. Feature 2: Bulk Worker Control (`scan_logs`, `stop_pending`, `rolling_restart`, `stop_all`)
+    // 8-A. Feature 2: Bulk Worker Control (`stop_selected`, `delete_selected`, `trim_excess_pending`, `scan_logs`, `stop_pending`, `rolling_restart`, `stop_all`)
     if (pathname === "/api/space/runs/bulk-action" && req.method === "POST") {
       const body = await readJsonBody(req);
       const action = String(body.action || "").trim();
@@ -4527,6 +4595,104 @@ const server = http.createServer(async (req, res) => {
       const pendingRuns = activeRuns.filter(
         (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
       );
+
+      if (action === "stop_selected" || action === "delete_selected") {
+        const reduceTarget = Boolean(action === "delete_selected" || body.reduceTarget);
+        const requestedRunIds = new Set(
+          (Array.isArray(body.runIds) ? body.runIds : []).map((x) => String(x || "").trim()).filter(Boolean)
+        );
+        const requestedSlots = (Array.isArray(body.slotNumbers) ? body.slotNumbers : [])
+          .map((n) => Number(n))
+          .filter((n) => Number.isFinite(n) && n >= 1);
+
+        // Resolve `slotNumbers` (1-based sequential worker index on the focused job's fleet board) into `runIds`
+        if (requestedSlots.length > 0) {
+          const preFleet = computeWorkerFleetStats(runs);
+          const targetJf =
+            (body.jobId && preFleet.jobs.find((j) => String(j.jobId) === String(body.jobId))) ||
+            preFleet.jobs.find((j) => j.enabled && (j.activeCount || 0) > 0) ||
+            preFleet.jobs.find((j) => j.enabled) ||
+            preFleet.jobs[0];
+          if (targetJf && Array.isArray(targetJf.activeWorkers)) {
+            const slotSet = new Set(requestedSlots);
+            for (const w of targetJf.activeWorkers) {
+              if (slotSet.has(Number(w.slotIndex)) || slotSet.has(Number(w.stateOrderIndex))) {
+                requestedRunIds.add(String(w.id));
+              }
+            }
+          }
+        }
+
+        const targetIdsList = Array.from(requestedRunIds);
+        if (targetIdsList.length === 0) {
+          return sendJson(res, 400, { error: "선택된 워커 슬롯 또는 Run ID가 없습니다." });
+        }
+
+        const terminatedIds = [];
+        const terminatedNames = [];
+        const perJobTerminatedCount = new Map();
+
+        for (const rId of targetIdsList) {
+          const runObj = runs.find((r) => String(r.id ?? r.runId ?? "") === rId) || null;
+          try {
+            await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
+            terminatedIds.push(rId);
+            terminatedNames.push(runObj?.containerName || runObj?.name || `#${rId}`);
+            if (reduceTarget) {
+              const matchedJob =
+                (body.jobId && state.jobs.find((j) => String(j.id) === String(body.jobId))) ||
+                (runObj && state.jobs.find((j) => doesRunMatchJob(runObj, j, state.jobs)));
+              if (matchedJob) {
+                perJobTerminatedCount.set(matchedJob.id, (perJobTerminatedCount.get(matchedJob.id) || 0) + 1);
+              }
+            }
+            if (targetIdsList.length > 1) {
+              await sleep(150);
+            }
+          } catch {
+            // ignore individual failure
+          }
+        }
+
+        if (reduceTarget && perJobTerminatedCount.size > 0) {
+          for (const [jId, delCnt] of perJobTerminatedCount.entries()) {
+            const jobObj = state.jobs.find((j) => String(j.id) === String(jId));
+            if (!jobObj) continue;
+            // Compute new target so scheduler does not respawn the deleted workers
+            const remainingActiveForJob = activeRuns.filter(
+              (r) => !terminatedIds.includes(String(r.id ?? r.runId ?? "")) && doesRunMatchJob(r, jobObj, state.jobs)
+            ).length;
+            const prevTarget = Math.max(1, Number(jobObj.minConcurrentRuns || 1));
+            const nextTargetBySub = Math.max(1, prevTarget - delCnt);
+            jobObj.minConcurrentRuns = Math.min(nextTargetBySub, Math.max(1, remainingActiveForJob));
+            if (remainingActiveForJob === 0 && prevTarget <= delCnt) {
+              jobObj.enabled = false;
+            }
+          }
+          saveState();
+        }
+
+        const updatedRuns = await fetchCurrentRuns(true).catch(() => lastKnownRuns);
+        const fleet = computeWorkerFleetStats(updatedRuns);
+        addLog(
+          "warn",
+          reduceTarget
+            ? `🗑️ [선택 워커 슬롯 영구 삭제] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료하고 목표 워커 수를 자동 축소했습니다.`
+            : `🛑 [선택 워커 슬롯 즉시 Kill] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료했습니다.`,
+          { terminatedIds, terminatedNames, reduceTarget }
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          reduceTarget,
+          terminatedCount: terminatedIds.length,
+          terminatedIds,
+          terminatedNames,
+          jobs: state.jobs,
+          workerFleet: fleet,
+        });
+      }
 
       if (action === "scan_logs") {
         const scanRes = await scanWorkerLogsRoundRobin(runs, { scanAll: true });
@@ -4558,9 +4724,9 @@ const server = http.createServer(async (req, res) => {
             if (!rId) continue;
             try {
               await spaceApi.terminateRun(rId);
+              markRunRecentlyTerminated(rId);
               terminatedIds.push(rId);
               terminatedNames.push(r.containerName || r.name || `#${rId}`);
-              recentlyCreatedRunsMap.delete(rId);
               await sleep(200);
             } catch {
               // ignore
@@ -4591,6 +4757,7 @@ const server = http.createServer(async (req, res) => {
           if (!rId) continue;
           try {
             await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
             terminatedIds.push(rId);
             await sleep(250);
           } catch {
@@ -4621,6 +4788,7 @@ const server = http.createServer(async (req, res) => {
           if (!rId) continue;
           try {
             await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
             terminatedIds.push(rId);
             terminatedNames.push(r.containerName || r.name || `#${rId}`);
             await sleep(300);
@@ -4656,6 +4824,7 @@ const server = http.createServer(async (req, res) => {
           if (!rId) continue;
           try {
             await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
             terminatedIds.push(rId);
             await sleep(250);
           } catch {

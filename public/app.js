@@ -670,7 +670,14 @@ function renderTopAutoStatusBanner() {
 function renderWorkerFleetBoard(fleet) {
   const panel = document.getElementById("workerFleetPanel");
   if (!panel) return;
-  if (document.activeElement?.id === "quickTargetInput" || document.activeElement?.id === "quickIntervalInput") return;
+  const activeElId = document.activeElement?.id || "";
+  if (
+    activeElId === "quickTargetInput" ||
+    activeElId === "quickIntervalInput" ||
+    activeElId === "slotRangeKillInput"
+  ) {
+    return;
+  }
   if (!fleet || !Array.isArray(fleet.jobs) || fleet.jobs.length === 0) {
     panel.innerHTML = `
       <div style="font-size:13px; color:var(--muted);">
@@ -708,13 +715,19 @@ function renderWorkerFleetBoard(fleet) {
     const myUnmatchedBadges = myUnmatched
       .map(
         (u) =>
-          `<span class="mono" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')" style="cursor:pointer; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.5); color:#7dd3fc; padding:1px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="현재 규칙 이름과 다른 내 계정 워크로드 (클릭 시 로그 보기)">📌 규칙외 내 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>`
+          `<span class="mono" style="display:inline-flex; align-items:center; gap:4px; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.5); color:#7dd3fc; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="현재 규칙 이름과 다른 내 계정 워크로드">
+            <span style="cursor:pointer;" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')">📌 규칙외 내 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
+            <button type="button" class="danger sm" style="padding:1px 5px; font-size:10px;" onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}', '규칙외 #${escapeHtml(String(u.id))}', false, '')">🛑Kill</button>
+          </span>`
       )
       .join(" ");
     const otherUserBadges = otherUsers
       .map(
         (u) =>
-          `<span class="mono" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')" style="cursor:pointer; background:rgba(168,85,247,0.18); border:1px solid rgba(168,85,247,0.5); color:#d8b4fe; padding:1px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="그룹 내 다른 사용자 워크로드 (클릭 시 로그 보기)">👥 타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>`
+          `<span class="mono" style="display:inline-flex; align-items:center; gap:4px; background:rgba(168,85,247,0.18); border:1px solid rgba(168,85,247,0.5); color:#d8b4fe; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="그룹 내 다른 사용자 워크로드">
+            <span style="cursor:pointer;" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')">👥 타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
+            <button type="button" class="danger sm" style="padding:1px 5px; font-size:10px;" onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}', '타유저 #${escapeHtml(String(u.id))}', false, '')">🛑Kill</button>
+          </span>`
       )
       .join(" ");
 
@@ -742,7 +755,7 @@ function renderWorkerFleetBoard(fleet) {
         ${
           myUnmatched.length > 0 || otherUsers.length > 0
             ? `<div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px; color:#cbd5e1;">
-                <span style="color:#94a3b8;">💡 규칙 외 SPACE 가동 워크로드 안내:</span>
+                <span style="color:#94a3b8;">💡 규칙 외 SPACE 가동 워크로드 (즉시 Kill 가능):</span>
                 ${myUnmatchedBadges}
                 ${otherUserBadges}
               </div>`
@@ -795,9 +808,36 @@ function renderWorkerFleetBoard(fleet) {
   const pipe = fleet.pipeline || {};
   const tel = fleet.telemetry || {};
 
+  // Clean up any stale selected IDs that are no longer active anywhere
+  const allCurrentActiveIds = new Set();
+  for (const jItem of fleet.jobs || []) {
+    for (const aw of jItem.activeWorkers || []) {
+      if (aw.id !== undefined && aw.id !== null) allCurrentActiveIds.add(String(aw.id));
+    }
+  }
+  if (recon && Array.isArray(recon.unmatchedActiveRuns)) {
+    for (const u of recon.unmatchedActiveRuns) {
+      if (u.id !== undefined && u.id !== null) allCurrentActiveIds.add(String(u.id));
+    }
+  }
+  for (const r of latestRawSpaceRuns || []) {
+    if (classifyUiRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE") {
+      allCurrentActiveIds.add(String(r.id ?? r.runId));
+    }
+  }
+  if (allCurrentActiveIds.size > 0) {
+    for (const selId of Array.from(selectedWorkerRunIds)) {
+      if (!allCurrentActiveIds.has(String(selId))) {
+        selectedWorkerRunIds.delete(selId);
+      }
+    }
+  }
+
   for (let i = 0; i < maxVisualSlots; i++) {
     const w = activeWorkers[i];
     if (w) {
+      const wIdStr = String(w.id);
+      const isSelected = selectedWorkerRunIds.has(wIdStr);
       const stUpper = String(w.status || "").toUpperCase();
       const isRun = stUpper.includes("RUN");
       const isExcess = Boolean(w.isExcessPending);
@@ -805,7 +845,9 @@ function renderWorkerFleetBoard(fleet) {
       const prog = w.progress || null;
       const isStraggler = Boolean(prog?.isStraggler);
       const dot = hasErr ? "🚨" : isStraggler ? "🐢" : isRun ? "🟢" : isExcess ? "⚠️" : "⏳";
-      const bg = hasErr
+      const bg = isSelected
+        ? "rgba(56,189,248,0.28)"
+        : hasErr
         ? "rgba(239,68,68,0.22)"
         : isStraggler
         ? "rgba(249,115,22,0.22)"
@@ -814,7 +856,9 @@ function renderWorkerFleetBoard(fleet) {
         : isExcess
         ? "rgba(245,158,11,0.28)"
         : "rgba(245,158,11,0.18)";
-      const border = hasErr
+      const border = isSelected
+        ? "#38bdf8"
+        : hasErr
         ? "#f87171"
         : isStraggler
         ? "#fb923c"
@@ -850,20 +894,33 @@ function renderWorkerFleetBoard(fleet) {
           : "";
 
       slotPills.push(`
-        <span class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
-          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(String(w.id))}) · 상태: ${escapeHtml(w.status)} · ${pillHeaderLabel} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
-          style="cursor:pointer; display:inline-flex; flex-direction:column; gap:2px; padding:4px 8px; border-radius:6px; font-size:11px; background:${bg}; border:1px solid ${border}; color:${color}; font-weight:600;">
-          <span>${dot} ${pillHeaderLabel} <span style="opacity:0.9;">(#${escapeHtml(String(w.id))} · ${escapeHtml(w.name.slice(0, 14))})</span></span>
-          ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)} (${srcTag})</span>` : `<span style="font-size:10px; opacity:0.85;">상태: ${escapeHtml(w.status)} (${srcTag})</span>`}
+        <div class="mono" onclick="viewRunLog('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}')"
+          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(wIdStr)}) · 상태: ${escapeHtml(w.status)} · ${pillHeaderLabel} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
+          style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${bg}; border:${isSelected ? "2px" : "1px"} solid ${border}; ${isSelected ? "box-shadow:0 0 0 2px rgba(56,189,248,0.28);" : ""} color:${color}; font-weight:600;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
+            <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:4px; cursor:pointer; margin:0; font-weight:700; color:${color};">
+              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(wIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
+              <span>${dot} ${pillHeaderLabel} <span style="opacity:0.9;">(#${escapeHtml(wIdStr)})</span></span>
+            </label>
+            <div style="display:inline-flex; align-items:center; gap:3px;" onclick="event.stopPropagation();">
+              <button type="button" class="danger sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800;"
+                onclick="killSingleWorkerSlot('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}', '${escapeHtml(pillHeaderLabel)}', false, '${escapeHtml(jf.jobId)}')"
+                title="이 슬롯(#${escapeHtml(wIdStr)})을 즉시 강제 종료(Stop/Kill)합니다 (자동충원 유지)">🛑Kill</button>
+              <button type="button" class="secondary sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800; border-color:rgba(244,63,94,0.65); color:#fecdd3; background:rgba(159,18,57,0.45);"
+                onclick="killSingleWorkerSlot('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}', '${escapeHtml(pillHeaderLabel)}', true, '${escapeHtml(jf.jobId)}')"
+                title="이 슬롯(#${escapeHtml(wIdStr)})을 즉시 종료(Kill)하고 목표 워커 수를 -1 차감하여 다시 생성되지 않게 영구 삭제합니다">🗑️삭제</button>
+            </div>
+          </div>
+          ${reqTimeShort ? `<span style="font-size:10px; color:#fde68a;">⚡승인 ${escapeHtml(reqTimeShort)} → ✅${escapeHtml(doneTimeShort)} (${srcTag})</span>` : `<span style="font-size:10px; opacity:0.85;">상태: ${escapeHtml(w.status)} (${srcTag} · ${escapeHtml(w.name.slice(0, 14))})</span>`}
           ${progBadgeHtml}
           ${
             hasErr
               ? `<span style="font-size:10px; color:#fca5a5;">🚨 에러감지: ${escapeHtml(w.logErrorKeyword || "Error")}</span>`
               : logLineShort
-              ? `<span style="font-size:9.5px; color:#cbd5e1; max-width:190px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📝 ${escapeHtml(logLineShort)}</span>`
+              ? `<span style="font-size:9.5px; color:#cbd5e1; max-width:210px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📝 ${escapeHtml(logLineShort)}</span>`
               : ""
           }
-        </span>
+        </div>
       `);
     } else {
       const isNext = i === activeCnt && remainingCnt > 0 && isAutoOn;
@@ -872,29 +929,42 @@ function renderWorkerFleetBoard(fleet) {
       const color = isNext ? "#93c5fd" : "#94a3b8";
       const nextSlotNum = i + 1;
       slotPills.push(`
-        <span class="mono"
-          title="${isNext ? "다음 차례에 자동 생성될 워커 슬롯입니다" : "순차적으로 자동 생성 예정인 워커 슬롯입니다"}"
-          style="display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:6px; font-size:11.5px; background:${bg}; border:1px dashed ${border}; color:${color};">
-          ${isNext ? "⚡" : "🔄"} 워커 #${nextSlotNum} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span>
-        </span>
+        <div class="mono"
+          title="${isNext ? "다음 차례에 자동 생성될 워커 슬롯입니다 (우측 🗑️삭제 클릭 시 목표 워커 수 -1 차감)" : "순차적으로 자동 생성 예정인 워커 슬롯입니다 (우측 🗑️삭제 클릭 시 목표 워커 수 -1 차감)"}"
+          style="display:inline-flex; align-items:center; justify-content:space-between; gap:6px; padding:4px 8px; border-radius:6px; font-size:11.5px; background:${bg}; border:1px dashed ${border}; color:${color};">
+          <span>${isNext ? "⚡" : "🔄"} 워커 #${nextSlotNum} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span></span>
+          <button type="button" class="secondary sm" style="padding:1px 5px; font-size:9.5px; border-color:rgba(244,63,94,0.5); color:#fda4af;"
+            onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${Math.max(1, targetCnt - 1)})"
+            title="대기 슬롯 1개를 삭제하여 목표 워커 수를 ${Math.max(1, targetCnt - 1)}개로 줄입니다">🗑️-1</button>
+        </div>
       `);
     }
   }
 
-  // Also append unmatched active SPACE runs (e.g. `fss #352713` or other user runs) so all 64 SPACE active runs are visible
+  // Also append unmatched active SPACE runs (e.g. `fss #352713` or other user runs) so all SPACE active runs are visible and directly killable
   if (recon && Array.isArray(recon.unmatchedActiveRuns) && recon.unmatchedActiveRuns.length > 0) {
     for (const u of recon.unmatchedActiveRuns) {
+      const uIdStr = String(u.id);
+      const isSelected = selectedWorkerRunIds.has(uIdStr);
       const isMine = Boolean(u.isMine);
-      const pillBg = isMine ? "rgba(56,189,248,0.16)" : "rgba(168,85,247,0.16)";
-      const pillBorder = isMine ? "rgba(56,189,248,0.55)" : "rgba(168,85,247,0.55)";
+      const pillBg = isSelected ? "rgba(56,189,248,0.28)" : isMine ? "rgba(56,189,248,0.16)" : "rgba(168,85,247,0.16)";
+      const pillBorder = isSelected ? "#38bdf8" : isMine ? "rgba(56,189,248,0.55)" : "rgba(168,85,247,0.55)";
       const pillColor = isMine ? "#7dd3fc" : "#d8b4fe";
       slotPills.push(`
-        <span class="mono" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')"
-          title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}"
-          style="cursor:pointer; display:inline-flex; flex-direction:column; gap:2px; padding:4px 8px; border-radius:6px; font-size:11px; background:${pillBg}; border:1px solid ${pillBorder}; color:${pillColor}; font-weight:600;">
-          <span>${isMine ? "📌 규칙외(내 런)" : `👥 타유저(${escapeHtml(u.userName)})`} <b>${escapeHtml(u.name)}</b> (#${escapeHtml(String(u.id))})</span>
+        <div class="mono" onclick="viewRunLog('${escapeHtml(uIdStr)}', '${escapeHtml(u.name)}')"
+          title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(uIdStr)}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}"
+          style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${pillBg}; border:${isSelected ? "2px" : "1px"} solid ${pillBorder}; color:${pillColor}; font-weight:600;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
+            <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:4px; cursor:pointer; margin:0; color:${pillColor};">
+              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(uIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
+              <span>${isMine ? "📌 규칙외(내 런)" : `👥 타유저(${escapeHtml(u.userName)})`} <b>${escapeHtml(u.name)}</b> (#${escapeHtml(uIdStr)})</span>
+            </label>
+            <button type="button" class="danger sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800;"
+              onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeHtml(uIdStr)}', '${escapeHtml(u.name)}', '규칙외 #${escapeHtml(uIdStr)}', false, '')"
+              title="이 워크로드(#${escapeHtml(uIdStr)})를 즉시 강제 종료(Stop/Kill)합니다">🛑Kill</button>
+          </div>
           <span style="font-size:10px; opacity:0.9;">${u.isRunning ? "🟢 Running" : `⏳ ${escapeHtml(u.status)}`} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
-        </span>
+        </div>
       `);
     }
   }
@@ -1120,8 +1190,54 @@ function renderWorkerFleetBoard(fleet) {
       </div>
     </div>
 
+    <!-- 🎯 특정 워커 슬롯 직접 선택 & 즉시 Kill(Stop) / 슬롯 영구 삭제(Delete) 컨트롤 바 -->
+    <div style="margin-bottom:8px; padding:8px 11px; border-radius:8px; background:rgba(15,23,42,0.88); border:1.5px solid rgba(244,63,94,0.45); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px;">
+        <span style="font-weight:800; color:#fda4af;">🎯 특정 슬롯 직접 선택 &amp; 즉시 Kill:</span>
+        <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11px;" onclick="selectWorkerGroup('all', '${escapeHtml(jf.jobId)}')">☑️ 전체(${activeWorkers.length})</button>
+        <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11px; color:#6ee7b7;" onclick="selectWorkerGroup('running', '${escapeHtml(jf.jobId)}')">🟢 Running(${runningCnt})</button>
+        <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11px; color:#fde68a;" onclick="selectWorkerGroup('pending', '${escapeHtml(jf.jobId)}')">⏳ Pending(${pendingCnt})</button>
+        ${
+          excessPendingCnt > 0
+            ? `<button type="button" class="secondary sm" style="padding:2px 7px; font-size:11px; border-color:#fbbf24; color:#fde68a; font-weight:700;" onclick="selectWorkerGroup('excess', '${escapeHtml(jf.jobId)}')">⚠️ 초과Pending(+${excessPendingCnt})</button>`
+            : ""
+        }
+        <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11px; color:#fca5a5;" onclick="selectWorkerGroup('problem', '${escapeHtml(jf.jobId)}')">🚨 에러·느림</button>
+        <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11px; color:#94a3b8;" onclick="selectWorkerGroup('none', '${escapeHtml(jf.jobId)}')">✖ 선택해제</button>
+
+        <div style="display:inline-flex; align-items:center; gap:4px; margin-left:2px;">
+          <input type="text" id="slotRangeKillInput" class="mono"
+            placeholder="슬롯번호 (예: 1, 5, 58-62, #353028)"
+            value="${escapeHtml(slotSpecDraftText)}"
+            oninput="slotSpecDraftText = this.value"
+            onkeydown="if(event.key==='Enter'){ event.preventDefault(); applySlotSpecSelection('${escapeHtml(jf.jobId)}'); }"
+            style="width:195px; padding:3px 7px; font-size:11.5px; border-color:rgba(56,189,248,0.45);" />
+          <button type="button" class="secondary sm" style="padding:3px 7px; font-size:11px; border-color:rgba(56,189,248,0.5); color:#7dd3fc;"
+            onclick="applySlotSpecSelection('${escapeHtml(jf.jobId)}')"
+            title="입력한 슬롯 번호(예: 1, 5, 58-62) 또는 #RunID를 즉시 체크 선택합니다">번호선택</button>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+        <label style="display:inline-flex; align-items:center; gap:4px; font-size:11px; color:#fde68a; cursor:pointer; margin:0;" title="체크 시 각 슬롯의 [🛑Kill] / [🗑️삭제] 클릭 시 확인 팝업 없이 0.1초 만에 즉시 종료합니다">
+          <input type="checkbox" ${instantKillWithoutConfirm ? "checked" : ""} onchange="toggleInstantKillMode(this.checked)" style="width:13px; height:13px; margin:0; accent-color:#f43f5e;" />
+          ⚡ 확인창 없이 원클릭 즉시 Kill
+        </label>
+        <button type="button" class="danger sm" style="padding:4px 10px; font-size:11.5px; font-weight:800;"
+          onclick="executeSelectedWorkersKill(false, '${escapeHtml(jf.jobId)}')"
+          title="선택한 슬롯(또는 입력창의 슬롯번호)을 즉시 강제 종료(Stop/Kill)합니다. 목표 워커 수는 그대로 유지되어 자동충원 ON 시 새 워커가 보충됩니다.">
+          🛑 선택 슬롯(${selectedWorkerRunIds.size}개) 즉시 Stop/Kill <span style="font-size:10px; font-weight:600; opacity:0.9;">(자동충원 유지)</span>
+        </button>
+        <button type="button" class="secondary sm" style="padding:4px 10px; font-size:11.5px; font-weight:800; background:rgba(159,18,57,0.55); border-color:#f43f5e; color:#ffe4e6;"
+          onclick="executeSelectedWorkersKill(true, '${escapeHtml(jf.jobId)}')"
+          title="선택한 슬롯(또는 입력창의 슬롯번호)을 즉시 강제 종료(Kill)하고, 종료한 개수만큼 목표 워커 수도 함께 차감(-N)하여 다시 생성되지 않게 영구 삭제합니다.">
+          🗑️ 선택 슬롯(${selectedWorkerRunIds.size}개) 영구 Delete <span style="font-size:10px; font-weight:600; color:#fda4af;">(Kill + 목표수 -${selectedWorkerRunIds.size || "N"} 차감)</span>
+        </button>
+      </div>
+    </div>
+
     <!-- Slot Pills Grid -->
-    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:165px; overflow-y:auto; padding-top:4px;">
+    <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:210px; overflow-y:auto; padding-top:4px;">
       ${slotPills.join("")}
     </div>
 
@@ -3035,6 +3151,298 @@ async function approveAllPending() {
 
 let latestRawSpaceRuns = [];
 let currentSpaceRunsFilter = "active"; // "active" | "running" | "pending" | "mine" | "all"
+const selectedWorkerRunIds = new Set();
+let instantKillWithoutConfirm = true; // default true so 1-click Kill/Delete works immediately
+let slotSpecDraftText = "";
+
+function toggleInstantKillMode(checked) {
+  instantKillWithoutConfirm = Boolean(checked);
+  renderWorkerFleetBoard(latestWorkerFleet);
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+}
+
+function toggleSelectWorkerRun(runId, forceVal) {
+  const idStr = String(runId ?? "").trim();
+  if (!idStr) return;
+  if (typeof forceVal === "boolean") {
+    if (forceVal) selectedWorkerRunIds.add(idStr);
+    else selectedWorkerRunIds.delete(idStr);
+  } else {
+    if (selectedWorkerRunIds.has(idStr)) selectedWorkerRunIds.delete(idStr);
+    else selectedWorkerRunIds.add(idStr);
+  }
+  renderWorkerFleetBoard(latestWorkerFleet);
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+}
+
+function selectWorkerGroup(mode, jobId) {
+  const jf = getFocusedJobFleet(latestWorkerFleet);
+  const workers = jf?.activeWorkers || [];
+  if (mode === "none") {
+    selectedWorkerRunIds.clear();
+    showToast("✖ 모든 슬롯 선택이 해제되었습니다.");
+  } else if (mode === "all") {
+    selectedWorkerRunIds.clear();
+    for (const w of workers) {
+      if (w.id !== undefined && w.id !== null) selectedWorkerRunIds.add(String(w.id));
+    }
+    showToast(`☑️ 전체 가동 슬롯 ${selectedWorkerRunIds.size}개가 선택되었습니다.`);
+  } else if (mode === "running") {
+    selectedWorkerRunIds.clear();
+    for (const w of workers) {
+      if (String(w.status || "").toUpperCase().includes("RUN")) {
+        selectedWorkerRunIds.add(String(w.id));
+      }
+    }
+    showToast(`🟢 Running 슬롯 ${selectedWorkerRunIds.size}개가 선택되었습니다.`);
+  } else if (mode === "pending") {
+    selectedWorkerRunIds.clear();
+    for (const w of workers) {
+      if (!String(w.status || "").toUpperCase().includes("RUN")) {
+        selectedWorkerRunIds.add(String(w.id));
+      }
+    }
+    showToast(`⏳ Pending 대기 슬롯 ${selectedWorkerRunIds.size}개가 선택되었습니다.`);
+  } else if (mode === "excess") {
+    selectedWorkerRunIds.clear();
+    for (const w of workers) {
+      if (w.isExcessPending) {
+        selectedWorkerRunIds.add(String(w.id));
+      }
+    }
+    if (selectedWorkerRunIds.size === 0) {
+      for (const w of workers) {
+        if (!String(w.status || "").toUpperCase().includes("RUN")) {
+          selectedWorkerRunIds.add(String(w.id));
+        }
+      }
+    }
+    showToast(`⚠️ 초과 Pending 슬롯 ${selectedWorkerRunIds.size}개가 선택되었습니다.`);
+  } else if (mode === "problem") {
+    selectedWorkerRunIds.clear();
+    for (const w of workers) {
+      if (w.hasLogError || w.progress?.isStraggler) {
+        selectedWorkerRunIds.add(String(w.id));
+      }
+    }
+    showToast(
+      selectedWorkerRunIds.size > 0
+        ? `🚨 에러/느린 슬롯 ${selectedWorkerRunIds.size}개가 선택되었습니다.`
+        : "🟢 현재 에러나 속도 저하가 감지된 슬롯이 없습니다."
+    );
+  }
+  renderWorkerFleetBoard(latestWorkerFleet);
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+}
+
+function parseSlotSpecToRunIds(specStr, jf = getFocusedJobFleet(latestWorkerFleet)) {
+  const raw = String(specStr || "").trim();
+  const matchedRunIds = [];
+  const matchedLabels = [];
+  if (!raw) return { matchedRunIds, matchedLabels };
+
+  const workers = jf?.activeWorkers || [];
+  const slotNumSet = new Set();
+  const explicitRunIdSet = new Set();
+
+  const parts = raw
+    .split(/[,\s]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  for (const part of parts) {
+    if (part.startsWith("#")) {
+      const rid = part.slice(1).trim();
+      if (rid) explicitRunIdSet.add(rid);
+      continue;
+    }
+    const rangeMatch = part.match(/^(\d+)\s*[-~]\s*(\d+)$/);
+    if (rangeMatch) {
+      const a = Number(rangeMatch[1]);
+      const b = Number(rangeMatch[2]);
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      for (let k = lo; k <= hi && k - lo <= 512; k++) {
+        slotNumSet.add(k);
+      }
+      continue;
+    }
+    const num = Number(part);
+    if (Number.isFinite(num) && num > 0) {
+      if (num > 5000) {
+        explicitRunIdSet.add(String(num));
+      } else {
+        slotNumSet.add(num);
+      }
+    }
+  }
+
+  const seen = new Set();
+  workers.forEach((w, idx) => {
+    const seqNum = idx + 1;
+    const slotIdx = Number(w.slotIndex || seqNum);
+    const wId = String(w.id);
+    if (slotNumSet.has(seqNum) || slotNumSet.has(slotIdx) || explicitRunIdSet.has(wId)) {
+      if (!seen.has(wId)) {
+        seen.add(wId);
+        matchedRunIds.push(wId);
+        matchedLabels.push(`슬롯#${seqNum}(#${wId})`);
+      }
+    }
+  });
+
+  // Also check unmatched active runs or raw active runs for explicit #runId
+  for (const r of latestRawSpaceRuns || []) {
+    const rId = String(r.id ?? r.runId ?? "");
+    if (explicitRunIdSet.has(rId) && !seen.has(rId)) {
+      seen.add(rId);
+      matchedRunIds.push(rId);
+      matchedLabels.push(`Run #${rId}`);
+    }
+  }
+
+  return { matchedRunIds, matchedLabels };
+}
+
+function applySlotSpecSelection(jobId) {
+  const inputEl = document.getElementById("slotRangeKillInput");
+  const spec = inputEl ? inputEl.value : slotSpecDraftText;
+  slotSpecDraftText = spec || "";
+  const jf = getFocusedJobFleet(latestWorkerFleet);
+  const { matchedRunIds, matchedLabels } = parseSlotSpecToRunIds(spec, jf);
+  if (matchedRunIds.length === 0) {
+    showToast(`⚠️ 입력한 번호("${spec}")에 해당하는 활성 워커 슬롯을 찾지 못했습니다. (예: 1, 5, 58-62 또는 #353028)`);
+    return;
+  }
+  for (const idStr of matchedRunIds) {
+    selectedWorkerRunIds.add(String(idStr));
+  }
+  showToast(`🎯 ${matchedRunIds.length}개 슬롯 선택 추가됨: ${matchedLabels.slice(0, 6).join(", ")}${matchedLabels.length > 6 ? " 외" : ""}`);
+  if (inputEl) inputEl.blur();
+  renderWorkerFleetBoard(latestWorkerFleet);
+  renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet);
+}
+
+async function killSingleWorkerSlot(runId, runName = "", slotLabel = "", reduceTarget = false, jobId = "") {
+  const idStr = String(runId ?? "").trim();
+  if (!idStr) return;
+  const label = slotLabel || `Run #${idStr}`;
+
+  if (!instantKillWithoutConfirm) {
+    const msg = reduceTarget
+      ? `🗑️ [${label} (${runName || `#${idStr}`})] 슬롯을 영구 삭제(강제 종료 + 목표 워커 수 -1 차감)하시겠습니까?`
+      : `🛑 [${label} (${runName || `#${idStr}`})] 슬롯을 즉시 강제 중지(Kill)하시겠습니까?`;
+    if (!confirm(msg)) return;
+  }
+
+  try {
+    showToast(
+      reduceTarget
+        ? `🗑️ [${label}] 즉시 Kill + 목표 워커 수 -1 영구 차감 처리 중...`
+        : `🛑 [${label}] 즉시 강제 종료(Kill) 요청 중...`
+    );
+    const res = await api(`/api/space/runs/${encodeURIComponent(idStr)}/stop`, {
+      method: "POST",
+      body: JSON.stringify({
+        reduceTarget: Boolean(reduceTarget),
+        jobId: jobId || undefined,
+      }),
+    });
+    selectedWorkerRunIds.delete(idStr);
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+    if (res.targetAdjustment) {
+      const adj = res.targetAdjustment;
+      const minInput = document.getElementById("jobMinConcurrent");
+      if (minInput && String(document.getElementById("jobId")?.value) === String(adj.jobId)) {
+        minInput.value = adj.newTarget;
+      }
+      showToast(
+        `🗑️ [${label}] 강제 종료 + 규칙 [${adj.jobName}] 목표 워커 수 ${adj.previousTarget}개 → ${adj.newTarget}개로 영구 차감 완료!`
+      );
+    } else {
+      showToast(`🛑 [${label} (#${idStr})] 즉시 강제 종료(Kill) 완료!`);
+    }
+    await loadSpaceRuns();
+    await loadServerState();
+  } catch (e) {
+    alert(`슬롯 종료 실패 (#${idStr}): ` + e.message);
+  }
+}
+
+async function executeSelectedWorkersKill(reduceTarget = false, jobId = "") {
+  const jf = getFocusedJobFleet(latestWorkerFleet);
+  const inputEl = document.getElementById("slotRangeKillInput");
+  const specText = (inputEl ? inputEl.value : slotSpecDraftText).trim();
+
+  // If user typed slot numbers in input box, include them automatically
+  if (specText) {
+    const { matchedRunIds } = parseSlotSpecToRunIds(specText, jf);
+    for (const idStr of matchedRunIds) {
+      selectedWorkerRunIds.add(String(idStr));
+    }
+  }
+
+  const targetIds = Array.from(selectedWorkerRunIds);
+  if (targetIds.length === 0) {
+    showToast("⚠️ 먼저 아래 슬롯 박스의 체크박스를 클릭하거나 슬롯 번호(예: 1, 5, 58-62)를 입력해 주세요!");
+    return;
+  }
+
+  if (!instantKillWithoutConfirm) {
+    const msg = reduceTarget
+      ? `🗑️ 선택한 ${targetIds.length}개 워커 슬롯을 즉시 종료(Kill)하고 목표 워커 수도 -${targetIds.length}개 영구 차감하시겠습니까?\n(대상 Run ID: #${targetIds.slice(0, 10).join(", #")}${targetIds.length > 10 ? " 외" : ""})`
+      : `🛑 선택한 ${targetIds.length}개 워커 슬롯을 즉시 강제 종료(Stop/Kill)하시겠습니까? (목표 워커 수는 그대로 유지됩니다)\n(대상 Run ID: #${targetIds.slice(0, 10).join(", #")}${targetIds.length > 10 ? " 외" : ""})`;
+    if (!confirm(msg)) return;
+  }
+
+  try {
+    showToast(
+      reduceTarget
+        ? `🗑️ 선택 슬롯 ${targetIds.length}개 즉시 Kill + 목표 워커 수 -${targetIds.length} 영구 삭제 실행 중...`
+        : `🛑 선택 슬롯 ${targetIds.length}개 즉시 일괄 Kill(Stop) 실행 중...`
+    );
+    const res = await api("/api/space/runs/bulk-action", {
+      method: "POST",
+      body: JSON.stringify({
+        action: reduceTarget ? "delete_selected" : "stop_selected",
+        runIds: targetIds,
+        reduceTarget: Boolean(reduceTarget),
+        jobId: jobId || jf?.jobId || undefined,
+      }),
+    });
+
+    for (const tid of targetIds) {
+      selectedWorkerRunIds.delete(String(tid));
+    }
+    slotSpecDraftText = "";
+    if (inputEl) inputEl.value = "";
+
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+
+    if (res.targetAdjustment) {
+      const adj = res.targetAdjustment;
+      const minInput = document.getElementById("jobMinConcurrent");
+      if (minInput && String(document.getElementById("jobId")?.value) === String(adj.jobId)) {
+        minInput.value = adj.newTarget;
+      }
+      showToast(
+        `🗑️ 선택 슬롯 ${res.terminatedCount || targetIds.length}개 영구 삭제 완료! (규칙 [${adj.jobName}] 목표 워커 ${adj.previousTarget}개 → ${adj.newTarget}개로 차감)`
+      );
+    } else {
+      showToast(`🛑 선택 슬롯 ${res.terminatedCount || targetIds.length}개 즉시 강제 종료(Stop/Kill) 완료!`);
+    }
+    await loadSpaceRuns();
+    await loadServerState();
+  } catch (e) {
+    alert("선택 슬롯 일괄 종료 실패: " + e.message);
+  }
+}
 
 function setSpaceRunsFilter(filterMode) {
   currentSpaceRunsFilter = filterMode || "active";
@@ -3061,13 +3469,15 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
   const recon = fleet?.spaceReconciliation || {};
   const myUser = String(recon.currentUserName || serverState?.config?.userName || serverState?.config?.resolvedUserName || "").trim();
 
-  // Map runId -> matched rule name
+  // Map runId -> matched rule name & jobId
   const runToJobName = new Map();
+  const runToJobId = new Map();
   if (fleet && Array.isArray(fleet.jobs)) {
     for (const jf of fleet.jobs) {
       for (const w of jf.activeWorkers || []) {
         if (w.id !== undefined && w.id !== null) {
           runToJobName.set(String(w.id), jf.jobName || jf.name || "규칙");
+          runToJobId.set(String(w.id), jf.jobId || "");
         }
       }
     }
@@ -3108,8 +3518,16 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
         ${mkBtn("mine", `👤 내 계정 활성 (${myActiveRuns.length}개)`, "#93c5fd")}
         ${mkBtn("all", `📜 종료 포함 (${allRuns.length}개)`, "#cbd5e1")}
       </div>
-      <div class="mono" style="font-size:11.5px; color:#cbd5e1;">
-        🟢 가동: <b style="color:#34d399;">${runningRuns.length}개</b> &nbsp;|&nbsp; ⏳ 대기: <b style="color:#fde68a;">${pendingRuns.length}개</b> &nbsp;|&nbsp; 전체 활성: <b>${orderedActiveRuns.length}개</b> (잘림 없이 전체 표시)
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        ${
+          selectedWorkerRunIds.size > 0
+            ? `<button type="button" class="danger sm" style="padding:3px 9px; font-size:11px; font-weight:800;" onclick="executeSelectedWorkersKill(false, '')">🛑 선택(${selectedWorkerRunIds.size}개) 즉시 Kill</button>
+               <button type="button" class="secondary sm" style="padding:3px 9px; font-size:11px; font-weight:800; background:rgba(159,18,57,0.55); border-color:#f43f5e; color:#ffe4e6;" onclick="executeSelectedWorkersKill(true, '')">🗑️ 선택(${selectedWorkerRunIds.size}개) 영구 삭제(-${selectedWorkerRunIds.size})</button>`
+            : ""
+        }
+        <div class="mono" style="font-size:11.5px; color:#cbd5e1;">
+          🟢 가동: <b style="color:#34d399;">${runningRuns.length}개</b> &nbsp;|&nbsp; ⏳ 대기: <b style="color:#fde68a;">${pendingRuns.length}개</b> &nbsp;|&nbsp; 전체 활성: <b>${orderedActiveRuns.length}개</b>
+        </div>
       </div>
     `;
   }
@@ -3137,10 +3555,13 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
   tbody.innerHTML = displayList
     .map((r, idx) => {
       const id = r.id ?? r.runId;
+      const idStr = String(id ?? "");
+      const isSelected = selectedWorkerRunIds.has(idStr);
       const name = r.containerName ?? r.name ?? `run-${id}`;
       const userName = r.userId || r.userName || r.user || "-";
       const mine = isMyRun(r);
-      const matchedJob = runToJobName.get(String(id)) || null;
+      const matchedJob = runToJobName.get(idStr) || null;
+      const matchedJobId = runToJobId.get(idStr) || "";
       const st = String(r.status ?? r.state ?? r.phase ?? "UNKNOWN");
       const stUpper = st.toUpperCase();
       const isRun = stUpper.includes("RUNNING");
@@ -3148,10 +3569,11 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
       if (isRun) runSeq += 1;
       else if (isAct) pendSeq += 1;
 
+      const seqLabelText = isRun ? `워커 #${runSeq}` : isAct ? `Pending대기 #${pendSeq}` : `종료 #${idx + 1}`;
       const seqBadge = isRun
-        ? `<span class="mono" style="color:#34d399; font-weight:800;">🟢 #${runSeq}</span>`
+        ? `<label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0;"><input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(idStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" /><span class="mono" style="color:#34d399; font-weight:800;">🟢 #${runSeq}</span></label>`
         : isAct
-        ? `<span class="mono" style="color:#fde68a; font-weight:800;">⏳ 대기#${pendSeq}</span><div class="mono" style="font-size:10px; color:#94a3b8;">(활성#${idx + 1})</div>`
+        ? `<label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0;"><input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(idStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" /><span class="mono" style="color:#fde68a; font-weight:800;">⏳ 대기#${pendSeq}</span></label><div class="mono" style="font-size:10px; color:#94a3b8; padding-left:18px;">(활성#${idx + 1})</div>`
         : `<span class="mono" style="color:#94a3b8;">종료 #${idx + 1}</span>`;
 
       const isAlreadyApproved = String(r.approvalStatus || "").toLowerCase() === "approved";
@@ -3178,13 +3600,13 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
         : "";
       const approveBtn =
         stUpper.includes("PENDING") && !isAlreadyApproved
-          ? `<button class="success sm" onclick="approveSingleItem('', '${escapeHtml(String(id))}')">✅ Admin 승인</button>`
+          ? `<button class="success sm" onclick="approveSingleItem('', '${escapeHtml(idStr)}')">✅ Admin 승인</button>`
           : "";
       return `
-        <tr style="${!mine && isAct ? "background:rgba(168,85,247,0.08);" : ""}">
+        <tr style="${isSelected ? "background:rgba(56,189,248,0.16);" : !mine && isAct ? "background:rgba(168,85,247,0.08);" : ""}">
           <td>${seqBadge}</td>
           <td class="mono">
-            <b>#${escapeHtml(String(id))}</b>
+            <b>#${escapeHtml(idStr)}</b>
             <div style="font-size:10.5px; color:${mine ? "#93c5fd" : "#d8b4fe"};">${escapeHtml(userName)}${!mine ? " (타유저)" : ""}</div>
           </td>
           <td class="mono">
@@ -3192,12 +3614,17 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
           </td>
           <td><span class="${cls}">${escapeHtml(displayStatus)}</span>${reasonText}</td>
           <td class="mono">${escapeHtml(gpuInfo)}</td>
-          <td class="mono" style="max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(cmd)}">${escapeHtml(cmd)}</td>
+          <td class="mono" style="max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(cmd)}">${escapeHtml(cmd)}</td>
           <td>
             <div class="btn-row">
               ${approveBtn}
-              <button class="secondary sm" onclick="viewRunLog('${id}', '${escapeHtml(name)}')">📜 로그</button>
-              ${isAct ? `<button class="danger sm" onclick="stopRun('${id}')">중지</button>` : ""}
+              <button class="secondary sm" onclick="viewRunLog('${escapeHtml(idStr)}', '${escapeHtml(name)}')">📜 로그</button>
+              ${
+                isAct
+                  ? `<button class="danger sm" onclick="killSingleWorkerSlot('${escapeHtml(idStr)}', '${escapeHtml(name)}', '${escapeHtml(seqLabelText)}', false, '${escapeHtml(matchedJobId)}')" title="이 슬롯(#${escapeHtml(idStr)})만 즉시 강제 종료(Stop/Kill)합니다 (자동충원 유지)">🛑 Kill</button>
+                     <button class="secondary sm" style="background:rgba(159,18,57,0.5); border-color:#f43f5e; color:#ffe4e6;" onclick="killSingleWorkerSlot('${escapeHtml(idStr)}', '${escapeHtml(name)}', '${escapeHtml(seqLabelText)}', true, '${escapeHtml(matchedJobId)}')" title="이 슬롯(#${escapeHtml(idStr)})을 강제 종료(Kill)하고 목표 워커 수를 -1 차감하여 다시 생성되지 않게 영구 삭제합니다">🗑️ 삭제(-1)</button>`
+                  : ""
+              }
             </div>
           </td>
         </tr>
@@ -3246,16 +3673,8 @@ function refreshCurrentRunLog() {
   viewRunLog(currentLogRunId, "");
 }
 
-async function stopRun(runId) {
-  if (!confirm(`Run #${runId} 워크로드를 강제 중지하시겠습니까?`)) return;
-  try {
-    await api(`/api/space/runs/${runId}/stop`, { method: "POST", body: "{}" });
-    showToast(`🛑 Run #${runId} 중지 요청 완료`);
-    await loadSpaceRuns();
-    await loadServerState();
-  } catch (e) {
-    alert("중지 실패: " + e.message);
-  }
+async function stopRun(runId, reduceTarget = false, jobId = "") {
+  return killSingleWorkerSlot(runId, "", `Run #${runId}`, reduceTarget, jobId);
 }
 
 function renderHistoryTable(history) {
