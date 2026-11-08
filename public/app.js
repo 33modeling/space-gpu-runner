@@ -225,6 +225,69 @@ async function loadServerState() {
 }
 
 let focusedFleetJobId = "";
+let currentMainView = "monitor";
+
+function switchMainView(view = "monitor", targetSection = "") {
+  currentMainView = view === "setup" ? "setup" : "monitor";
+  const monEl = document.getElementById("viewMonitorSection");
+  const setEl = document.getElementById("viewSetupSection");
+  const btnMon = document.getElementById("tabBtnMonitor");
+  const btnSet = document.getElementById("tabBtnSetup");
+
+  if (monEl) monEl.style.display = currentMainView === "monitor" ? "block" : "none";
+  if (setEl) setEl.style.display = currentMainView === "setup" ? "block" : "none";
+
+  if (btnMon && btnSet) {
+    if (currentMainView === "monitor") {
+      btnMon.style.background = "linear-gradient(135deg, #2563eb, #1d4ed8)";
+      btnMon.style.borderColor = "#60a5fa";
+      btnMon.style.color = "#fff";
+      btnMon.style.boxShadow = "0 4px 14px rgba(37,99,235,0.4)";
+
+      btnSet.style.background = "rgba(30,41,59,0.85)";
+      btnSet.style.borderColor = "rgba(148,163,184,0.35)";
+      btnSet.style.color = "#cbd5e1";
+      btnSet.style.boxShadow = "none";
+    } else {
+      btnSet.style.background = "linear-gradient(135deg, #2563eb, #1d4ed8)";
+      btnSet.style.borderColor = "#60a5fa";
+      btnSet.style.color = "#fff";
+      btnSet.style.boxShadow = "0 4px 14px rgba(37,99,235,0.4)";
+
+      btnMon.style.background = "rgba(30,41,59,0.85)";
+      btnMon.style.borderColor = "rgba(148,163,184,0.35)";
+      btnMon.style.color = "#cbd5e1";
+      btnMon.style.boxShadow = "none";
+    }
+  }
+
+  if (currentMainView === "setup" && targetSection) {
+    setTimeout(() => {
+      if (targetSection === "auth") {
+        const el = document.getElementById("authConfigCard");
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+        const pasteBox = document.getElementById("quickPasteJson");
+        if (pasteBox) pasteBox.focus();
+      } else if (targetSection === "rules") {
+        const el = document.getElementById("rulesConfigCard");
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+      } else if (targetSection === "form") {
+        const el = document.getElementById("jobRuleFormBox");
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 50);
+  }
+}
+
+function openNewJobRuleInSetup() {
+  switchMainView("setup", "form");
+  startNewJobRule();
+}
+
+function editJobRuleInSetup(jobId) {
+  switchMainView("setup", "form");
+  selectAndEditJobRule(jobId, true);
+}
 
 function getFocusedJobFleet(fleet = latestWorkerFleet) {
   const jobs = Array.isArray(fleet?.jobs) ? fleet.jobs : [];
@@ -1256,6 +1319,8 @@ function renderConfig(cfg, loopStats = null) {
 
   const jwtBadge = document.getElementById("jwtBadge");
   const card1Banner = document.getElementById("card1TokenStatusBanner");
+  const monTokenBar = document.getElementById("monitorTokenAlertBar");
+  const monTokenText = document.getElementById("monitorTokenAlertText");
   if (cfg.jwtInfo) {
     const rem = cfg.jwtInfo.remainingSec;
     const mins = rem !== null ? Math.floor(rem / 60) : null;
@@ -1263,6 +1328,7 @@ function renderConfig(cfg, loopStats = null) {
     if (rem !== null && rem > 0) {
       jwtBadge.className = "badge ok";
       jwtBadge.textContent = `🟢 인증됨: ${userLabel} (${mins}분 남음)`;
+      if (monTokenBar) monTokenBar.style.display = "none";
       if (card1Banner) {
         card1Banner.style.background = "rgba(16, 185, 129, 0.14)";
         card1Banner.style.borderColor = "rgba(16, 185, 129, 0.45)";
@@ -1273,6 +1339,10 @@ function renderConfig(cfg, loopStats = null) {
       const expiredMins = mins !== null ? Math.abs(mins) : "?";
       jwtBadge.className = "badge err";
       jwtBadge.textContent = `🚨 토큰 만료됨 (${expiredMins}분 전 만료)`;
+      if (monTokenBar && monTokenText) {
+        monTokenBar.style.display = "flex";
+        monTokenText.innerHTML = `🚨 <b>저장된 SPACE 인증 토큰이 만료되었습니다 (${expiredMins}분 전 만료)</b> — 우측 버튼을 눌러 설정 화면에서 새 토큰을 붙여넣어 주세요.`;
+      }
       if (card1Banner) {
         card1Banner.style.background = "rgba(239, 68, 68, 0.16)";
         card1Banner.style.borderColor = "rgba(239, 68, 68, 0.55)";
@@ -1283,9 +1353,14 @@ function renderConfig(cfg, loopStats = null) {
   } else if (cfg.hasAccessToken) {
     jwtBadge.className = "badge ok";
     jwtBadge.textContent = "Access Token 설정됨";
+    if (monTokenBar) monTokenBar.style.display = "none";
   } else {
     jwtBadge.className = "badge warn";
     jwtBadge.textContent = "토큰 미설정";
+    if (monTokenBar && monTokenText) {
+      monTokenBar.style.display = "flex";
+      monTokenText.innerHTML = `⚠️ <b>SPACE 토큰이 아직 설정되지 않았습니다.</b> 우측 버튼을 눌러 설정 화면에서 토큰을 등록해 주세요.`;
+    }
     if (card1Banner) {
       card1Banner.style.background = "rgba(245, 158, 11, 0.14)";
       card1Banner.style.borderColor = "rgba(245, 158, 11, 0.45)";
@@ -2174,61 +2249,126 @@ function selectAndEditJobRule(jobId, scrollToForm = true) {
 
 function renderJobsTable(jobs, fleet = latestWorkerFleet) {
   const tbody = document.getElementById("jobsTableBody");
+  const monTbody = document.getElementById("monitorJobsTableBody");
+  const navMonBadge = document.getElementById("navMonitorBadge");
+  const navSetBadge = document.getElementById("navSetupBadge");
+
+  if (navMonBadge && fleet) {
+    navMonBadge.textContent = `가동 ${fleet.totalActiveWorkers ?? 0}/${fleet.totalTargetWorkers ?? 0}워커`;
+  }
+  if (navSetBadge) {
+    navSetBadge.textContent = `규칙 ${jobs.length}개`;
+  }
+
   if (!jobs.length) {
-    tbody.innerHTML = `<tr><td colspan="7" class="hint">등록된 자동 실행 규칙이 없습니다. 아래 폼에서 [➕ 신규 규칙으로 추가 등록]을 눌러 첫 규칙을 추가하세요.</td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="7" class="hint">등록된 자동 실행 규칙이 없습니다. 아래 폼에서 [➕ 신규 규칙으로 추가 등록]을 눌러 첫 규칙을 추가하세요.</td></tr>`;
+    }
+    if (monTbody) {
+      monTbody.innerHTML = `<tr><td colspan="7" class="hint">등록된 규칙이 없습니다. 우측 상단 [➕ 신규 규칙 추가 작성]을 눌러 규칙을 등록하세요.</td></tr>`;
+    }
     return;
   }
   const currentFormJobId = document.getElementById("jobId")?.value || "";
+  const focusedId = focusedFleetJobId || currentFormJobId;
   const jobFleetMap = new Map();
   if (fleet && Array.isArray(fleet.jobs)) {
     fleet.jobs.forEach((jf) => jobFleetMap.set(jf.jobId, jf));
   }
-  tbody.innerHTML = jobs
-    .map((j) => {
-      const isSelected = !isNewJobMode && String(j.id) === String(currentFormJobId);
-      const jf = jobFleetMap.get(j.id);
-      const activeCnt = jf ? jf.activeCount : "?";
-      const targetCnt = j.minConcurrentRuns || 1;
-      const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
-      const fleetBadges = jf
-        ? `<div style="margin-top:4px; display:flex; gap:5px; flex-wrap:wrap;">
-            <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">가동: ${activeCnt} / 목표: ${targetCnt}개</span>
-            ${
-              remCnt > 0
-                ? `<span class="badge warn">🔄 +${remCnt}개 대기</span>`
-                : `<span class="badge ok">✅ 충족</span>`
-            }
-          </div>`
-        : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
-      const badge = j.enabled
-        ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
-        : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
-      const runTypeBadge = j.allowSpot
-        ? `<span class="badge warn" style="margin-right:4px;">🟧 Spot</span>`
-        : `<span class="badge ok" style="margin-right:4px; background:rgba(59,130,246,0.2); color:#93c5fd;">🟦 Std</span>`;
-      return `
-        <tr style="${isSelected ? "background:rgba(59,130,246,0.14); outline:1px solid rgba(59,130,246,0.45);" : ""}">
-          <td>${badge}</td>
-          <td class="mono" style="cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)" title="클릭하면 이 규칙을 선택합니다">
-            <b>${escapeHtml(j.name)}</b>
-            ${isSelected ? `<div style="font-size:10px; color:#60a5fa; font-weight:700;">✏️ 현재 선택/편집 중</div>` : ""}
-          </td>
-          <td>${fleetBadges}</td>
-          <td class="mono" style="font-size:11.5px;">${runTypeBadge}Core:${escapeHtml(String(j.coreId || "자동"))} × ${j.coreCount || 1}GPU</td>
-          <td class="mono" style="color:#93c5fd; font-size:12px; cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)">${escapeHtml(j.executionCommand)}</td>
-          <td style="font-size:11.5px;">${escapeHtml(j.lastStatus || "대기 중")}</td>
-          <td>
-            <div class="btn-row" style="gap:4px;">
-              <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeHtml(j.id)}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">▶ +1 실행</button>
-              <button class="secondary sm" style="padding:4px 8px;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', true)">✏️ 수정</button>
-              <button class="secondary sm" style="padding:4px 8px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;" onclick="duplicateJobRule('${escapeHtml(j.id)}')" title="이 규칙을 복제하여 새 규칙으로 바로 추가합니다">📋 복제추가</button>
-              <button class="danger sm" style="padding:4px 8px;" onclick="deleteJob('${escapeHtml(j.id)}')">삭제</button>
-            </div>
-          </td>
-        </tr>
-      `;
-    })
-    .join("");
+  if (tbody) {
+    tbody.innerHTML = jobs
+      .map((j) => {
+        const isSelected = !isNewJobMode && String(j.id) === String(currentFormJobId);
+        const jf = jobFleetMap.get(j.id);
+        const activeCnt = jf ? jf.activeCount : "?";
+        const targetCnt = j.minConcurrentRuns || 1;
+        const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
+        const fleetBadges = jf
+          ? `<div style="margin-top:4px; display:flex; gap:5px; flex-wrap:wrap;">
+              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">가동: ${activeCnt} / 목표: ${targetCnt}개</span>
+              ${
+                remCnt > 0
+                  ? `<span class="badge warn">🔄 +${remCnt}개 대기</span>`
+                  : `<span class="badge ok">✅ 충족</span>`
+              }
+            </div>`
+          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
+        const badge = j.enabled
+          ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
+          : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
+        const runTypeBadge = j.allowSpot
+          ? `<span class="badge warn" style="margin-right:4px;">🟧 Spot</span>`
+          : `<span class="badge ok" style="margin-right:4px; background:rgba(59,130,246,0.2); color:#93c5fd;">🟦 Std</span>`;
+        return `
+          <tr style="${isSelected ? "background:rgba(59,130,246,0.14); outline:1px solid rgba(59,130,246,0.45);" : ""}">
+            <td>${badge}</td>
+            <td class="mono" style="cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)" title="클릭하면 이 규칙을 선택합니다">
+              <b>${escapeHtml(j.name)}</b>
+              ${isSelected ? `<div style="font-size:10px; color:#60a5fa; font-weight:700;">✏️ 현재 선택/편집 중</div>` : ""}
+            </td>
+            <td>${fleetBadges}</td>
+            <td class="mono" style="font-size:11.5px;">${runTypeBadge}Core:${escapeHtml(String(j.coreId || "자동"))} × ${j.coreCount || 1}GPU</td>
+            <td class="mono" style="color:#93c5fd; font-size:12px; cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)">${escapeHtml(j.executionCommand)}</td>
+            <td style="font-size:11.5px;">${escapeHtml(j.lastStatus || "대기 중")}</td>
+            <td>
+              <div class="btn-row" style="gap:4px;">
+                <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeHtml(j.id)}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">▶ +1 실행</button>
+                <button class="secondary sm" style="padding:4px 8px;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', true)">✏️ 수정</button>
+                <button class="secondary sm" style="padding:4px 8px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;" onclick="duplicateJobRule('${escapeHtml(j.id)}')" title="이 규칙을 복제하여 새 규칙으로 바로 추가합니다">📋 복제추가</button>
+                <button class="danger sm" style="padding:4px 8px;" onclick="deleteJob('${escapeHtml(j.id)}')">삭제</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
+  if (monTbody) {
+    monTbody.innerHTML = jobs
+      .map((j) => {
+        const isFocused = String(j.id) === String(focusedId);
+        const jf = jobFleetMap.get(j.id);
+        const activeCnt = jf ? jf.activeCount : "?";
+        const targetCnt = j.minConcurrentRuns || 1;
+        const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
+        const fleetBadges = jf
+          ? `<div style="display:flex; gap:5px; flex-wrap:wrap; align-items:center;">
+              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">가동: ${activeCnt} / 목표: ${targetCnt}개</span>
+              ${
+                remCnt > 0
+                  ? `<span class="badge warn">🔄 +${remCnt}개 대기</span>`
+                  : `<span class="badge ok">✅ 충족</span>`
+              }
+            </div>`
+          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
+        const badge = j.enabled
+          ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)">🟢 ON (가동중)</button>`
+          : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)">⚪ OFF (켜기)</button>`;
+        const runTypeBadge = j.allowSpot
+          ? `<span class="badge warn" style="margin-right:4px;">🟧 Spot</span>`
+          : `<span class="badge ok" style="margin-right:4px; background:rgba(59,130,246,0.2); color:#93c5fd;">🟦 Std</span>`;
+        return `
+          <tr style="${isFocused ? "background:rgba(59,130,246,0.12);" : ""}">
+            <td>${badge}</td>
+            <td class="mono" style="cursor:pointer;" onclick="selectFleetJobTab('${escapeHtml(j.id)}')" title="클릭하면 위 모니터링 보드에서 이 규칙 현황을 봅니다">
+              <b>${escapeHtml(j.name)}</b>
+            </td>
+            <td>${fleetBadges}</td>
+            <td class="mono" style="font-size:11.5px;">${runTypeBadge}Core:${escapeHtml(String(j.coreId || "자동"))} × ${j.coreCount || 1}GPU</td>
+            <td class="mono" style="color:#93c5fd; font-size:12px;">${escapeHtml(j.executionCommand)}</td>
+            <td style="font-size:11.5px;">${escapeHtml(j.lastStatus || "대기 중")}</td>
+            <td>
+              <div class="btn-row" style="gap:4px;">
+                <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeHtml(j.id)}')" title="워커 1개 즉시 실행">▶ +1 즉시실행</button>
+                <button class="secondary sm" style="padding:4px 8px;" onclick="editJobRuleInSetup('${escapeHtml(j.id)}')" title="설정 화면에서 이 규칙을 수정합니다">⚙️ 설정 수정</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
 
   if (!window.__initialJobLoaded && jobs[0]) {
     window.__initialJobLoaded = true;
