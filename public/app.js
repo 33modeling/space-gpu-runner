@@ -1683,7 +1683,9 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
           ${
             remainingCnt > 0
-              ? `<b>${intervalSec}초</b>마다 1개씩 자동 생성 · 약 <b>${Math.ceil((remainingCnt * intervalSec) / 60)}분</b> 내 전부 생성`
+              ? `<b>${
+                  intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분(${intervalSec}초)` : `${intervalSec}초`
+                }</b>마다 1개씩 자동 생성 · 약 <b>${Math.ceil((remainingCnt * intervalSec) / 60)}분</b> 내 전부 생성`
               : targetPendingCnt > 0
               ? `목표 Pending <b>${targetPendingCnt}개</b> 유지 완료 · Running 진입 시 즉시 새 Pending 보충`
               : pendingCnt > 0
@@ -1747,22 +1749,25 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       </div>
 
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(168,85,247,0.45); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">⏱️ 워커 자동 생성 주기 (초/분)</div>
+        <div style="font-size:11.5px; color:#94a3b8;">⏱️ 워커 자동 할당·생성 주기 (초/분)</div>
         <div style="display:flex; align-items:center; gap:4px; margin-top:4px; flex-wrap:wrap;">
-          <span class="mono" style="font-size:19px; font-weight:800; color:#c084fc; margin-right:3px;">${
+          <span class="mono" style="font-size:18px; font-weight:800; color:#c084fc; margin-right:3px;">${
             intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분(${intervalSec}초)` : `${intervalSec}초`
           }</span>
-          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 5 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 5)">5초</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 15 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 15)">15초</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 30 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 30)">30초</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 60 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 60)">1분</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 120 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 120)">2분</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 180 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 180)">3분</button>
-          <input type="number" id="quickIntervalInput" class="mono" min="1" max="3600" value="${intervalSec}" style="width:58px; padding:3px 5px; font-size:12px;" title="직접 초 단위 입력 (예: 60=1분, 120=2분, 180=3분)" />
+          <button type="button" class="secondary sm" style="padding:2px 5px; ${intervalSec === 15 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 15)">15초</button>
+          <button type="button" class="secondary sm" style="padding:2px 5px; ${intervalSec === 30 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 30)">30초</button>
+          <button type="button" class="secondary sm" style="padding:2px 5px; ${intervalSec === 60 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 60)">1분</button>
+          <button type="button" class="secondary sm" style="padding:2px 5px; ${intervalSec === 120 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 120)">2분</button>
+          <button type="button" class="secondary sm" style="padding:2px 5px; ${intervalSec === 180 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 180)">3분</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; font-weight:700; ${intervalSec === 300 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 300)">5분</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; font-weight:800; ${intervalSec === 600 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : "border-color:rgba(192,132,252,0.55); color:#e9d5ff;"}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 600)">10분</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 900 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 900)">15분</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 1800 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 1800)">30분</button>
+          <input type="number" id="quickIntervalInput" class="mono" min="1" max="86400" value="${intervalSec}" style="width:62px; padding:3px 5px; font-size:12px;" title="직접 초 단위 입력 (예: 180=3분, 300=5분, 600=10분, 1800=30분)" />
           <button type="button" class="sm" style="padding:3px 8px;" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickIntervalInput').value || 15))">적용</button>
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:3px;">
-          워커 1개 생성 후 다음 생성까지 간격 (5초 ~ 3분 또는 직접 입력)
+          워커 1개 생성 후 다음 자동 할당까지 간격 (15초 ~ 30분 또는 초 단위 직접 입력)
         </div>
       </div>
     </div>
@@ -2070,7 +2075,7 @@ async function quickUpdateTargetPending(jobId, newTargetPending) {
 }
 
 async function quickUpdateSpawnInterval(jobId, newIntervalSec) {
-  const sec = Math.max(1, Math.min(3600, Number(newIntervalSec || 15)));
+  const sec = Math.max(1, Math.min(86400, Number(newIntervalSec || 15)));
   const label = sec >= 60 && sec % 60 === 0 ? `${sec / 60}분(${sec}초)` : `${sec}초`;
   try {
     const res = await api("/api/jobs/target", {

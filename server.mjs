@@ -3030,39 +3030,44 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
 /**
  * Feature 1: Zombie / Stuck Pending Worker Watchdog Sweep
  * Automatically terminates non-Running active workers (`Pending`/`Creating`/`Approved`)
- * stuck longer than `maxPendingTimeoutMin` minutes (or stuck >= 5 minutes when newer runs are already Running)
- * so the scheduler can immediately spawn a fresh worker on a healthy node.
+ * only when stuck longer than `maxPendingTimeoutMin` minutes (minimum 120 minutes for normal Pending queue runs
+ * so workers legitimately waiting for cluster GPU nodes are never prematurely killed and re-created).
  */
 async function runWatchdogSweep(allRuns = getSiteKnownRuns()) {
   watchdogStats.lastSweepAt = new Date().toISOString();
   if (state.config.watchdogEnabled === false) return { terminatedIds: [] };
 
-  const maxPendingMin = Math.max(3, Number(state.config.maxPendingTimeoutMin || 20));
-  const maxPendingMs = maxPendingMin * 60 * 1000;
+  const configuredPendingMin = Math.max(10, Number(state.config.maxPendingTimeoutMin || 120));
   const now = Date.now();
   const runsList = Array.isArray(allRuns) ? allRuns : [];
 
   const activeRuns = runsList.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
-  const runningRuns = activeRuns.filter((r) =>
-    String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
-  );
-  const highestRunningId = runningRuns.reduce((maxId, r) => Math.max(maxId, Number(r.id ?? r.runId ?? 0)), 0);
-
   const nonRunningActive = activeRuns.filter(
     (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
 
+  // If the user configured a target Pending queue (`targetPendingRuns > 0`) or a long allocation interval (`>= 180s`),
+  // Pending workers are intentionally waiting in the cluster queue for free GPU nodes and should not be killed early.
+  const hasLongQueuePolicy = state.jobs.some(
+    (j) => j.enabled && (Number(j.targetPendingRuns || 0) > 0 || Number(j.cooldownSec || 0) >= 180)
+  );
+
   const terminatedIds = [];
   for (const r of nonRunningActive) {
-    // Use `startTime || registerTime || createdAt` so Pending runs without `startTime` (e.g. stuck WLM pods) are also caught!
+    const stUpper = String(r.status || r.state || r.phase || "").toUpperCase();
+    const isNormalQueuePending =
+      stUpper.includes("PENDING") || stUpper.includes("QUEUE") || stUpper.includes("WAIT") || stUpper.includes("APPROV");
+    // Normal cluster queue Pending runs wait at least 180 minutes (or 360 minutes under long-queue policy)
+    const effectiveTimeoutMin = isNormalQueuePending
+      ? Math.max(hasLongQueuePolicy ? 360 : 180, configuredPendingMin)
+      : configuredPendingMin;
+    const maxPendingMs = effectiveTimeoutMin * 60 * 1000;
+
     const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
     const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
     if (!startMs || Number.isNaN(startMs)) continue;
     const stuckMs = now - startMs;
-    const numId = Number(r.id ?? r.runId ?? 0);
-    // If newer runs (higher runId) have already entered RUNNING, a Pending run stuck >= 5 minutes is bypassed/zombie
-    const bypassedByNewerRunning = highestRunningId > numId && stuckMs >= 5 * 60 * 1000;
-    if (stuckMs >= maxPendingMs || bypassedByNewerRunning) {
+    if (stuckMs >= maxPendingMs) {
       const rId = String(r.id ?? r.runId ?? "");
       const rName = r.containerName || r.name || `#${rId}`;
       const stuckMin = Math.round(stuckMs / 60000);
@@ -4563,19 +4568,19 @@ setInterval(() => {
         const anyJobAutoApprove = state.jobs.some((j) => j.autoApprove !== false);
         if (state.config.autoApprovalScope !== "off" || anyJobAutoApprove) {
           const hasRecentTrigger = state.jobs.some(
-            (j) => j.autoApprove !== false && j.lastTriggeredAt && now - new Date(j.lastTriggeredAt).getTime() < 5 * 60 * 1000
+            (j) => j.autoApprove !== false && j.lastTriggeredAt && now - new Date(j.lastTriggeredAt).getTime() < 30 * 1000
           );
-          const configuredApprovalSec = Math.max(1, Number(state.config.approvalCheckIntervalSec || 3));
+          const configuredApprovalSec = Math.max(1, Number(state.config.approvalCheckIntervalSec || 5));
           const adaptivePolling = state.config.adaptivePollingEnabled !== false;
-          // Fast 2s polling right after a run creation or when any run is Pending; gently relax to 5s when all runs are steadily Running & no pending approvals
+          // Fast 2s polling right after a run creation (30s window) or when unapproved items exist; relax to >=10s otherwise
           let effectiveApprovalSec =
-            hasRecentTrigger || hasNonRunningActive || approvalLoopStats.pendingCount > 0
+            hasRecentTrigger || approvalLoopStats.pendingCount > 0
               ? Math.min(2, configuredApprovalSec)
               : adaptivePolling
-              ? Math.max(configuredApprovalSec, 5)
-              : Math.min(3, configuredApprovalSec);
+              ? Math.max(configuredApprovalSec, 10)
+              : Math.max(configuredApprovalSec, 5);
           if (loadMonitorStats.backoffUntilMs > now) {
-            effectiveApprovalSec = Math.max(effectiveApprovalSec, 8);
+            effectiveApprovalSec = Math.max(effectiveApprovalSec, 15);
           }
           approvalLoopStats.effectiveIntervalSec = effectiveApprovalSec;
           const approvalIntervalMs = effectiveApprovalSec * 1000;
@@ -4604,27 +4609,49 @@ setInterval(() => {
         let effectiveSchedSec =
           enabledJobIntervals.length > 0 ? Math.min(configuredSchedSec, ...enabledJobIntervals) : configuredSchedSec;
 
-        // When any enabled job is below its target worker count, check every <= 4s (using cached runs when fresh)
-        // so cooldown expiration is detected within 1~3s instead of slipping by a full 30s cycle!
-        const hasWorkerDeficit = enabledJobs.some((job) => {
-          const activeForJob = knownRuns.filter(
-            (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
-          ).length;
-          return activeForJob < Math.max(1, Number(job.minConcurrentRuns || 1));
-        });
-        const loopCheckSec = hasWorkerDeficit ? Math.min(4, effectiveSchedSec) : effectiveSchedSec;
-
         if (loadMonitorStats.backoffUntilMs > now) {
-          effectiveSchedSec = Math.max(effectiveSchedSec, 10);
+          effectiveSchedSec = Math.max(effectiveSchedSec, 15);
         }
         schedulerLoopStats.effectiveIntervalSec = effectiveSchedSec;
-        const schedIntervalMs = loopCheckSec * 1000;
-        if (rt.lastSchedulerTickTime) {
-          schedulerLoopStats.nextCheckAt = new Date(rt.lastSchedulerTickTime + schedIntervalMs).toISOString();
+
+        // Calculate the exact next time any enabled job with a deficit is eligible to spawn a worker (`lastTriggeredAt + cooldownSec`).
+        // During a long cooldown (e.g., 3min, 5min, 10min, 30min), do NOT poll `runSchedulerTick` every 4 seconds!
+        let earliestDeficitSpawnMs = null;
+        for (const job of enabledJobs) {
+          const matchingActive = knownRuns.filter(
+            (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+          );
+          const matchingPending = matchingActive.filter(
+            (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+          );
+          const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
+          const minConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
+          const hasDeficit =
+            targetPending > 0 ? matchingPending.length < targetPending : matchingActive.length < minConcurrent;
+          if (hasDeficit) {
+            const jobCooldownSec = Math.max(1, Number(job.cooldownSec || configuredSchedSec || 15));
+            const lastTrigMs = job.lastTriggeredAt ? new Date(job.lastTriggeredAt).getTime() : 0;
+            const eligibleMs = lastTrigMs ? lastTrigMs + jobCooldownSec * 1000 : now;
+            if (earliestDeficitSpawnMs === null || eligibleMs < earliestDeficitSpawnMs) {
+              earliestDeficitSpawnMs = eligibleMs;
+            }
+          }
         }
-        if (now - rt.lastSchedulerTickTime >= schedIntervalMs) {
+
+        const baseTickTargetMs = rt.lastSchedulerTickTime
+          ? rt.lastSchedulerTickTime + effectiveSchedSec * 1000
+          : now;
+        let nextTargetTickMs = baseTickTargetMs;
+        if (earliestDeficitSpawnMs !== null) {
+          // Wake up when the job's cooldown expires (with a minimum 4s spacing after the previous tick)
+          const minNextTickMs = rt.lastSchedulerTickTime ? rt.lastSchedulerTickTime + Math.min(4, effectiveSchedSec) * 1000 : now;
+          nextTargetTickMs = Math.max(minNextTickMs, Math.min(baseTickTargetMs, earliestDeficitSpawnMs));
+        }
+
+        schedulerLoopStats.nextCheckAt = new Date(nextTargetTickMs).toISOString();
+        if (now >= nextTargetTickMs) {
           rt.lastSchedulerTickTime = now;
-          schedulerLoopStats.nextCheckAt = new Date(now + schedIntervalMs).toISOString();
+          schedulerLoopStats.nextCheckAt = new Date(now + effectiveSchedSec * 1000).toISOString();
           await runSchedulerTick(false);
         }
       } catch {
