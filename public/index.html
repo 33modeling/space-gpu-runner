@@ -660,15 +660,31 @@
 
           <!-- ② 목표 동시 워커 수 -->
           <div class="form-group">
-            <label style="font-size:12.5px; font-weight:700; color:#e2e8f0;">② 유지할 동시 워커(컨테이너) 개수</label>
-            <div style="display:flex; gap:5px; align-items:center;">
-              <input type="number" id="jobMinConcurrent" min="1" max="9999" value="1" class="mono" style="width:85px; font-size:14px; font-weight:800; color:#60a5fa;" />
+            <label style="font-size:12.5px; font-weight:700; color:#e2e8f0;">② 유지할 전체 목표 워커 개수 (`minConcurrentRuns`)</label>
+            <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap;">
+              <input type="number" id="jobMinConcurrent" min="1" max="9999" value="1" class="mono" style="width:78px; font-size:14px; font-weight:800; color:#60a5fa;" />
               <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=1">1개</button>
               <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=8">8개</button>
               <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=16">16개</button>
               <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=32">32개</button>
               <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=48">48개</button>
             </div>
+          </div>
+
+          <!-- ②-2 목표 Pending 대기 개수 -->
+          <div class="form-group">
+            <label style="font-size:12.5px; font-weight:700; color:#fde68a;">⏳ 목표 Pending 대기 개수 (`targetPendingRuns` — 0이면 전체목표 기준)</label>
+            <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
+              <input type="number" id="jobTargetPending" min="0" max="9999" value="0" class="mono" style="width:74px; font-size:14px; font-weight:800; color:#fbbf24; border-color:rgba(245,158,11,0.5);" />
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=0">0(해제)</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=1">1개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=2">2개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=3">3개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=5">5개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=8">8개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=10">10개</button>
+            </div>
+            <div class="hint" style="margin-top:2px; font-size:11px; color:#fcd34d;">1 이상 입력 시 Running 개수와 무관하게 대기열(Pending)을 항상 해당 개수로 유지합니다.</div>
           </div>
 
           <!-- ③ 실행 방식 (Standard vs Spot) & GPU 선택 -->
@@ -816,6 +832,6 @@
   </div> <!-- /.container -->
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=18"></script>
+  <script src="/app.js?v=19"></script>
 </body>
 </html>

@@ -1118,6 +1118,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   const activeElId = document.activeElement?.id || "";
   if (
     activeElId === "quickTargetInput" ||
+    activeElId === "quickTargetPendingInput" ||
     activeElId === "quickIntervalInput" ||
     activeElId === "slotRangeKillInput"
   ) {
@@ -1138,8 +1139,11 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   const runningCnt = jf.runningCount ?? 0;
   const pendingCnt = jf.pendingCount ?? 0;
   const targetCnt = jf.targetCount ?? 1;
-  const remainingCnt = jf.remainingToCreate ?? Math.max(0, targetCnt - activeCnt);
-  const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
+  const targetPendingCnt = jf.targetPendingCount ?? jf.targetPendingRuns ?? 0;
+  const remainingCnt = jf.remainingToCreate ?? (targetPendingCnt > 0 ? Math.max(0, targetPendingCnt - pendingCnt) : Math.max(0, targetCnt - activeCnt));
+  const excessPendingCnt =
+    jf.excessPendingCount ??
+    (targetPendingCnt > 0 ? Math.max(0, pendingCnt - targetPendingCnt) : Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt)));
   const gpusPerWorker = jf.coreCountPerWorker ?? jf.gpusPerWorker ?? 1;
   const runningGpus = jf.runningGpuCount ?? jf.runningGpus ?? runningCnt * gpusPerWorker;
   const pendingGpus = jf.pendingGpuCount ?? jf.pendingGpus ?? pendingCnt * gpusPerWorker;
@@ -1183,7 +1187,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12.5px;">
             <span style="font-weight:800; color:#38bdf8;">📊 SPACE 실제 워커 실시간 대조표:</span>
             <span class="mono" style="background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.45); padding:3px 8px; border-radius:6px; color:#d1fae5;">
-              ① 규칙 <b>[${escapeHtml(jf.jobName)}]</b>: <b style="color:#34d399;">🟢 Running ${runningCnt}개</b>(${runningGpus}GPU) + <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>(${pendingGpus}GPU) = <b>활성 ${activeCnt}개</b> / 목표 ${targetCnt}개
+              ① 규칙 <b>[${escapeHtml(jf.jobName)}]</b>: <b style="color:#34d399;">🟢 Running ${runningCnt}개</b>(${runningGpus}GPU) + <b style="color:#fde68a;">⏳ Pending ${pendingCnt}${targetPendingCnt > 0 ? `/${targetPendingCnt}(목표)` : ""}개</b>(${pendingGpus}GPU) = <b>활성 ${activeCnt}개</b> / 목표 ${targetCnt}개
             </span>
             <span class="mono" style="background:rgba(59,130,246,0.15); border:1px solid rgba(59,130,246,0.45); padding:3px 8px; border-radius:6px; color:#dbeafe;">
               ② 내 계정 전체(<code>${escapeHtml(recon.currentUserName || "me")}</code>): <b style="color:#60a5fa;">🟢 Running ${recon.mySpaceRunningWorkers}개</b>(${recon.mySpaceRunningGpus}GPU) + ⏳ Pending ${recon.mySpacePendingWorkers}개 = <b>총 ${recon.mySpaceActiveWorkers}개</b>
@@ -1194,7 +1198,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           </div>
           ${
             excessPendingCnt > 0
-              ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800; padding:4px 10px;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending +${excessPendingCnt}개 자동 정리 (${targetCnt}개 맞춤)</button>`
+              ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800; padding:4px 10px;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending +${excessPendingCnt}개 자동 정리 (${targetPendingCnt > 0 ? `목표 Pending ${targetPendingCnt}개` : `${targetCnt}개`} 맞춤)</button>`
               : ""
           }
         </div>
@@ -1637,9 +1641,9 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   updateHtmlIfSigChanged(document.getElementById("wfHeadlineSection"), headlineSig, headlineHtml);
 
   // 4. Metric cards section (only update when worker/target/interval counts change)
-  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${remainingCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}`;
+  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetPendingCnt}|${remainingCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}`;
   const metricHtml = `
-    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(215px, 1fr)); gap:10px; margin-bottom:12px;">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-bottom:12px;">
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(16,185,129,0.45); border-radius:8px; padding:10px 12px;">
         <div style="font-size:11.5px; color:#94a3b8;">🟢 실제 가동 중(Running) 워커 수</div>
         <div class="mono" style="font-size:22px; font-weight:800; color:#34d399; margin-top:2px;">
@@ -1647,18 +1651,32 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           <span style="font-size:12.5px; font-weight:600; color:#a7f3d0;">(가동 GPU ${runningGpus}장)</span>
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
-          ⏳ Pending 대기: <b style="color:#fde68a;">${pendingCnt}개</b>(${pendingGpus}장) &nbsp;|&nbsp; 전체 활성: <b>${activeCnt}개</b>(${activeGpus}장)
+          ⏳ Pending 대기: <b style="color:#fde68a;">${pendingCnt}개${targetPendingCnt > 0 ? ` / 목표 ${targetPendingCnt}개` : ""}</b>(${pendingGpus}장) &nbsp;|&nbsp; 전체 활성: <b>${activeCnt}개</b>(${activeGpus}장)
         </div>
       </div>
 
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(245,158,11,0.45); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">${remainingCnt > 0 ? "🔄 앞으로 자동 생성될 워커 수" : "⏳ 클러스터 Pending 대기 및 추가 생성"}</div>
+        <div style="font-size:11.5px; color:#94a3b8;">${
+          targetPendingCnt > 0
+            ? `⏳ Pending 목표(${targetPendingCnt}개) 자동 유지 상태`
+            : remainingCnt > 0
+            ? "🔄 앞으로 자동 생성될 워커 수"
+            : "⏳ 클러스터 Pending 대기 및 추가 생성"
+        }</div>
         <div class="mono" style="font-size:21px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : pendingCnt > 0 ? "#fde68a" : "#6ee7b7"}; margin-top:2px;">
           ${
             remainingCnt > 0
-              ? `+${remainingCnt}개 생성 예정 <span style="font-size:12.5px; font-weight:600; color:#fde68a;">(GPU +${remainingGpus}장)</span>`
+              ? `+${remainingCnt}개 생성 예정 <span style="font-size:12.5px; font-weight:600; color:#fde68a;">(${
+                  targetPendingCnt > 0 ? `Pending ${pendingCnt}→${targetPendingCnt}개` : `GPU +${remainingGpus}장`
+                })</span>`
               : pendingCnt > 0
-              ? `⏳ Pending ${pendingCnt}개 대기 <span style="font-size:12.5px; font-weight:600; color:#cbd5e1;">(${excessPendingCnt > 0 ? `목표초과 +${excessPendingCnt}개` : `Running 전환 대기`})</span>`
+              ? `⏳ Pending ${pendingCnt}개 대기 <span style="font-size:12.5px; font-weight:600; color:#cbd5e1;">(${
+                  excessPendingCnt > 0
+                    ? `목표초과 +${excessPendingCnt}개`
+                    : targetPendingCnt > 0
+                    ? `목표 Pending ${targetPendingCnt}개 유지중`
+                    : `Running 전환 대기`
+                })</span>`
               : `대기 0개 <span style="font-size:12.5px; font-weight:600; color:#6ee7b7;">(전원 Running!)</span>`
           }
         </div>
@@ -1666,6 +1684,8 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           ${
             remainingCnt > 0
               ? `<b>${intervalSec}초</b>마다 1개씩 자동 생성 · 약 <b>${Math.ceil((remainingCnt * intervalSec) / 60)}분</b> 내 전부 생성`
+              : targetPendingCnt > 0
+              ? `목표 Pending <b>${targetPendingCnt}개</b> 유지 완료 · Running 진입 시 즉시 새 Pending 보충`
               : pendingCnt > 0
               ? `목표 ${targetCnt}개 신청 완료 · 클러스터 GPU 노드 배정 시 Running 진입`
               : `추가 생성 대기 없음 (목표 Running 100% 충족)`
@@ -1673,8 +1693,45 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         </div>
       </div>
 
+      <div style="background:rgba(15,23,42,0.82); border:1.5px solid ${
+        targetPendingCnt > 0 ? "rgba(245,158,11,0.75)" : "rgba(245,158,11,0.38)"
+      }; border-radius:8px; padding:10px 12px;">
+        <div style="font-size:11.5px; color:#fde68a; font-weight:700;">⏳ 유지할 목표 Pending 대기 개수 (빠른 지정)</div>
+        <div style="display:flex; align-items:center; gap:4px; margin-top:4px; flex-wrap:wrap;">
+          <span class="mono" style="font-size:19px; font-weight:800; color:${
+            targetPendingCnt > 0 ? "#fbbf24" : "#94a3b8"
+          }; margin-right:3px;">${targetPendingCnt > 0 ? `${targetPendingCnt}개` : "자동(OFF)"}</span>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${
+            targetPendingCnt === 0 ? "background:#475569; border-color:#94a3b8; color:#fff;" : ""
+          }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 0)" title="0으로 설정 시 전체 목표 워커 수 기준으로 자동 운영">해제(0)</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', ${Math.max(0, targetPendingCnt - 1)})">-1</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', ${targetPendingCnt + 1})">+1</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${
+            targetPendingCnt === 2 ? "background:#d97706; border-color:#fbbf24; color:#fff;" : ""
+          }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 2)">2</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${
+            targetPendingCnt === 5 ? "background:#d97706; border-color:#fbbf24; color:#fff;" : ""
+          }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 5)">5</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${
+            targetPendingCnt === 8 ? "background:#d97706; border-color:#fbbf24; color:#fff;" : ""
+          }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 8)">8</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; ${
+            targetPendingCnt === 10 ? "background:#d97706; border-color:#fbbf24; color:#fff;" : ""
+          }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 10)">10</button>
+          <input type="number" id="quickTargetPendingInput" class="mono" min="0" max="9999" value="${targetPendingCnt}" style="width:56px; padding:3px 5px; font-size:12px;" title="유지할 목표 Pending 대기 개수 (0=해제)" />
+          <button type="button" class="sm" style="padding:3px 8px; background:#d97706;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetPendingInput').value || 0))">적용</button>
+        </div>
+        <div style="font-size:11px; color:#cbd5e1; margin-top:3px;">
+          ${
+            targetPendingCnt > 0
+              ? `현재 Pending <b style="color:#fde68a;">${pendingCnt}개</b> / 목표 <b style="color:#fbbf24;">${targetPendingCnt}개</b> (Running 진입 시 자동 보충)`
+              : `1 이상 입력 시 해당 개수만큼 Pending 대기열을 항상 유지합니다`
+          }
+        </div>
+      </div>
+
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(59,130,246,0.45); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">🎯 유지할 목표 워커 수 (빠른 변경)</div>
+        <div style="font-size:11.5px; color:#94a3b8;">🎯 유지할 목표 총 워커 수 (빠른 변경)</div>
         <div style="display:flex; align-items:center; gap:5px; margin-top:4px; flex-wrap:wrap;">
           <span class="mono" style="font-size:20px; font-weight:800; color:#60a5fa; margin-right:4px;">${targetCnt}개</span>
           <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${Math.max(1, targetCnt - 4)})">-4</button>
@@ -1898,6 +1955,7 @@ function updateWorkerCountdownBadge() {
   const pendingCnt = jf.pendingCount ?? 0;
   const activeCnt = jf.activeCount ?? 0;
   const targetCnt = jf.targetCount ?? 1;
+  const targetPendingCnt = jf.targetPendingCount ?? 0;
   const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
   const isAutoOn = Boolean(latestWorkerFleet.schedulerEnabled && jf.enabled);
   const schedStats = latestSchedulerStats || {};
@@ -1908,7 +1966,13 @@ function updateWorkerCountdownBadge() {
   }
 
   if (remainingCnt <= 0) {
-    if (runningCnt < targetCnt) {
+    if (targetPendingCnt > 0) {
+      const waitMsg = `✅ 목표 Pending 대기 <b>${pendingCnt}/${targetPendingCnt}개</b> 유지 중! — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> 가동 중이며 <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>가 GPU 노드 배정을 기다리고 있습니다.${
+        excessPendingCnt > 0 ? ` (목표 Pending 대비 초과 +${excessPendingCnt}개)` : ""
+      } (Running 진입 시 즉시 새 Pending 보충 · 다음 점검: <b>${nextSchedCheckSec}초 후</b>)`;
+      if (el) el.innerHTML = waitMsg;
+      if (topAllocEl) topAllocEl.innerHTML = waitMsg;
+    } else if (runningCnt < targetCnt) {
       const waitMsg = `⏳ 목표 워커 <b>${targetCnt}개</b> 모두 신청 완료 — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> 가동 중이며 <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>가 클러스터 GPU 노드 배정을 기다리고 있습니다.${
         excessPendingCnt > 0 ? ` (목표 대비 초과 Pending +${excessPendingCnt}개)` : ""
       } (다음 감시 점검: <b>${nextSchedCheckSec}초 후</b>)`;
@@ -1941,10 +2005,14 @@ function updateWorkerCountdownBadge() {
   const totalEstSec = remainSec + Math.max(0, remainingCnt - 1) * (jf.scaleUpIntervalSec || 15);
   const mins = Math.floor(totalEstSec / 60);
   const secs = totalEstSec % 60;
+  const targetDesc =
+    targetPendingCnt > 0
+      ? `남은 Pending 보충 <b>+${remainingCnt}개</b> (목표 Pending ${targetPendingCnt}개)`
+      : `남은 <b>+${remainingCnt}개</b> 전체 자동 신청`;
   const msgHtml =
     remainSec > 0
-      ? `⏱️ 다음 <b>워커#${nextSlotNum}</b> 무클릭 자동 신청까지: <b style="color:#fde68a; font-size:13.5px;">${remainSec}초</b> 남음 &nbsp;|&nbsp; 남은 <b>+${remainingCnt}개</b> 전체 자동 신청 완료 예상: 약 <b>${mins > 0 ? `${mins}분 ` : ""}${secs}초</b>`
-      : `⚡ 지금 <b>워커#${nextSlotNum}</b> 무클릭 자동 신청 및 Admin 즉시 승인 요청 중... (남은 자동 신청 예정: <b>+${remainingCnt}개</b>)`;
+      ? `⏱️ 다음 <b>워커#${nextSlotNum}</b> 무클릭 자동 신청까지: <b style="color:#fde68a; font-size:13.5px;">${remainSec}초</b> 남음 &nbsp;|&nbsp; ${targetDesc} 완료 예상: 약 <b>${mins > 0 ? `${mins}분 ` : ""}${secs}초</b>`
+      : `⚡ 지금 <b>워커#${nextSlotNum}</b> 무클릭 자동 신청 및 Admin 즉시 승인 요청 중... (${targetDesc})`;
   if (el) el.innerHTML = msgHtml;
   if (topAllocEl) topAllocEl.innerHTML = msgHtml;
 }
@@ -1969,6 +2037,35 @@ async function quickUpdateTargetWorkers(jobId, newTarget) {
     await loadServerState();
   } catch (e) {
     alert("목표 워커 수 변경 실패: " + e.message);
+  }
+}
+
+async function quickUpdateTargetPending(jobId, newTargetPending) {
+  const targetPending = Math.max(0, Math.min(9999, Number(newTargetPending ?? 0)));
+  try {
+    const res = await api("/api/jobs/target", {
+      method: "POST",
+      body: JSON.stringify({
+        jobId,
+        targetPendingRuns: targetPending,
+      }),
+    });
+    const pendInput = document.getElementById("jobTargetPending");
+    if (pendInput) pendInput.value = targetPending;
+    const quickInput = document.getElementById("quickTargetPendingInput");
+    if (quickInput) quickInput.value = targetPending;
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet);
+    }
+    showToast(
+      targetPending > 0
+        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (Pending < ${targetPending}개일 때 자동 보충)`
+        : `⏳ 목표 Pending 대기 개수 지정이 해제(0)되었습니다! (전체 목표 워커 수 기준으로 자동 운영)`
+    );
+    await loadServerState();
+  } catch (e) {
+    alert("목표 Pending 대기 개수 변경 실패: " + e.message);
   }
 }
 
@@ -3181,7 +3278,7 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
     jobs
       .map((j) => {
         const jf = jobFleetMap.get(j.id);
-        return `${j.id}:${j.name}:${j.enabled}:${j.minConcurrentRuns}:${j.allowSpot}:${j.coreId}:${j.coreCount}:${j.executionCommand}:${j.lastStatus}:${jf?.runningCount}:${jf?.pendingCount}`;
+        return `${j.id}:${j.name}:${j.enabled}:${j.minConcurrentRuns}:${j.targetPendingRuns ?? 0}:${j.allowSpot}:${j.coreId}:${j.coreCount}:${j.executionCommand}:${j.lastStatus}:${jf?.runningCount}:${jf?.pendingCount}`;
       })
       .join(";");
 
@@ -3194,25 +3291,32 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
         const pendingCnt = jf ? jf.pendingCount : 0;
         const activeCnt = jf ? jf.activeCount : "?";
         const targetCnt = j.minConcurrentRuns || 1;
+        const targetPendingCnt = Math.max(0, Number(j.targetPendingRuns ?? jf?.targetPendingCount ?? 0));
         const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
         const excessCnt = jf ? jf.excessPendingCount || 0 : 0;
         const fleetBadges = jf
           ? `<div style="margin-top:4px; display:flex; gap:5px; flex-wrap:wrap;">
               <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개</span>
               ${
-                pendingCnt > 0
+                targetPendingCnt > 0
+                  ? `<span class="badge warn" style="border:1px solid #fbbf24;">🎯 목표Pending: ${pendingCnt}/${targetPendingCnt}개</span>`
+                  : pendingCnt > 0
                   ? `<span class="badge warn">⏳ Pending 대기: ${pendingCnt}개 (활성 ${activeCnt}개${excessCnt > 0 ? ` · 초과+${excessCnt}` : ""})</span>`
                   : ""
               }
               ${
                 remCnt > 0
                   ? `<span class="badge warn">🔄 +${remCnt}개 추가생성 예정</span>`
+                  : targetPendingCnt > 0 && pendingCnt >= targetPendingCnt
+                  ? `<span class="badge ok">✅ 목표Pending ${targetPendingCnt}개 유지중</span>`
                   : runningCnt >= targetCnt
                   ? `<span class="badge ok">✅ 전원 Running</span>`
                   : ""
               }
             </div>`
-          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
+          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b>${
+              targetPendingCnt > 0 ? ` · 목표Pending: <b>${targetPendingCnt}개</b>` : ""
+            }</div>`;
         const badge = j.enabled
           ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
           : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
@@ -3254,25 +3358,32 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
         const pendingCnt = jf ? jf.pendingCount : 0;
         const activeCnt = jf ? jf.activeCount : "?";
         const targetCnt = j.minConcurrentRuns || 1;
+        const targetPendingCnt = Math.max(0, Number(j.targetPendingRuns ?? jf?.targetPendingCount ?? 0));
         const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
         const excessCnt = jf ? jf.excessPendingCount || 0 : 0;
         const fleetBadges = jf
           ? `<div style="display:flex; gap:5px; flex-wrap:wrap; align-items:center;">
               <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개</span>
               ${
-                pendingCnt > 0
+                targetPendingCnt > 0
+                  ? `<span class="badge warn" style="border:1px solid #fbbf24;">🎯 목표Pending: ${pendingCnt}/${targetPendingCnt}개</span>`
+                  : pendingCnt > 0
                   ? `<span class="badge warn">⏳ Pending 대기: ${pendingCnt}개 (활성 ${activeCnt}개${excessCnt > 0 ? ` · 초과+${excessCnt}` : ""})</span>`
                   : ""
               }
               ${
                 remCnt > 0
                   ? `<span class="badge warn">🔄 +${remCnt}개 추가생성 예정</span>`
+                  : targetPendingCnt > 0 && pendingCnt >= targetPendingCnt
+                  ? `<span class="badge ok">✅ 목표Pending ${targetPendingCnt}개 유지중</span>`
                   : runningCnt >= targetCnt
                   ? `<span class="badge ok">✅ 전원 Running</span>`
                   : ""
               }
             </div>`
-          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b></div>`;
+          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b>${
+              targetPendingCnt > 0 ? ` · 목표Pending: <b>${targetPendingCnt}개</b>` : ""
+            }</div>`;
         const badge = j.enabled
           ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)">🟢 ON (가동중)</button>`
           : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)">⚪ OFF (켜기)</button>`;
@@ -3343,6 +3454,8 @@ function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   document.getElementById("jobMode").value = j.mode || "ensure_running";
   document.getElementById("jobUseSpecId").value = j.useSpecId || "";
   document.getElementById("jobMinConcurrent").value = j.minConcurrentRuns || 1;
+  const targetPendingEl = document.getElementById("jobTargetPending");
+  if (targetPendingEl) targetPendingEl.value = Math.max(0, Number(j.targetPendingRuns ?? 0));
   document.getElementById("jobGroupPoolId").value = j.groupPoolId || "";
   document.getElementById("jobCoreId").value = j.coreId || "";
   document.getElementById("jobCoreCount").value = j.coreCount || 1;
@@ -3396,6 +3509,7 @@ function startNewJobRule() {
       name: `worker-rule-${nextIdx}`,
       mode: "ensure_running",
       minConcurrentRuns: 1,
+      targetPendingRuns: 0,
       groupPoolId: currentPoolId,
       coreId: currentCoreId,
       coreCount: 1,
@@ -3437,6 +3551,7 @@ function collectJobFormPayload() {
     mode: document.getElementById("jobMode").value,
     useSpecId: document.getElementById("jobUseSpecId").value,
     minConcurrentRuns: Number(document.getElementById("jobMinConcurrent").value || 1),
+    targetPendingRuns: Math.max(0, Number(document.getElementById("jobTargetPending")?.value || 0)),
     groupPoolId: document.getElementById("jobGroupPoolId").value,
     coreId: document.getElementById("jobCoreId").value,
     coreCount: Number(document.getElementById("jobCoreCount").value || 1),
