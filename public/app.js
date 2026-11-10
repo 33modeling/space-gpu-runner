@@ -108,10 +108,214 @@ function applyUiRefreshInterval(sec) {
   }, cleanSec * 1000);
 }
 
+let currentSiteId = localStorage.getItem("space_active_site_id") || "n9";
+let sitesList = [
+  {
+    id: "n9",
+    name: "SPACE N9 (H100 클러스터)",
+    gpuModel: "H100",
+    portalUrl: "https://space.n9.sr-cloud.com",
+    baseUrl: "https://mlp.n9.sr-cloud.com",
+    sfmUrl: "https://sfsm.n9.sr-cloud.com",
+  },
+  {
+    id: "n6",
+    name: "SPACE N6 (A100 클러스터)",
+    gpuModel: "A100",
+    portalUrl: "https://space.n6.sr-cloud.com",
+    baseUrl: "https://mlp.n6.sr-cloud.com",
+    sfmUrl: "https://sfsm.n6.sr-cloud.com",
+  },
+];
+
+function getActiveSiteProfile(siteId = currentSiteId) {
+  const found = (sitesList || []).find((s) => s.id === siteId);
+  if (found) return found;
+  if (siteId === "n6") {
+    return {
+      id: "n6",
+      name: "SPACE N6 (A100 클러스터)",
+      gpuModel: "A100",
+      portalUrl: "https://space.n6.sr-cloud.com",
+      baseUrl: "https://mlp.n6.sr-cloud.com",
+      sfmUrl: "https://sfsm.n6.sr-cloud.com",
+    };
+  }
+  return {
+    id: siteId || "n9",
+    name: `SPACE ${(siteId || "n9").toUpperCase()} (${siteId === "n6" ? "A100" : "H100"} 클러스터)`,
+    gpuModel: siteId === "n6" ? "A100" : "H100",
+    portalUrl: `https://space.${siteId || "n9"}.sr-cloud.com`,
+    baseUrl: `https://mlp.${siteId || "n9"}.sr-cloud.com`,
+    sfmUrl: `https://sfsm.${siteId || "n9"}.sr-cloud.com`,
+  };
+}
+
+function getActiveGpuModel(siteId = currentSiteId) {
+  return getActiveSiteProfile(siteId).gpuModel || (siteId === "n6" ? "A100" : "H100");
+}
+
+function getActiveSiteHost(siteId = currentSiteId) {
+  const portal = getActiveSiteProfile(siteId).portalUrl || `https://space.${siteId || "n9"}.sr-cloud.com`;
+  return portal.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+}
+
+async function selectSpaceSite(siteId, options = {}) {
+  const target = String(siteId || "n9").trim().toLowerCase();
+  if (!target) return;
+  currentSiteId = target;
+  try {
+    localStorage.setItem("space_active_site_id", currentSiteId);
+  } catch {}
+  focusedFleetJobId = "";
+  lastKnownActiveWorkerIdsSig = "";
+  try {
+    await api("/api/sites/select", {
+      method: "POST",
+      body: JSON.stringify({ siteId: currentSiteId }),
+    });
+  } catch {}
+  if (!options.silent) {
+    const prof = getActiveSiteProfile(currentSiteId);
+    showToast(`🌐 관리 사이트 전환: ${prof.name} (${prof.gpuModel})`);
+  }
+  await loadServerState();
+  const firstJob = (serverState?.jobs || [])[0];
+  if (firstJob) {
+    loadJobToForm(firstJob, false, false);
+  } else {
+    startNewJobRule();
+  }
+  if (serverState?.config?.hasAccessToken) {
+    discoverSpaceResources({ silent: true });
+    loadApprovals({ background: true });
+    loadSpaceRuns({ background: true });
+  } else {
+    discovered = { groups: [], groupPools: [], groupPoolsStatus: [], spotCores: [], priorities: [], experiments: [], specifications: [], images: [] };
+    const runsBody = document.getElementById("runsTableBody");
+    if (runsBody) {
+      runsBody.innerHTML = `<tr><td colspan="6" class="hint">${getActiveSiteProfile().name} 토큰이 아직 설정되지 않았습니다. [🔑 SPACE 토큰 연동/갱신]에서 ${getActiveSiteHost()} 토큰을 등록해 주세요.</td></tr>`;
+    }
+  }
+}
+
+async function promptAddCustomSite() {
+  const idInput = prompt("추가할 SPACE 클러스터 ID를 입력하세요 (예: n6, n7, n8, n10):", "n6");
+  if (!idInput || !idInput.trim()) return;
+  const cleanId = idInput.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  if (!cleanId) return;
+  const defaultGpu = cleanId === "n6" ? "A100" : "H100";
+  const gpuModelInput = prompt(`해당 사이트(${cleanId.toUpperCase()})의 기본 GPU 모델명을 입력하세요 (예: A100, H100, H200, L40S):`, defaultGpu);
+  if (gpuModelInput === null) return;
+  const gpuModel = (gpuModelInput || defaultGpu).trim().toUpperCase();
+  const nameInput = prompt(`사이트 표시 이름을 입력하세요:`, `SPACE ${cleanId.toUpperCase()} (${gpuModel} 클러스터)`);
+  if (nameInput === null) return;
+  try {
+    await api("/api/sites", {
+      method: "POST",
+      body: JSON.stringify({
+        id: cleanId,
+        name: nameInput.trim() || `SPACE ${cleanId.toUpperCase()} (${gpuModel} 클러스터)`,
+        gpuModel,
+        portalUrl: `https://space.${cleanId}.sr-cloud.com`,
+        baseUrl: `https://mlp.${cleanId}.sr-cloud.com`,
+        sfmUrl: `https://sfsm.${cleanId}.sr-cloud.com`,
+      }),
+    });
+    showToast(`✅ 신규 사이트 추가 완료: SPACE ${cleanId.toUpperCase()} (${gpuModel})`);
+    await selectSpaceSite(cleanId, { silent: true });
+  } catch (e) {
+    alert("사이트 추가 실패: " + e.message);
+  }
+}
+
+function renderMultiSiteSwitcherBar(sites = sitesList, activeId = currentSiteId) {
+  const tabsEl = document.getElementById("multiSiteTabsContainer");
+  const badgeEl = document.getElementById("activeSiteSummaryBadge");
+  const tokenBtnsEl = document.getElementById("tokenSiteQuickButtons");
+  const tokenTargetNameEl = document.getElementById("tokenTargetSiteName");
+  const hostLabelEl = document.getElementById("authSiteHostLabel");
+  const consoleLinkEl = document.getElementById("spaceConsoleQuickLink");
+
+  const activeProf = getActiveSiteProfile(activeId);
+  if (badgeEl) {
+    badgeEl.innerHTML = `현재 사이트: <b>${escapeHtml(activeProf.name)}</b> · 기본 GPU: <b>${escapeHtml(activeProf.gpuModel)}</b>`;
+  }
+  if (tokenTargetNameEl) {
+    tokenTargetNameEl.textContent = `${activeProf.name} (${activeProf.gpuModel})`;
+  }
+  if (hostLabelEl) {
+    hostLabelEl.textContent = getActiveSiteHost(activeId);
+  }
+  if (consoleLinkEl) {
+    consoleLinkEl.href = `${activeProf.portalUrl || `https://space.${activeId}.sr-cloud.com`}/console/home`;
+    consoleLinkEl.textContent = `🔗 SPACE ${activeId.toUpperCase()} (${activeProf.gpuModel}) 콘솔 열기`;
+  }
+
+  if (tabsEl && Array.isArray(sites) && sites.length > 0) {
+    const sig = sites
+      .map((s) => `${s.id}:${s.id === activeId}:${s.tokenValid}:${s.hasAccessToken}:${s.activeRunsCount}:${s.runningRunsCount}:${s.enabledJobCount}:${s.totalTargetWorkers}`)
+      .join("|");
+    const html =
+      `<span style="font-size:13px; font-weight:800; color:#6ee7b7; margin-right:4px;">🌐 관리 대상 SPACE 사이트:</span>` +
+      sites
+        .map((s) => {
+          const isCurrent = s.id === activeId;
+          const tokenDot = s.tokenValid ? "🟢" : s.hasAccessToken ? "🚨만료" : "⚪미등록";
+          const workerInfo =
+            s.activeRunsCount > 0 || s.enabledJobCount > 0
+              ? ` · 워커 ${s.runningRunsCount || 0}/${s.totalTargetWorkers || 0}`
+              : "";
+          const bg = isCurrent
+            ? s.gpuModel === "A100"
+              ? "linear-gradient(135deg, #059669, #047857)"
+              : "linear-gradient(135deg, #2563eb, #1d4ed8)"
+            : "rgba(30,41,59,0.88)";
+          const border = isCurrent ? (s.gpuModel === "A100" ? "#34d399" : "#60a5fa") : "rgba(148,163,184,0.35)";
+          return `<button
+            type="button"
+            onclick="selectSpaceSite('${escapeHtml(s.id)}')"
+            style="padding:8px 14px; font-size:13px; font-weight:800; border-radius:8px; background:${bg}; border:1.5px solid ${border}; color:${isCurrent ? "#fff" : "#cbd5e1"}; box-shadow:${isCurrent ? "0 4px 12px rgba(0,0,0,0.35)" : "none"};"
+          >
+            ${s.gpuModel === "A100" ? "⚡" : "🚀"} SPACE ${escapeHtml(s.id.toUpperCase())} (${escapeHtml(s.gpuModel)})
+            <span class="mono" style="margin-left:5px; font-size:11px; padding:1px 6px; border-radius:999px; background:rgba(15,23,42,0.5); color:${s.tokenValid ? "#a7f3d0" : "#fde68a"};">
+              ${tokenDot}${workerInfo}
+            </span>
+          </button>`;
+        })
+        .join("");
+    updateHtmlIfSigChanged(tabsEl, sig, html);
+  }
+
+  if (tokenBtnsEl && Array.isArray(sites) && sites.length > 0) {
+    const btnSig = sites.map((s) => `${s.id}:${s.id === activeId}:${s.tokenValid}:${s.hasAccessToken}`).join("|");
+    const btnHtml = sites
+      .map((s) => {
+        const isCurrent = s.id === activeId;
+        const stLabel = s.tokenValid
+          ? `🟢인증됨(${Math.max(1, Math.floor((s.jwtInfo?.remainingSec || 60) / 60))}m)`
+          : s.hasAccessToken
+          ? "🚨만료됨"
+          : "⚪미설정";
+        return `<button
+          type="button"
+          class="${isCurrent ? "sm" : "secondary sm"}"
+          onclick="selectSpaceSite('${escapeHtml(s.id)}')"
+          style="padding:4px 10px; font-size:11.5px; font-weight:700; ${isCurrent ? "background:#2563eb; border-color:#60a5fa; color:#fff;" : ""}"
+        >
+          ${escapeHtml(s.id.toUpperCase())} (${escapeHtml(s.gpuModel)}) 토큰: ${stLabel}
+        </button>`;
+      })
+      .join("");
+    updateHtmlIfSigChanged(tokenBtnsEl, btnSig, btnHtml);
+  }
+}
+
 async function api(path, options = {}) {
   const headers = {
     "Content-Type": "application/json",
     "X-Admin-Password": sessionPassword,
+    "X-Site-Id": currentSiteId,
     ...(options.headers || {}),
   };
   const res = await fetch(path, {
@@ -198,6 +402,25 @@ async function loadServerState(options = {}) {
   try {
     const data = await api("/api/state");
     serverState = data;
+    if (data.sites) {
+      const rawSitesArr = Array.isArray(data.sites) ? data.sites : Object.values(data.sites);
+      if (rawSitesArr.length > 0) {
+        sitesList = rawSitesArr.map((s) => ({
+          ...s,
+          tokenValid:
+            s.tokenValid !== undefined
+              ? Boolean(s.tokenValid)
+              : Boolean(s.hasAccessToken && (!s.jwtInfo || !s.jwtInfo.expired)),
+          activeRunsCount: s.activeWorkers ?? s.activeRunsCount ?? 0,
+          runningRunsCount: s.runningWorkers ?? s.runningRunsCount ?? 0,
+          totalTargetWorkers: s.targetWorkers ?? s.totalTargetWorkers ?? 0,
+        }));
+      }
+    }
+    if (data.activeSiteId) {
+      currentSiteId = data.activeSiteId;
+    }
+    renderMultiSiteSwitcherBar(sitesList, currentSiteId);
     if (data.workerFleet) {
       latestWorkerFleet = data.workerFleet;
     }
@@ -1845,9 +2068,12 @@ function renderApprovalLoopStatus(stats, cfg = serverState?.config || {}) {
 }
 
 function renderConfig(cfg, loopStats = null) {
+  const activeProf = getActiveSiteProfile(currentSiteId);
+  const siteHost = getActiveSiteHost(currentSiteId);
+  const siteLabel = `${activeProf.id.toUpperCase()} (${activeProf.gpuModel})`;
   const activeId = document.activeElement?.id || "";
-  if (activeId !== "cfgBaseUrl") document.getElementById("cfgBaseUrl").value = cfg.baseUrl || "https://mlp.n9.sr-cloud.com";
-  if (activeId !== "cfgSfmUrl") document.getElementById("cfgSfmUrl").value = cfg.sfmUrl || "https://sfsm.n9.sr-cloud.com";
+  if (activeId !== "cfgBaseUrl") document.getElementById("cfgBaseUrl").value = cfg.baseUrl || activeProf.baseUrl || "https://mlp.n9.sr-cloud.com";
+  if (activeId !== "cfgSfmUrl") document.getElementById("cfgSfmUrl").value = cfg.sfmUrl || activeProf.sfmUrl || "https://sfsm.n9.sr-cloud.com";
   if (activeId !== "cfgAccessToken") document.getElementById("cfgAccessToken").value = cfg.accessToken || "";
   if (activeId !== "cfgRefreshToken") document.getElementById("cfgRefreshToken").value = cfg.refreshToken || "";
   if (activeId !== "cfgGroupId") document.getElementById("cfgGroupId").value = cfg.groupId || "";
@@ -1947,49 +2173,49 @@ function renderConfig(cfg, loopStats = null) {
     const userLabel = cfg.userName || cfg.resolvedUserName || cfg.jwtInfo.sub || "User";
     if (rem !== null && rem > 0) {
       jwtBadge.className = "badge ok";
-      jwtBadge.textContent = `🟢 인증됨: ${userLabel} (${mins}분 남음)`;
+      jwtBadge.textContent = `🟢 [${siteLabel}] 인증됨: ${userLabel} (${mins}분 남음)`;
       if (monTokenBar) monTokenBar.style.display = "none";
       if (card1Banner) {
         card1Banner.style.background = "rgba(16, 185, 129, 0.14)";
         card1Banner.style.borderColor = "rgba(16, 185, 129, 0.45)";
         card1Banner.style.color = "#6ee7b7";
-        card1Banner.innerHTML = `🟢 <b>SPACE 토큰 정상 인증됨</b> — 계정: <code>${escapeHtml(userLabel)}</code> · 그룹: <code>${escapeHtml(cfg.groupId || "자동")}</code> · 남은 시간: <b>${mins}분</b> ${cfg.hasRefreshToken ? "(Refresh 자동 갱신 활성)" : ""}`;
+        card1Banner.innerHTML = `🟢 <b>[${escapeHtml(siteLabel)}] SPACE 토큰 정상 인증됨</b> — 계정: <code>${escapeHtml(userLabel)}</code> · 그룹: <code>${escapeHtml(cfg.groupId || "자동")}</code> · 남은 시간: <b>${mins}분</b> ${cfg.hasRefreshToken ? "(Refresh 자동 갱신 활성)" : ""}`;
       }
     } else {
       const expiredMins = mins !== null ? Math.abs(mins) : "?";
       jwtBadge.className = "badge err";
-      jwtBadge.textContent = `🚨 토큰 만료됨 (${expiredMins}분 전 만료)`;
+      jwtBadge.textContent = `🚨 [${siteLabel}] 토큰 만료됨 (${expiredMins}분 전 만료)`;
       if (monTokenBar && monTokenText) {
         monTokenBar.style.display = "flex";
-        monTokenText.innerHTML = `🚨 <b>저장된 SPACE 인증 토큰이 만료되었습니다 (${expiredMins}분 전 만료)</b> — 우측 버튼을 눌러 설정 화면에서 새 토큰을 붙여넣어 주세요.`;
+        monTokenText.innerHTML = `🚨 <b>[${escapeHtml(siteLabel)}] 저장된 SPACE 인증 토큰이 만료되었습니다 (${expiredMins}분 전 만료)</b> — 우측 버튼을 눌러 <code>${escapeHtml(siteHost)}</code> 새 토큰을 붙여넣어 주세요.`;
       }
       if (card1Banner) {
         card1Banner.style.background = "rgba(239, 68, 68, 0.16)";
         card1Banner.style.borderColor = "rgba(239, 68, 68, 0.55)";
         card1Banner.style.color = "#fca5a5";
-        card1Banner.innerHTML = `🚨 <b>저장된 SPACE 토큰이 만료되었습니다 (${expiredMins}분 전 만료)</b> — 먼저 <code>space.n9.sr-cloud.com</code> 탭을 <b>새로고침(<code>F5</code>)하여 재로그인</b>한 뒤 아래에 새 토큰을 붙여넣어 주세요!`;
+        card1Banner.innerHTML = `🚨 <b>[${escapeHtml(siteLabel)}] 저장된 SPACE 토큰이 만료되었습니다 (${expiredMins}분 전 만료)</b> — 먼저 <code>${escapeHtml(siteHost)}</code> 탭을 <b>새로고침(<code>F5</code>)하여 재로그인</b>한 뒤 아래에 새 토큰을 붙여넣어 주세요!`;
       }
     }
   } else if (cfg.hasAccessToken) {
     jwtBadge.className = "badge ok";
-    jwtBadge.textContent = "Access Token 설정됨";
+    jwtBadge.textContent = `[${siteLabel}] Access Token 설정됨`;
     if (monTokenBar) monTokenBar.style.display = "none";
   } else {
     jwtBadge.className = "badge warn";
-    jwtBadge.textContent = "토큰 미설정";
+    jwtBadge.textContent = `[${siteLabel}] 토큰 미설정`;
     if (monTokenBar && monTokenText) {
       monTokenBar.style.display = "flex";
-      monTokenText.innerHTML = `⚠️ <b>SPACE 토큰이 아직 설정되지 않았습니다.</b> 우측 버튼을 눌러 설정 화면에서 토큰을 등록해 주세요.`;
+      monTokenText.innerHTML = `⚠️ <b>[${escapeHtml(siteLabel)}] SPACE 토큰이 아직 설정되지 않았습니다.</b> 우측 버튼을 눌러 설정 화면에서 <code>${escapeHtml(siteHost)}</code> 토큰을 등록해 주세요.`;
     }
     if (card1Banner) {
       card1Banner.style.background = "rgba(245, 158, 11, 0.14)";
       card1Banner.style.borderColor = "rgba(245, 158, 11, 0.45)";
       card1Banner.style.color = "#fde68a";
-      card1Banner.innerHTML = `⚠️ <b>SPACE 토큰이 아직 설정되지 않았습니다.</b> 아래 안내에 따라 토큰을 복사해 붙여넣어 주세요.`;
+      card1Banner.innerHTML = `⚠️ <b>[${escapeHtml(siteLabel)}] SPACE 토큰이 아직 설정되지 않았습니다.</b> <code>${escapeHtml(siteHost)}</code> 콘솔에서 토큰을 복사해 아래에 붙여넣어 주세요.`;
     }
   }
 
-  document.getElementById("groupBadge").textContent = `Group ID: ${cfg.groupId || "미설정"}`;
+  document.getElementById("groupBadge").textContent = `${activeProf.id.toUpperCase()} Group ID: ${cfg.groupId || "미설정"}`;
 
   const schedBadge = document.getElementById("schedBadge");
   if (cfg.schedulerEnabled) {
@@ -2015,9 +2241,11 @@ function renderConfig(cfg, loopStats = null) {
   }
 }
 
-async function saveConfig() {
+async function saveConfig(overrideSiteId = "") {
   try {
+    const targetSiteId = overrideSiteId || currentSiteId;
     const payload = {
+      siteId: targetSiteId,
       baseUrl: document.getElementById("cfgBaseUrl").value,
       sfmUrl: document.getElementById("cfgSfmUrl").value,
       accessToken: document.getElementById("cfgAccessToken").value,
@@ -2077,10 +2305,21 @@ async function saveConfig() {
       nextStageCommand: document.getElementById("cfgNextStageCommand")?.value || "",
       schedulerEnabled: document.getElementById("cfgSchedulerEnabled").checked,
     };
-    await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
+    const resCfg = await api("/api/config", {
+      method: "POST",
+      headers: { "X-Site-Id": targetSiteId },
+      body: JSON.stringify(payload),
+    });
+    if (resCfg.siteId && resCfg.siteId !== currentSiteId) {
+      currentSiteId = resCfg.siteId;
+      try {
+        localStorage.setItem("space_active_site_id", currentSiteId);
+      } catch {}
+    }
     applyUiRefreshInterval(payload.uiRefreshIntervalSec);
+    const savedProf = getActiveSiteProfile(currentSiteId);
     showToast(
-      `✅ 설정 저장 완료! (GPU 체크: ${payload.checkIntervalSec}초 / 승인 감시: ${payload.approvalCheckIntervalSec}초 / 부하보호: ${payload.smartLoadGuardEnabled ? `ON(동시준비 ≤${payload.maxPendingWorkers}개)` : "OFF"})`
+      `✅ [${savedProf.id.toUpperCase()} · ${savedProf.gpuModel}] 설정 저장 완료! (GPU 체크: ${payload.checkIntervalSec}초 / 승인 감시: ${payload.approvalCheckIntervalSec}초)`
     );
     await loadServerState();
     if (payload.accessToken) {
@@ -2204,8 +2443,9 @@ function copyDevtoolsExtractor() {
     inputEl.focus();
     inputEl.select();
   }
+  const siteHost = getActiveSiteHost(currentSiteId);
   const onCopied = () => {
-    showToast("📋 토큰 추출 코드가 복사되었습니다! space.n9.sr-cloud.com 콘솔(F12)에 붙여넣고 Enter를 누른 뒤, 아래 칸에 Ctrl+V 하세요.");
+    showToast(`📋 토큰 추출 코드가 복사되었습니다! ${siteHost} 콘솔(F12)에 붙여넣고 Enter를 누른 뒤, 아래 칸에 Ctrl+V 하세요.`);
   };
   // Always try synchronous execCommand('copy') first so HTTP LAN IP (10.113.125.253:4300) never loses user-gesture activation!
   const syncOk = fallbackCopyText(snippet);
@@ -2259,6 +2499,21 @@ function decodeBrowserJwt(token) {
   } catch {
     return null;
   }
+}
+
+function detectSiteIdFromBrowserToken(accPayload, refPayload, rawText = "") {
+  const combined = `${accPayload?.iss || ""} ${refPayload?.iss || ""} ${rawText}`.toLowerCase();
+  const m = combined.match(/\b(n\d+)(?:-local)?\.sr-cloud\.com/i);
+  if (m && m[1]) {
+    return m[1].toLowerCase();
+  }
+  if (combined.includes("space.n6") || combined.includes("mlp.n6") || combined.includes("keycloak.n6")) {
+    return "n6";
+  }
+  if (combined.includes("space.n9") || combined.includes("mlp.n9") || combined.includes("keycloak.n9")) {
+    return "n9";
+  }
+  return null;
 }
 
 function showTokenPasteResult(type, htmlMsg) {
@@ -2328,23 +2583,36 @@ async function applyQuickPasteJson(raw, isManualButton = false) {
     }
   }
 
+  const curHost = getActiveSiteHost(currentSiteId);
   if (!extractedAccess && !extractedRefresh) {
     // Only show error if user clicked button or finished pasting a JSON object `{...}`
     if (isManualButton || (trimmed.startsWith("{") && trimmed.endsWith("}")) || trimmed.length > 30) {
       showTokenPasteResult(
         "err",
-        `🚨 붙여넣은 내용에서 유효한 SPACE 토큰(<code>eyJ...</code>)을 찾지 못했습니다!<br/>👉 <code>space.n9.sr-cloud.com</code>에 로그인된 탭의 콘솔에서 실행했는지 확인하거나, <code>F12 → Application → Session Storage</code>에서 <code>access_token</code> 값을 복사해 붙여넣어 주세요.`
+        `🚨 붙여넣은 내용에서 유효한 SPACE 토큰(<code>eyJ...</code>)을 찾지 못했습니다!<br/>👉 <code>${escapeHtml(curHost)}</code>에 로그인된 탭의 콘솔에서 실행했는지 확인하거나, <code>F12 → Application → Session Storage</code>에서 <code>access_token</code> 값을 복사해 붙여넣어 주세요.`
       );
     }
     return;
   }
 
-  // 3. Check JWT Expiration before saving so we immediately warn if the SPACE browser tab itself had an expired token!
+  // 3. Check JWT Expiration and Auto-Detect Target Site (e.g. N6 vs N9) from JWT Issuer (`keycloak.n6-local.sr-cloud.com` vs `keycloak.n9-local.sr-cloud.com`)
   const nowSec = Math.floor(Date.now() / 1000);
   const accPayload = extractedAccess ? decodeBrowserJwt(extractedAccess) : null;
   const refPayload = extractedRefresh ? decodeBrowserJwt(extractedRefresh) : null;
   const accRemSec = accPayload?.exp ? accPayload.exp - nowSec : null;
   const refRemSec = refPayload?.exp ? refPayload.exp - nowSec : null;
+
+  const detectedSiteId = detectSiteIdFromBrowserToken(accPayload, refPayload, trimmed) || currentSiteId;
+  if (detectedSiteId !== currentSiteId) {
+    currentSiteId = detectedSiteId;
+    try {
+      localStorage.setItem("space_active_site_id", currentSiteId);
+    } catch {}
+  }
+  const targetProf = getActiveSiteProfile(detectedSiteId);
+  const targetHost = getActiveSiteHost(detectedSiteId);
+  document.getElementById("cfgBaseUrl").value = targetProf.baseUrl || `https://mlp.${detectedSiteId}.sr-cloud.com`;
+  document.getElementById("cfgSfmUrl").value = targetProf.sfmUrl || `https://sfsm.${detectedSiteId}.sr-cloud.com`;
 
   if (extractedAccess) document.getElementById("cfgAccessToken").value = extractedAccess;
   if (extractedRefresh) {
@@ -2371,12 +2639,12 @@ async function applyQuickPasteJson(raw, isManualButton = false) {
     const expiredMins = Math.abs(Math.floor(accRemSec / 60));
     showTokenPasteResult(
       "err",
-      `🚨 <b>주의: 방금 복사해 오신 토큰은 ${expiredMins}분 전에 이미 만료된 토큰입니다!</b><br/>` +
-        `원인: 열려 있는 <code>space.n9.sr-cloud.com</code> 탭이 오래전에 로그인되어 세션이 만료된 상태입니다.<br/>` +
-        `👉 <b>해결법:</b> <code>space.n9.sr-cloud.com</code> 탭에서 <b>새로고침(<code>F5</code>)하여 다시 로그인</b>한 뒤, 똑같이 복사해 붙여넣어 주세요!`
+      `🚨 <b>[${escapeHtml(targetProf.id.toUpperCase())} · ${escapeHtml(targetProf.gpuModel)}] 주의: 방금 복사해 오신 토큰은 ${expiredMins}분 전에 이미 만료된 토큰입니다!</b><br/>` +
+        `원인: 열려 있는 <code>${escapeHtml(targetHost)}</code> 탭이 오래전에 로그인되어 세션이 만료된 상태입니다.<br/>` +
+        `👉 <b>해결법:</b> <code>${escapeHtml(targetHost)}</code> 탭에서 <b>새로고침(<code>F5</code>)하여 다시 로그인</b>한 뒤, 똑같이 복사해 붙여넣어 주세요!`
     );
-    showToast(`🚨 복사하신 SPACE 탭의 토큰이 이미 만료(${expiredMins}분 전)되어 있습니다! SPACE 탭을 F5 새로고침 후 다시 복사하세요.`);
-    await saveConfig();
+    showToast(`🚨 복사하신 ${targetHost} 탭의 토큰이 이미 만료(${expiredMins}분 전)되어 있습니다! F5 새로고침 후 다시 복사하세요.`);
+    await saveConfig(detectedSiteId);
     return;
   }
 
@@ -2384,10 +2652,10 @@ async function applyQuickPasteJson(raw, isManualButton = false) {
   const validMins = accRemSec !== null && accRemSec > 0 ? Math.floor(accRemSec / 60) : Math.floor((refRemSec || 0) / 60);
   showTokenPasteResult(
     "ok",
-    `✅ <b>새 토큰 적용 완료!</b> (계정: <code>${escapeHtml(extractedUser || accPayload?.preferred_username || "감지됨")}</code> · 유효시간: <b>${validMins}분 남음</b>${extractedRefresh ? " · Refresh 토큰 포함" : ""}) — 그룹 및 GPU 풀을 자동 동기화합니다.`
+    `✅ <b>[${escapeHtml(targetProf.id.toUpperCase())} · ${escapeHtml(targetProf.gpuModel)}] 새 토큰 독립 저장 완료!</b> (계정: <code>${escapeHtml(extractedUser || accPayload?.preferred_username || "감지됨")}</code> · 유효시간: <b>${validMins}분 남음</b>${extractedRefresh ? " · Refresh 토큰 포함" : ""}) — ${escapeHtml(targetProf.name)} 그룹 및 ${escapeHtml(targetProf.gpuModel)} GPU 풀을 자동 동기화합니다.`
   );
-  showToast(`✅ 새 SPACE 토큰 적용 완료! (유효시간 ${validMins}분 남음)`);
-  await saveConfig();
+  showToast(`✅ [${targetProf.id.toUpperCase()} · ${targetProf.gpuModel}] 새 SPACE 토큰 적용 완료! (${validMins}분 남음)`);
+  await saveConfig(detectedSiteId);
   await discoverSpaceResources();
 }
 
@@ -2630,17 +2898,18 @@ function onChangeRunType(mode, silent = false) {
   }
 
   const hint = document.getElementById("runTypeHint");
+  const gpuModel = getActiveGpuModel(currentSiteId);
   if (hint) {
     if (isSpot) {
       hint.style.color = "#fbbf24";
       hint.innerHTML =
         `🟧 <b>Spot Instance 모드 (` +
-        `<code>allowSpot: true</code>)</b>: Group Pool 및 Priority 없이 클러스터 전체 Spot GPU(<code>H100</code>, <code>MI300X</code>, <code>H100 5GB~60GB fGPU</code> 등)를 직접 선택하여 실행합니다.`;
+        `<code>allowSpot: true</code>)</b>: Group Pool 및 Priority 없이 클러스터 전체 Spot GPU(<code>${escapeHtml(gpuModel)}</code>, <code>${escapeHtml(gpuModel)} fGPU</code> 등)를 직접 선택하여 실행합니다.`;
     } else {
       hint.style.color = "#93c5fd";
       hint.innerHTML =
         `🟦 <b>Standard 모드 (` +
-        `<code>allowSpot: false</code>)</b>: 내 그룹의 Group Pool(예: <code>training-pool</code>)과 Priority(<code>P3</code>)를 사용하여 정규 GPU(<code>H100</code> 등)를 할당합니다.`;
+        `<code>allowSpot: false</code>)</b>: 내 그룹의 Group Pool과 Priority(<code>P3</code>)를 사용하여 정규 GPU(<code>${escapeHtml(gpuModel)}</code> 등)를 할당합니다.`;
     }
   }
 
@@ -2728,8 +2997,13 @@ function populateCoresForPool(poolId) {
     }
   });
   if (cores.length > 0) {
-    // Prefer a GPU core (e.g. H100) over CPU by default
-    const preferredGpuCore = cores.find((c) => !/^cpu$/i.test(String(c.name ?? c.coreName ?? "").trim())) || cores[0];
+    // Prefer the active site's primary GPU core (e.g. A100 on N6, H100 on N9) over CPU by default
+    const siteGpu = getActiveGpuModel(currentSiteId).toLowerCase();
+    const preferredGpuCore =
+      cores.find((c) => String(c.name ?? c.coreName ?? "").trim().toLowerCase() === siteGpu) ||
+      cores.find((c) => String(c.name ?? c.coreName ?? "").toLowerCase().includes(siteGpu)) ||
+      cores.find((c) => !/^cpu$/i.test(String(c.name ?? c.coreName ?? "").trim())) ||
+      cores[0];
     const defaultCoreId = preferredGpuCore.id ?? preferredGpuCore.coreId;
     const coreInput = document.getElementById("jobCoreId");
     const matchesCurrent = cores.some((c) => String(c.id ?? c.coreId) === String(coreInput.value));
@@ -3423,7 +3697,7 @@ async function loadApprovals() {
         runId: rId,
         runName: tl.runName || `Run #${rId}`,
         user: `${tl.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동신청"} · ${tl.approvedBy || "minsoo3.kim"}`,
-        resourceText: `H100 GPU×${tl.coreCount || 4}`,
+        resourceText: `${getActiveGpuModel(currentSiteId)} GPU×${tl.coreCount || 4}`,
         requestTimeText: reqIso ? `⚡ ${formatPreciseTime(reqIso, true)} (${formatRelativeAgo(reqIso)})` : "-",
         stageLabel: "✅ APPROVED",
         isPending: false,

@@ -47,6 +47,43 @@
   </header>
 
   <div class="container">
+    <!-- 🌐 멀티 사이트(SPACE N9 H100 / SPACE N6 A100 / 추가 사이트) 통합 전환 & 사이트별 토큰/워커 현황 바 -->
+    <div
+      id="multiSiteSwitcherBar"
+      style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px; padding:10px 14px; border-radius:12px; background:linear-gradient(135deg, rgba(15,23,42,0.96), rgba(30,41,59,0.92)); border:2px solid rgba(16,185,129,0.55); box-shadow:0 6px 20px rgba(0,0,0,0.38);"
+    >
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;" id="multiSiteTabsContainer">
+        <span style="font-size:13px; font-weight:800; color:#6ee7b7; margin-right:4px;">🌐 관리 사이트 선택:</span>
+        <button
+          type="button"
+          onclick="selectSpaceSite('n9')"
+          style="padding:8px 14px; font-size:13.5px; font-weight:800; border-radius:8px; background:linear-gradient(135deg, #2563eb, #1d4ed8); border:1.5px solid #60a5fa; color:#fff;"
+        >
+          🚀 SPACE N9 (H100)
+        </button>
+        <button
+          type="button"
+          onclick="selectSpaceSite('n6')"
+          style="padding:8px 14px; font-size:13.5px; font-weight:800; border-radius:8px; background:rgba(30,41,59,0.85); border:1.5px solid rgba(148,163,184,0.35); color:#cbd5e1;"
+        >
+          ⚡ SPACE N6 (A100)
+        </button>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span id="activeSiteSummaryBadge" class="mono" style="font-size:12px; padding:4px 10px; border-radius:999px; background:rgba(59,130,246,0.18); border:1px solid rgba(96,165,250,0.45); color:#bfdbfe; font-weight:700;">
+          현재 사이트: SPACE N9 (H100)
+        </span>
+        <button
+          type="button"
+          class="secondary sm"
+          onclick="promptAddCustomSite()"
+          style="padding:6px 11px; font-size:12px; font-weight:700; border-color:rgba(16,185,129,0.5); color:#6ee7b7;"
+        >
+          ➕ 관리 사이트 추가 (N6/N9 외 확장)
+        </button>
+      </div>
+    </div>
+
     <!-- 🧭 메인 화면 2분할 탭 내비게이션 바: [실시간 러닝 & 모니터링] vs [규칙 생성 & 연동 설정] 완벽 분리 -->
     <div
       id="mainViewNavBar"
@@ -291,10 +328,22 @@
       <!-- Card 1: Connection, Admin Run-Approval & Polling Interval Config -->
       <div class="card">
         <div class="card-header">
-          <h2>1️⃣ SPACE 연동 인증 &amp; 기본 스케줄러 설정</h2>
+          <h2 id="card1AuthTitle">1️⃣ SPACE 연동 인증 (사이트별 독립 토큰 관리) &amp; 스케줄러 설정</h2>
           <div class="btn-row">
             <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()">📋 1. 추출 코드 복사</button>
             <button type="button" class="sm" onclick="saveConfig()">💾 설정 저장</button>
+          </div>
+        </div>
+
+        <!-- 사이트별 독립 토큰 대상 선택 & 전체 사이트 토큰 요약 바 -->
+        <div id="tokenTargetSiteBar" style="margin-bottom:8px; padding:8px 10px; border-radius:8px; background:rgba(15,23,42,0.8); border:1px solid rgba(56,189,248,0.4); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <div style="font-size:12px; color:#bae6fd; font-weight:700;">
+            🎯 토큰 관리 대상 사이트: <b id="tokenTargetSiteName">SPACE N9 (H100)</b>
+            <span style="color:#94a3b8; font-weight:400; font-size:11px; margin-left:4px;">(N9·N6 토큰이 각각 별도로 저장되며, 붙여넣기 시 자동 구분됩니다)</span>
+          </div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap;" id="tokenSiteQuickButtons">
+            <button type="button" class="secondary sm" onclick="selectSpaceSite('n9')" style="padding:4px 9px; font-size:11.5px;">N9 (H100) 토큰 설정</button>
+            <button type="button" class="secondary sm" onclick="selectSpaceSite('n6')" style="padding:4px 9px; font-size:11.5px;">N6 (A100) 토큰 설정</button>
           </div>
         </div>
 
@@ -305,10 +354,15 @@
 
         <div class="hint" style="margin-bottom:10px; background:rgba(59,130,246,0.1); border:1px solid rgba(59,130,246,0.35); border-radius:8px; padding:10px;">
           <div style="font-size:12px; color:#e2e8f0; line-height:1.5;">
-            💡 <b>토큰 연동 방법 (아래 3가지 중 편한 방법 아무거나 사용 가능!):</b><br/>
-            ① <b>[주의]</b> 먼저 <code>space.n9.sr-cloud.com</code> 탭을 <b>새로고침(<code>F5</code>)하여 로그인 상태가 살아있는지 확인</b>하세요.<br/>
+            💡 <b>토큰 연동 방법 (N9 H100 / N6 A100 모두 동일 · 아래 3가지 중 편한 방법 사용!):</b>
+            <span style="margin-left:6px;">
+              <a id="spaceConsoleQuickLink" href="https://space.n9.sr-cloud.com/console/home" target="_blank" style="color:#38bdf8; font-weight:800; text-decoration:underline;">🔗 SPACE N9 콘솔 열기</a>
+              &nbsp;|&nbsp;
+              <a id="spaceN6ConsoleQuickLink" href="https://space.n6.sr-cloud.com/console/home" target="_blank" style="color:#a7f3d0; font-weight:800; text-decoration:underline;">🔗 SPACE N6 (A100) 콘솔 열기</a>
+            </span><br/>
+            ① <b>[주의]</b> 먼저 <code id="authSiteHostLabel">space.n9.sr-cloud.com</code> (또는 <code>space.n6.sr-cloud.com</code>) 탭을 <b>새로고침(<code>F5</code>)하여 로그인 상태가 살아있는지 확인</b>하세요.<br/>
             ② <code>F12</code> → <b>Console(콘솔)</b> 탭에서 아래 코드를 붙여넣고 <code>Enter</code> (또는 직접 <b style="color:#38bdf8;"><code>copy(sessionStorage)</code></b> 타이핑 후 <code>Enter</code>)<br/>
-            <span style="color:#94a3b8; font-size:11px;">※ 콘솔 붙여넣기가 막혀 있으면 <code>F12</code> → <b>Application</b> → <b>Session Storage</b>에서 <code>access_token</code> 값(<code>eyJ...</code>)을 더블클릭 복사해도 됩니다!</span>
+            <span style="color:#94a3b8; font-size:11px;">※ 콘솔 붙여넣기가 막혀 있으면 <code>F12</code> → <b>Application</b> → <b>Session Storage</b>에서 <code>access_token</code> 값(<code>eyJ...</code>)을 더블클릭 복사해도 됩니다! (N6 토큰을 붙여넣으면 자동으로 N6 프로필에 저장됩니다)</span>
           </div>
           <div style="display:flex; gap:6px; margin-top:6px; align-items:center;">
             <input type="text" id="devtoolsSnippetInput" readonly value='copy(JSON.stringify({accessToken:sessionStorage.access_token||localStorage.access_token,refreshToken:sessionStorage.refresh_token||localStorage.refresh_token,groupId:localStorage.group_id||sessionStorage.group_id}))' class="mono" onclick="this.select(); copyDevtoolsExtractor();" style="flex:1; font-size:11px; padding:5px 8px; background:rgba(2,6,23,0.85); color:#38bdf8; border:1px solid rgba(56,189,248,0.4); cursor:pointer;" title="클릭하면 전체 선택 및 복사됩니다" />
@@ -762,6 +816,6 @@
   </div> <!-- /.container -->
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=17"></script>
+  <script src="/app.js?v=18"></script>
 </body>
 </html>
