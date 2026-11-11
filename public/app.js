@@ -1682,7 +1682,11 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
           ${
-            remainingCnt > 0
+            remainingCnt > 0 && targetPendingCnt > 0
+              ? `부족한 Pending <b>+${remainingCnt}개</b> 일괄 연속 보충 · Running 전환 시 즉시 보충 (주기 점검: <b>${
+                  intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분(${intervalSec}초)` : `${intervalSec}초`
+                }</b>)`
+              : remainingCnt > 0
               ? `<b>${
                   intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분(${intervalSec}초)` : `${intervalSec}초`
                 }</b>마다 1개씩 자동 생성 · 약 <b>${Math.ceil((remainingCnt * intervalSec) / 60)}분</b> 내 전부 생성`
@@ -1706,8 +1710,8 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           <button type="button" class="secondary sm" style="padding:2px 6px; ${
             targetPendingCnt === 0 ? "background:#475569; border-color:#94a3b8; color:#fff;" : ""
           }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 0)" title="0으로 설정 시 전체 목표 워커 수 기준으로 자동 운영">해제(0)</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', ${Math.max(0, targetPendingCnt - 1)})">-1</button>
-          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', ${targetPendingCnt + 1})">+1</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', { delta: -1 })">-1</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', { delta: 1 })">+1</button>
           <button type="button" class="secondary sm" style="padding:2px 6px; ${
             targetPendingCnt === 2 ? "background:#d97706; border-color:#fbbf24; color:#fff;" : ""
           }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 2)">2</button>
@@ -1726,7 +1730,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         <div style="font-size:11px; color:#cbd5e1; margin-top:3px;">
           ${
             targetPendingCnt > 0
-              ? `현재 Pending <b style="color:#fde68a;">${pendingCnt}개</b> / 목표 <b style="color:#fbbf24;">${targetPendingCnt}개</b> (Running 진입 시 자동 보충)`
+              ? `현재 Pending <b style="color:#fde68a;">${pendingCnt}개</b> / 목표 <b style="color:#fbbf24;">${targetPendingCnt}개</b> (Running 진입 시 즉시 보충)`
               : `1 이상 입력 시 해당 개수만큼 Pending 대기열을 항상 유지합니다`
           }
         </div>
@@ -1736,8 +1740,8 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         <div style="font-size:11.5px; color:#94a3b8;">🎯 유지할 목표 총 워커 수 (빠른 변경)</div>
         <div style="display:flex; align-items:center; gap:5px; margin-top:4px; flex-wrap:wrap;">
           <span class="mono" style="font-size:20px; font-weight:800; color:#60a5fa; margin-right:4px;">${targetCnt}개</span>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${Math.max(1, targetCnt - 4)})">-4</button>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${targetCnt + 4})">+4</button>
+          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: -4 })">-4</button>
+          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: 4 })">+4</button>
           <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 48)">48</button>
           <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 56)">56</button>
           <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" style="width:64px; padding:3px 6px; font-size:12.5px;" />
@@ -2007,12 +2011,13 @@ function updateWorkerCountdownBadge() {
     remainSec = Math.max(0, Math.ceil((new Date(jf.nextSpawnAt).getTime() - now) / 1000));
   }
   const nextSlotNum = (jf.activeCount || 0) + 1;
-  const totalEstSec = remainSec + Math.max(0, remainingCnt - 1) * (jf.scaleUpIntervalSec || 15);
+  const perWorkerGapSec = targetPendingCnt > 0 ? 2 : jf.scaleUpIntervalSec || 15;
+  const totalEstSec = remainSec + Math.max(0, remainingCnt - 1) * perWorkerGapSec;
   const mins = Math.floor(totalEstSec / 60);
   const secs = totalEstSec % 60;
   const targetDesc =
     targetPendingCnt > 0
-      ? `남은 Pending 보충 <b>+${remainingCnt}개</b> (목표 Pending ${targetPendingCnt}개)`
+      ? `남은 Pending 보충 <b>+${remainingCnt}개</b> (목표 Pending ${targetPendingCnt}개 일괄 채움)`
       : `남은 <b>+${remainingCnt}개</b> 전체 자동 신청`;
   const msgHtml =
     remainSec > 0
@@ -2022,8 +2027,22 @@ function updateWorkerCountdownBadge() {
   if (topAllocEl) topAllocEl.innerHTML = msgHtml;
 }
 
-async function quickUpdateTargetWorkers(jobId, newTarget) {
-  const target = Math.max(1, Math.min(9999, Number(newTarget || 1)));
+async function quickUpdateTargetWorkers(jobId, valueOrOpts) {
+  const jf = (latestWorkerFleet?.jobs || []).find((j) => j.jobId === jobId) || latestWorkerFleet?.jobs?.[0] || null;
+  const quickInputEl = document.getElementById("quickTargetInput");
+  const baseVal = Number(quickInputEl?.value ?? jf?.targetCount ?? 1);
+  const rawTarget =
+    typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
+      ? baseVal + Number(valueOrOpts.delta || 0)
+      : Number(valueOrOpts || 1);
+  const target = Math.max(1, Math.min(9999, rawTarget));
+  if (quickInputEl) quickInputEl.value = target;
+  const minInput = document.getElementById("jobMinConcurrent");
+  if (minInput) minInput.value = target;
+  if (jf) {
+    jf.targetCount = target;
+    renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  }
   try {
     const res = await api("/api/jobs/target", {
       method: "POST",
@@ -2032,11 +2051,9 @@ async function quickUpdateTargetWorkers(jobId, newTarget) {
         minConcurrentRuns: target,
       }),
     });
-    const minInput = document.getElementById("jobMinConcurrent");
-    if (minInput) minInput.value = target;
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
-      renderWorkerFleetBoard(latestWorkerFleet);
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
     }
     showToast(`🎯 목표 워커 수가 ${target}개로 변경되었습니다!`);
     await loadServerState();
@@ -2045,8 +2062,23 @@ async function quickUpdateTargetWorkers(jobId, newTarget) {
   }
 }
 
-async function quickUpdateTargetPending(jobId, newTargetPending) {
-  const targetPending = Math.max(0, Math.min(9999, Number(newTargetPending ?? 0)));
+async function quickUpdateTargetPending(jobId, valueOrOpts) {
+  const jf = (latestWorkerFleet?.jobs || []).find((j) => j.jobId === jobId) || latestWorkerFleet?.jobs?.[0] || null;
+  const quickInputEl = document.getElementById("quickTargetPendingInput");
+  const baseVal = Number(quickInputEl?.value ?? jf?.targetPendingCount ?? 0);
+  const rawTargetPending =
+    typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
+      ? baseVal + Number(valueOrOpts.delta || 0)
+      : Number(valueOrOpts ?? 0);
+  const targetPending = Math.max(0, Math.min(9999, rawTargetPending));
+  if (quickInputEl) quickInputEl.value = targetPending;
+  const pendInput = document.getElementById("jobTargetPending");
+  if (pendInput) pendInput.value = targetPending;
+  if (jf) {
+    jf.targetPendingCount = targetPending;
+    jf.remainingToSpawn = targetPending > 0 ? Math.max(0, targetPending - (jf.pendingCount || 0)) : Math.max(0, (jf.targetCount || 1) - (jf.activeCount || 0));
+    renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  }
   try {
     const res = await api("/api/jobs/target", {
       method: "POST",
@@ -2055,17 +2087,13 @@ async function quickUpdateTargetPending(jobId, newTargetPending) {
         targetPendingRuns: targetPending,
       }),
     });
-    const pendInput = document.getElementById("jobTargetPending");
-    if (pendInput) pendInput.value = targetPending;
-    const quickInput = document.getElementById("quickTargetPendingInput");
-    if (quickInput) quickInput.value = targetPending;
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
-      renderWorkerFleetBoard(latestWorkerFleet);
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
     }
     showToast(
       targetPending > 0
-        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (Pending < ${targetPending}개일 때 자동 보충)`
+        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (부족 시 즉시 ${targetPending}개까지 일괄 보충)`
         : `⏳ 목표 Pending 대기 개수 지정이 해제(0)되었습니다! (전체 목표 워커 수 기준으로 자동 운영)`
     );
     await loadServerState();

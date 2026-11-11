@@ -1579,7 +1579,7 @@ function mergeWithRecentlyCreatedRuns(apiRuns = []) {
     }
   }
   for (const [k, entry] of rt.recentlyCreatedRunsMap.entries()) {
-    const exp = entry?.expiresAtMs || (entry?.createdAtMs ? entry.createdAtMs + 20_000 : 0);
+    const exp = entry?.expiresAtMs || (entry?.createdAtMs ? entry.createdAtMs + 35_000 : 0);
     if (!entry || exp <= now || rt.recentlyTerminatedRunsMap.has(k)) {
       rt.recentlyCreatedRunsMap.delete(k);
     }
@@ -3344,15 +3344,40 @@ function computeServerLoadStatus(allRuns = getSiteKnownRuns()) {
   let oldestRecentPendingWorkerName = null;
 
   for (const r of nonRunningActiveRuns) {
-    const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
-    const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
-    const waitSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
-    const rName = r.containerName || r.name || `#${r.id || r.runId}`;
-    if (waitSec >= oldestPendingWaitSec) {
+    const rId = String(r.id ?? r.runId ?? "");
+    const rName = r.containerName || r.name || `#${rId}`;
+    const matchedApproval = rId ? lastKnownApprovalsMap.get(rId) : null;
+    const timeBasis =
+      r.startTime ||
+      r.registerTime ||
+      r.createdAt ||
+      r.createTime ||
+      matchedApproval?.requestedAt ||
+      matchedApproval?.createdAt ||
+      null;
+    let startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
+    if ((!startMs || Number.isNaN(startMs)) && typeof rName === "string") {
+      // Fallback: parse `-MMdd-HH-mm-ss` KST suffix from containerName (e.g. `v8-s06-1111-19-44-10`)
+      const mTs = rName.match(/-(\d{2})(\d{2})-(\d{2})-(\d{2})-(\d{2})(?:-\d+)?$/);
+      if (mTs) {
+        const kstNow = new Date(now + 9 * 3600 * 1000);
+        const year = kstNow.getUTCFullYear();
+        const utcMs =
+          Date.UTC(year, Number(mTs[1]) - 1, Number(mTs[2]), Number(mTs[3]), Number(mTs[4]), Number(mTs[5])) -
+          9 * 3600 * 1000;
+        if (!Number.isNaN(utcMs) && utcMs <= now + 60000) {
+          startMs = utcMs;
+        }
+      }
+    }
+    const isOurRuleRun = (state.jobs || []).some((j) => j && j.enabled && doesRunMatchJob(r, j, state.jobs));
+    // If creation timestamp is unknown (`startMs === 0`), treat as an older queue run (`waitSec = 999`) so it never falsely triggers `waitSec <= 90` congestion holds!
+    const waitSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 999;
+    if (waitSec < 999 && waitSec >= oldestPendingWaitSec) {
       oldestPendingWaitSec = waitSec;
       oldestPendingWorkerName = rName;
     }
-    if (waitSec <= 90) {
+    if (isOurRuleRun && waitSec <= 90) {
       recentInFlightPendingRuns.push(r);
       if (waitSec >= oldestRecentPendingWaitSec) {
         oldestRecentPendingWaitSec = waitSec;
@@ -3415,8 +3440,8 @@ function computeServerLoadStatus(allRuns = getSiteKnownRuns()) {
     reasons.push(`SPACE API 응답 다소 느림 (최근 ${lastLat}ms · 평균 ${avgLat}ms) → 생성 간격 1.4x 완만 조절`);
   }
 
-  // In-flight Pending/Creating worker congestion check (ONLY for recently created workers <= 90s)
-  if (recentInFlightPendingRuns.length >= maxPendingWorkers) {
+  // In-flight Pending/Creating worker congestion check (ONLY when `maxJobTargetPending === 0` and recently created workers <= 90s exceed cap)
+  if (maxJobTargetPending === 0 && recentInFlightPendingRuns.length >= maxPendingWorkers) {
     if (loadLevel === "GREEN" || loadLevel === "YELLOW") {
       loadLevel = "YELLOW";
       loadBadgeText = `🟡 최근 생성 워커 ${recentInFlightPendingRuns.length}/${maxPendingWorkers}개 준비중 · 순차 보호`;
@@ -3629,11 +3654,21 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     let nextSpawnInSec = null;
     if (job.enabled && state.config.schedulerEnabled && remainingToCreate > 0) {
       const lastTriggerMs = job.lastTriggeredAt ? new Date(job.lastTriggeredAt).getTime() : 0;
-      const nextByCooldownMs = lastTriggerMs ? lastTriggerMs + effectiveCooldownSec * 1000 : now;
+      const retryBatchMs =
+        targetPendingCount > 0 && job._incompletePendingBatchRetryAtMs && job._incompletePendingBatchRetryAtMs > now
+          ? job._incompletePendingBatchRetryAtMs
+          : 0;
+      const nextByCooldownMs = job._pendingRefillImmediate
+        ? now
+        : retryBatchMs > 0
+        ? retryBatchMs
+        : lastTriggerMs
+        ? lastTriggerMs + effectiveCooldownSec * 1000
+        : now;
       const loopCheckSec = Math.min(4, effectiveTickSec);
       const nextBySchedMs = rt.lastSchedulerTickTime ? rt.lastSchedulerTickTime + loopCheckSec * 1000 : now;
       const backoffMs = loadStatus.api.backoffRemainingSec > 0 ? now + loadStatus.api.backoffRemainingSec * 1000 : now;
-      const holdExtraMs = loadStatus.holdCreation ? Math.max(nextBySchedMs, now + 5000) : now;
+      const holdExtraMs = targetPendingCount === 0 && loadStatus.holdCreation ? Math.max(nextBySchedMs, now + 5000) : now;
       const nextSpawnMs = Math.max(now, nextByCooldownMs, nextBySchedMs, backoffMs, holdExtraMs);
       nextSpawnAt = new Date(nextSpawnMs).toISOString();
       nextSpawnInSec = Math.max(0, Math.ceil((nextSpawnMs - now) / 1000));
@@ -3779,7 +3814,8 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       pacedCooldownSec,
       nextSpawnAt,
       nextSpawnInSec,
-      estimatedFullScaleSec: remainingToCreate * scaleUpIntervalSec,
+      estimatedFullScaleSec:
+        targetPendingCount > 0 ? (nextSpawnInSec || 0) + remainingToCreate * 2 : remainingToCreate * scaleUpIntervalSec,
       activeWorkers,
     };
   });
@@ -3999,8 +4035,9 @@ async function checkPoolGpuAvailable(groupPoolId, coreId, requiredCount) {
 
 let isTickRunning = false;
 
-async function evaluateJobRule(job, allRuns, forceTrigger = false) {
+async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {}) {
   const now = Date.now();
+  const bypassCooldown = Boolean(options.bypassCooldown);
   job.lastCheckAt = new Date(now).toISOString();
 
   const prefix = getJobContainerPrefix(job);
@@ -4045,7 +4082,11 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       if (runDurSec <= rapidSecLimit && now - endMs < 180000) {
         badNodeStats.rapidFailCount += 1;
         badNodeStats.consecutiveRapidFails += 1;
-        badNodeStats.cooldownUntilMs = Math.max(badNodeStats.cooldownUntilMs, now + cooldownSec * 1000);
+        // Base cooldown on the actual failure timestamp (`endMs + cooldownSec * 1000`) so old failures discovered on a 3m/10m tick don't block the tick!
+        const candidateCooldownUntilMs = (fr.endTime ? endMs : now) + cooldownSec * 1000;
+        if (candidateCooldownUntilMs > now) {
+          badNodeStats.cooldownUntilMs = Math.max(badNodeStats.cooldownUntilMs, candidateCooldownUntilMs);
+        }
         badNodeStats.lastBadRunId = fId;
         badNodeStats.lastBadRunName = fr.containerName || fr.name || `#${fId}`;
         badNodeStats.lastReason = `시작 ${runDurSec}초 만에 조기 실패(Rapid-Fail <= ${rapidSecLimit}초)`;
@@ -4111,14 +4152,6 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
         ? Math.max(0, targetPending - effectivePendingCount)
         : Math.max(0, minConcurrent - effectiveActiveCount);
 
-    // Batch 2 - Feature 6: Enforce Bad-Node Cooldown before spawning replacement workers
-    if (state.config.badNodeGuardEnabled !== false && badNodeStats.cooldownUntilMs > now) {
-      const remainBadSec = Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000);
-      job.lastStatus = `🩺 [불량 노드 회피 쿨다운] 직전 워커(${badNodeStats.lastBadRunName || "-"}) ${badNodeStats.lastReason || "조기 실패"} → 동일 노드 재당첨 방지를 위해 ${remainBadSec}초 후 +${currentDeficit}개 안전 재배치`;
-      saveState();
-      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
-    }
-
     if (targetPending > 0 ? effectivePendingCount >= targetPending : effectiveActiveCount >= minConcurrent) {
       if (targetPending > 0) {
         const excessPending = Math.max(0, pendingJobRuns.length - targetPending);
@@ -4158,6 +4191,14 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       job._lastNotifiedTarget = null;
     }
 
+    // Batch 2 - Feature 6: Enforce Bad-Node Cooldown only when `targetPending === 0` (when `targetPending > 0`, workers queue in Pending first and must not be blocked from maintaining the target Pending queue count)
+    if (targetPending === 0 && state.config.badNodeGuardEnabled !== false && badNodeStats.cooldownUntilMs > now) {
+      const remainBadSec = Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000);
+      job.lastStatus = `🩺 [불량 노드 회피 쿨다운] 직전 워커(${badNodeStats.lastBadRunName || "-"}) ${badNodeStats.lastReason || "조기 실패"} → 동일 노드 재당첨 방지를 위해 ${remainBadSec}초 후 +${currentDeficit}개 안전 재배치`;
+      saveState();
+      return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
+    }
+
     // 🛡️ Smart Load-Safe Guard #1: API Backoff / Rate-Limit Cooldown
     if (loadStatus.enabled && loadStatus.api.backoffRemainingSec > 0) {
       loadMonitorStats.throttleCount += 1;
@@ -4168,29 +4209,32 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
       return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
     }
 
-    // 🛡️ Smart Load-Safe Guard #2: In-Flight Pending / Creating Worker Congestion Protection (ONLY for recent creations <= 90s)
-    const effectiveMaxPending = targetPending > 0 ? Math.max(loadStatus.maxPendingWorkers, targetPending) : loadStatus.maxPendingWorkers;
-    if (loadStatus.enabled && loadStatus.inFlightPendingCount >= effectiveMaxPending) {
+    // 🛡️ Smart Load-Safe Guard #2: In-Flight Pending / Creating Worker Congestion Protection (ONLY when `targetPending === 0`; when `targetPending > 0`, `targetPending` itself is the explicit Pending queue target!)
+    if (targetPending === 0 && loadStatus.enabled && loadStatus.inFlightPendingCount >= loadStatus.maxPendingWorkers) {
       const pendingNames = pendingJobRuns
         .slice(0, 3)
         .map((r) => `${r.containerName || r.name || `#${r.id || r.runId}`}(${r.status || r.state})`)
         .join(", ");
       loadMonitorStats.throttleCount = (loadMonitorStats.throttleCount || 0) + 1;
       loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
-      loadMonitorStats.lastThrottleReason = `최근 준비중 워커 ${loadStatus.inFlightPendingCount}/${effectiveMaxPending}개 상한 도달`;
-      job.lastStatus = `🛡️ [서버 부하 보호 · 순차 할당] 최근 생성되어 준비 중인 워커 ${loadStatus.inFlightPendingCount}/${effectiveMaxPending}개 (${pendingNames || "승인/컨테이너 준비중"}) → Running 진입 또는 90초 경과 시 +${currentDeficit}개 이어서 자동 할당`;
+      loadMonitorStats.lastThrottleReason = `최근 준비중 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 상한 도달`;
+      job.lastStatus = `🛡️ [서버 부하 보호 · 순차 할당] 최근 생성되어 준비 중인 워커 ${loadStatus.inFlightPendingCount}/${loadStatus.maxPendingWorkers}개 (${pendingNames || "승인/컨테이너 준비중"}) → Running 진입 또는 90초 경과 시 +${currentDeficit}개 이어서 자동 할당`;
       saveState();
       return { triggered: false, reason: job.lastStatus, loadThrottled: true, loadMonitor: loadStatus };
     }
 
-    // Respect user-configured worker creation interval (`job.cooldownSec` / `state.config.checkIntervalSec`), dynamically stretched when SPACE API latency is elevated
+    // Respect user-configured worker creation interval (`job.cooldownSec` / `state.config.checkIntervalSec`), unless bypassed during a `targetPendingRuns` refill pass
     const baseCooldownSec = Math.max(1, Number(job.cooldownSec || state.config.checkIntervalSec || 15));
     const effectiveCooldownSec = loadStatus.enabled
       ? Math.max(baseCooldownSec, Math.ceil(baseCooldownSec * loadStatus.pacingMultiplier) + loadStatus.extraDelaySec)
       : baseCooldownSec;
     const cooldownMs = effectiveCooldownSec * 1000;
     // Allow 1.5s jitter margin so API latency during `createRun` never causes the next scheduled tick to be skipped
-    if (job.lastTriggeredAt && now - new Date(job.lastTriggeredAt).getTime() < Math.max(500, cooldownMs - 1500)) {
+    if (
+      !bypassCooldown &&
+      job.lastTriggeredAt &&
+      now - new Date(job.lastTriggeredAt).getTime() < Math.max(500, cooldownMs - 1500)
+    ) {
       const remainWaitSec = Math.max(1, Math.ceil((cooldownMs - (now - new Date(job.lastTriggeredAt).getTime())) / 1000));
       const paceNote =
         loadStatus.enabled && effectiveCooldownSec > baseCooldownSec
@@ -4198,7 +4242,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
           : "";
       job.lastStatus =
         targetPending > 0
-          ? `⏳ 목표 Pending ${targetPending}개 맞춤 증설 중 (⏳ 현재 Pending ${pendingJobRuns.length}/${targetPending}개 · 🟢 Running ${runningRuns.length}개 · +${currentDeficit}개 추가 예정 · ${remainWaitSec}초 후 다음 워커 생성${paceNote})`
+          ? `⏳ 목표 Pending ${targetPending}개 맞춤 대기 중 (⏳ 현재 Pending ${pendingJobRuns.length}/${targetPending}개 · 🟢 Running ${runningRuns.length}개 · +${currentDeficit}개 일괄 보충 예정 · ${remainWaitSec}초 후 또는 Running 전환 시 즉시 보충${paceNote})`
           : `⏳ 워커 안전 페이싱 증설 중 (🟢 가동 ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}/${minConcurrent}개 · +${currentDeficit}개 추가 예정 · ${remainWaitSec}초 후 다음 워커 생성${paceNote})`;
       saveState();
       return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
@@ -4412,7 +4456,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false) {
 /**
  * Periodic Workload / GPU Scheduler Loop
  */
-async function runSchedulerTick(manual = false) {
+async function runSchedulerTick(manual = false, options = {}) {
   const rt = getSiteRuntime();
   if (rt.isTickRunning) return { skipped: true, reason: "Already running tick" };
   if (!manual && !state.config.schedulerEnabled) return { skipped: true, reason: "Scheduler disabled" };
@@ -4476,8 +4520,110 @@ async function runSchedulerTick(manual = false) {
       // so log scanning latency can never make `allRuns` stale or cause over-spawning!
       for (const job of enabledJobs) {
         try {
-          const res = await evaluateJobRule(job, allRuns, false);
-          results.push({ jobId: job.id, name: job.name, ...res });
+          const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
+          if (targetPending > 0) {
+            // Check if any previously-Pending worker transitioned into Running since our last check
+            const matchingActivePre = allRuns.filter(
+              (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
+            );
+            const matchingRunningPre = matchingActivePre.filter((r) =>
+              String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+            );
+            const matchingPendingPre = matchingActivePre.filter(
+              (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+            );
+            const prevPendingIds = Array.isArray(job._knownPendingRunIds) ? job._knownPendingRunIds : [];
+            const currentRunningIdSet = new Set(matchingRunningPre.map((r) => String(r.id ?? r.runId ?? "")));
+            const promotedToRunningIds = prevPendingIds.filter((id) => id && currentRunningIdSet.has(String(id)));
+            const immediateRefillRequested = Boolean(job._pendingRefillImmediate);
+
+            if (promotedToRunningIds.length > 0 && matchingPendingPre.length < targetPending) {
+              addLog(
+                "info",
+                `⚡ [${job.name}] Pending 워커(${promotedToRunningIds.map((id) => `#${id}`).join(", ")}) Running 진입 감지 — 즉시 Pending 대기 목표(${matchingPendingPre.length}/${targetPending}개) 자동 보충!`
+              );
+            }
+
+            const shouldBypassCooldown =
+              manual || Boolean(options?.bypassCooldown) || promotedToRunningIds.length > 0 || immediateRefillRequested;
+            job._pendingRefillImmediate = false;
+
+            // Multi-spawn loop in a single tick when `targetPendingRuns > 0`:
+            // Keep spawning missing Pending workers until `pendingCount >= targetPending` (with 1s spacing)
+            // instead of spawning only 1 worker per 3~10 minute cooldown tick!
+            const maxRefillSteps = Math.min(20, Math.max(targetPending + 4, 6));
+            let lastRes = null;
+            let spawnedInPass = 0;
+            let throttledInPass = false;
+            for (let step = 0; step < maxRefillSteps; step++) {
+              if (step > 0) {
+                await sleep(1000);
+                allRuns = getSiteKnownRuns();
+              }
+              const res = await evaluateJobRule(job, allRuns, false, {
+                bypassCooldown: shouldBypassCooldown || spawnedInPass > 0,
+              });
+              lastRes = res;
+              if (res?.triggered) {
+                spawnedInPass++;
+                allRuns = getSiteKnownRuns();
+                const postActive = allRuns.filter(
+                  (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
+                );
+                const postPending = postActive.filter(
+                  (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+                );
+                if (postPending.length >= targetPending) {
+                  // Verify against fresh API state in case an earlier Pending worker already transitioned to Running/Failed during this burst
+                  allRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
+                  const verifiedActive = allRuns.filter(
+                    (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
+                  );
+                  const verifiedPending = verifiedActive.filter(
+                    (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+                  );
+                  if (verifiedPending.length >= targetPending) {
+                    break;
+                  }
+                }
+                continue;
+              }
+              if (res?.throttled) {
+                throttledInPass = true;
+              }
+              break;
+            }
+
+            if (spawnedInPass > 0) {
+              allRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
+            }
+            const finalActive = allRuns.filter(
+              (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
+            );
+            const finalPending = finalActive.filter(
+              (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+            );
+            job._knownPendingRunIds = finalPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
+            if (finalPending.length < targetPending && (spawnedInPass > 0 || throttledInPass)) {
+              job._incompletePendingBatchRetryAtMs = Date.now() + 15 * 1000;
+            } else {
+              job._incompletePendingBatchRetryAtMs = 0;
+            }
+            results.push({
+              jobId: job.id,
+              name: job.name,
+              ...(lastRes || { triggered: false }),
+              triggered: spawnedInPass > 0 || Boolean(lastRes?.triggered),
+              spawnedInPass,
+            });
+          } else {
+            const res = await evaluateJobRule(job, allRuns, false, {
+              bypassCooldown: manual || Boolean(options?.bypassCooldown) || Boolean(job._pendingRefillImmediate),
+            });
+            job._pendingRefillImmediate = false;
+            job._incompletePendingBatchRetryAtMs = 0;
+            results.push({ jobId: job.id, name: job.name, ...res });
+          }
         } catch (jobErr) {
           job.lastStatus = `오류: ${jobErr.message}`;
           saveState();
@@ -4614,27 +4760,72 @@ setInterval(() => {
         }
         schedulerLoopStats.effectiveIntervalSec = effectiveSchedSec;
 
+        // Keep `knownRuns` fresh in the background even when no browser tab is polling `/api/space/runs`
+        // and `effectiveSchedSec` is long (e.g., 3min, 5min, 10min, 30min), so `Pending ➔ Running` transitions
+        // and worker completions are detected within ~10-12 seconds.
+        const hasTargetPendingJob = enabledJobs.some((j) => Number(j.targetPendingRuns ?? 0) > 0);
+        const runsRefreshIntervalMs = hasTargetPendingJob || hasNonRunningActive ? 10_000 : 20_000;
+        if (
+          enabledJobs.length > 0 &&
+          !rt.runsInFlightPromise &&
+          !rt.isTickRunning &&
+          loadMonitorStats.backoffUntilMs <= now &&
+          now - (rt.lastKnownRunsAtMs || 0) >= runsRefreshIntervalMs
+        ) {
+          fetchCurrentRuns(true).catch(() => {});
+        }
+
         // Calculate the exact next time any enabled job with a deficit is eligible to spawn a worker (`lastTriggeredAt + cooldownSec`).
-        // During a long cooldown (e.g., 3min, 5min, 10min, 30min), do NOT poll `runSchedulerTick` every 4 seconds!
+        // When `targetPending > 0` and a previously-Pending worker enters `Running` (or immediate refill is requested),
+        // wake up immediately (`eligibleMs = now`) to replenish the Pending queue!
         let earliestDeficitSpawnMs = null;
+        let hasImmediatePendingRefill = false;
         for (const job of enabledJobs) {
           const matchingActive = knownRuns.filter(
             (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+          );
+          const matchingRunning = matchingActive.filter((r) =>
+            String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
           );
           const matchingPending = matchingActive.filter(
             (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
           );
           const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
           const minConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
+
+          if (targetPending > 0 && !Array.isArray(job._knownPendingRunIds) && matchingPending.length > 0) {
+            job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
+          }
+
           const hasDeficit =
             targetPending > 0 ? matchingPending.length < targetPending : matchingActive.length < minConcurrent;
           if (hasDeficit) {
             const jobCooldownSec = Math.max(1, Number(job.cooldownSec || configuredSchedSec || 15));
             const lastTrigMs = job.lastTriggeredAt ? new Date(job.lastTriggeredAt).getTime() : 0;
-            const eligibleMs = lastTrigMs ? lastTrigMs + jobCooldownSec * 1000 : now;
+            let eligibleMs = lastTrigMs ? lastTrigMs + jobCooldownSec * 1000 : now;
+
+            if (targetPending > 0) {
+              const prevPendingIds = Array.isArray(job._knownPendingRunIds) ? job._knownPendingRunIds : [];
+              const currentRunningIdSet = new Set(matchingRunning.map((r) => String(r.id ?? r.runId ?? "")));
+              const hasPromotedToRunning = prevPendingIds.some((id) => id && currentRunningIdSet.has(String(id)));
+              if (job._pendingRefillImmediate || hasPromotedToRunning) {
+                job._pendingRefillImmediate = true;
+                eligibleMs = now;
+                hasImmediatePendingRefill = true;
+              } else if (job._incompletePendingBatchRetryAtMs && job._incompletePendingBatchRetryAtMs > 0) {
+                eligibleMs = Math.min(eligibleMs, job._incompletePendingBatchRetryAtMs);
+              }
+            } else if (job._pendingRefillImmediate) {
+              eligibleMs = now;
+              hasImmediatePendingRefill = true;
+            }
+
             if (earliestDeficitSpawnMs === null || eligibleMs < earliestDeficitSpawnMs) {
               earliestDeficitSpawnMs = eligibleMs;
             }
+          } else if (targetPending > 0) {
+            job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
+            job._incompletePendingBatchRetryAtMs = 0;
           }
         }
 
@@ -4643,8 +4834,8 @@ setInterval(() => {
           : now;
         let nextTargetTickMs = baseTickTargetMs;
         if (earliestDeficitSpawnMs !== null) {
-          // Wake up when the job's cooldown expires (with a minimum 4s spacing after the previous tick)
-          const minNextTickMs = rt.lastSchedulerTickTime ? rt.lastSchedulerTickTime + Math.min(4, effectiveSchedSec) * 1000 : now;
+          const minGapSec = hasImmediatePendingRefill ? 1 : Math.min(4, effectiveSchedSec);
+          const minNextTickMs = rt.lastSchedulerTickTime ? rt.lastSchedulerTickTime + minGapSec * 1000 : now;
           nextTargetTickMs = Math.max(minNextTickMs, Math.min(baseTickTargetMs, earliestDeficitSpawnMs));
         }
 
@@ -6123,6 +6314,8 @@ const server = http.createServer(async (req, res) => {
           body.maxTotalSucceededRuns !== undefined ? Number(body.maxTotalSucceededRuns) : existingJob?.maxTotalSucceededRuns,
         nextStageCommand: body.nextStageCommand !== undefined ? String(body.nextStageCommand) : existingJob?.nextStageCommand,
         _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
+        _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
+        _pendingRefillImmediate: true,
         lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
         lastTriggeredAt: existingJob ? existingJob.lastTriggeredAt : null,
         lastRunId: existingJob ? existingJob.lastRunId : null,
@@ -6137,6 +6330,10 @@ const server = http.createServer(async (req, res) => {
         addLog("info", `새 자동 실행 규칙 추가됨: ${jobObj.name} (목표 워커: ${jobObj.minConcurrentRuns}개${pendingTargetNote}, cmd: ${jobObj.executionCommand})`);
       }
       saveState();
+      if (jobObj.enabled && state.config.schedulerEnabled) {
+        getSiteRuntime().lastSchedulerTickTime = 0;
+        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+      }
       return sendJson(res, 200, { ok: true, job: jobObj, jobs: state.jobs, workerFleet: computeWorkerFleetStats(getSiteKnownRuns()) });
     }
 
@@ -6145,11 +6342,18 @@ const server = http.createServer(async (req, res) => {
       const job = state.jobs.find((j) => j.id === body.jobId);
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
       job.enabled = body.enabled !== undefined ? Boolean(body.enabled) : !job.enabled;
+      if (job.enabled) {
+        job._pendingRefillImmediate = true;
+      }
       saveState();
       addLog(
         "info",
         `[${job.name}] 주기적 자동 생성 규칙 상태 변경: ${job.enabled ? "🟢 ON (활성화)" : "⚪ OFF (일시정지 — Admin 자동 승인은 계속 작동)"}`
       );
+      if (job.enabled && state.config.schedulerEnabled) {
+        getSiteRuntime().lastSchedulerTickTime = 0;
+        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+      }
       return sendJson(res, 200, { ok: true, job, jobs: state.jobs, workerFleet: computeWorkerFleetStats(getSiteKnownRuns()) });
     }
 
@@ -6160,11 +6364,16 @@ const server = http.createServer(async (req, res) => {
         state.jobs.find((j) => j.enabled) ||
         state.jobs[0];
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
+      let shouldImmediateRefill = false;
       if (body.minConcurrentRuns !== undefined) {
-        job.minConcurrentRuns = Math.max(1, Number(body.minConcurrentRuns || 1));
+        const nextMin = Math.max(1, Number(body.minConcurrentRuns || 1));
+        if (nextMin !== job.minConcurrentRuns) shouldImmediateRefill = true;
+        job.minConcurrentRuns = nextMin;
       }
       if (body.targetPendingRuns !== undefined) {
-        job.targetPendingRuns = Math.max(0, Number(body.targetPendingRuns || 0));
+        const nextTargetPending = Math.max(0, Number(body.targetPendingRuns || 0));
+        if (nextTargetPending > 0) shouldImmediateRefill = true;
+        job.targetPendingRuns = nextTargetPending;
       }
       if (body.cooldownSec !== undefined) {
         job.cooldownSec = Math.max(1, Number(body.cooldownSec || 15));
@@ -6181,6 +6390,10 @@ const server = http.createServer(async (req, res) => {
       if (body.stepByStepRunningCheck !== undefined) {
         state.config.stepByStepRunningCheck = Boolean(body.stepByStepRunningCheck);
       }
+      if (shouldImmediateRefill) {
+        job._pendingRefillImmediate = true;
+        job._incompletePendingBatchRetryAtMs = 0;
+      }
       saveState();
       addLog(
         "info",
@@ -6188,6 +6401,10 @@ const server = http.createServer(async (req, res) => {
           job.targetPendingRuns > 0 ? `${job.targetPendingRuns}개 유지` : "제한없음(전체 목표 기준)"
         } · 생성 주기: ${job.cooldownSec}초`
       );
+      if (shouldImmediateRefill && job.enabled && state.config.schedulerEnabled) {
+        getSiteRuntime().lastSchedulerTickTime = 0;
+        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+      }
       const fleet = computeWorkerFleetStats(getSiteKnownRuns());
       return sendJson(res, 200, {
         ok: true,
@@ -6308,6 +6525,7 @@ const server = http.createServer(async (req, res) => {
           maxTotalSucceededRuns: existingJob?.maxTotalSucceededRuns,
           nextStageCommand: existingJob?.nextStageCommand,
           _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
+          _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
           lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
           lastTriggeredAt: existingJob ? existingJob.lastTriggeredAt : null,
           lastRunId: existingJob ? existingJob.lastRunId : null,
@@ -6416,7 +6634,25 @@ server.listen(PORT, HOST, () => {
   for (const siteKey of siteKeys) {
     siteContextStorage.run(siteKey, () => {
       if (state.config.accessToken) {
-        fetchCurrentRuns().catch(() => {});
+        fetchCurrentRuns()
+          .then((initialRuns) => {
+            for (const job of state.jobs.filter((j) => j.enabled)) {
+              const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
+              if (targetPending > 0) {
+                const matchingActive = initialRuns.filter(
+                  (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+                );
+                const matchingPending = matchingActive.filter(
+                  (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+                );
+                job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
+                if (matchingPending.length < targetPending) {
+                  job._pendingRefillImmediate = true;
+                }
+              }
+            }
+          })
+          .catch(() => {});
         processPendingApprovals()
           .then(() => {
             addLog(
