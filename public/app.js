@@ -169,6 +169,8 @@ async function selectSpaceSite(siteId, options = {}) {
   } catch {}
   focusedFleetJobId = "";
   lastKnownActiveWorkerIdsSig = "";
+  selectedWorkerRunIds.clear();
+  latestRawSpaceRuns = [];
   try {
     await api("/api/sites/select", {
       method: "POST",
@@ -194,7 +196,19 @@ async function selectSpaceSite(siteId, options = {}) {
     discovered = { groups: [], groupPools: [], groupPoolsStatus: [], spotCores: [], priorities: [], experiments: [], specifications: [], images: [] };
     const runsBody = document.getElementById("runsTableBody");
     if (runsBody) {
-      runsBody.innerHTML = `<tr><td colspan="6" class="hint">${getActiveSiteProfile().name} 토큰이 아직 설정되지 않았습니다. [🔑 SPACE 토큰 연동/갱신]에서 ${getActiveSiteHost()} 토큰을 등록해 주세요.</td></tr>`;
+      updateHtmlIfSigChanged(
+        runsBody,
+        `no-token:${currentSiteId}`,
+        `<tr><td colspan="7" class="hint">${escapeHtml(getActiveSiteProfile().name)} 토큰이 아직 설정되지 않았습니다. [🔑 SPACE 토큰 연동/갱신]에서 ${escapeHtml(getActiveSiteHost())} 토큰을 등록해 주세요.</td></tr>`
+      );
+    }
+    const appBody = document.getElementById("approvalsTableBody");
+    if (appBody) {
+      updateHtmlIfSigChanged(
+        appBody,
+        `no-token:${currentSiteId}`,
+        `<tr><td colspan="6" class="hint">${escapeHtml(getActiveSiteProfile().name)} 토큰 등록 후 승인 내역이 표시됩니다.</td></tr>`
+      );
     }
   }
 }
@@ -399,8 +413,11 @@ function maybeTriggerBrowserAlert(alerts, cfg) {
 
 async function loadServerState(options = {}) {
   if (!sessionPassword) return;
+  const reqSiteId = currentSiteId;
   try {
     const data = await api("/api/state");
+    // Discard stale response if user switched site tabs while this poll was in flight
+    if (currentSiteId !== reqSiteId) return;
     serverState = data;
     if (data.sites) {
       const rawSitesArr = Array.isArray(data.sites) ? data.sites : Object.values(data.sites);
@@ -417,7 +434,7 @@ async function loadServerState(options = {}) {
         }));
       }
     }
-    if (data.activeSiteId) {
+    if (data.activeSiteId && !(sitesList || []).some((s) => s.id === currentSiteId)) {
       currentSiteId = data.activeSiteId;
     }
     renderMultiSiteSwitcherBar(sitesList, currentSiteId);
@@ -1166,17 +1183,16 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       .map(
         (u) =>
           `<span class="mono" style="display:inline-flex; align-items:center; gap:4px; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.5); color:#7dd3fc; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="현재 규칙 이름과 다른 내 계정 워크로드">
-            <span style="cursor:pointer;" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')">📌 규칙외 내 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
-            <button type="button" class="danger sm" style="padding:1px 5px; font-size:10px;" onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}', '규칙외 #${escapeHtml(String(u.id))}', false, '')">🛑Kill</button>
+            <span style="cursor:pointer;" onclick="viewRunLog('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}')">📌 규칙외 내 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
+            <button type="button" class="danger sm" style="padding:1px 5px; font-size:10px;" onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(String(u.id))}', false, '')">🛑Kill</button>
           </span>`
       )
       .join(" ");
     const otherUserBadges = otherUsers
       .map(
         (u) =>
-          `<span class="mono" style="display:inline-flex; align-items:center; gap:4px; background:rgba(168,85,247,0.18); border:1px solid rgba(168,85,247,0.5); color:#d8b4fe; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="그룹 내 다른 사용자 워크로드">
-            <span style="cursor:pointer;" onclick="viewRunLog('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}')">👥 타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
-            <button type="button" class="danger sm" style="padding:1px 5px; font-size:10px;" onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeHtml(String(u.id))}', '${escapeHtml(u.name)}', '타유저 #${escapeHtml(String(u.id))}', false, '')">🛑Kill</button>
+          `<span class="mono" style="display:inline-flex; align-items:center; gap:4px; background:rgba(168,85,247,0.18); border:1px solid rgba(168,85,247,0.5); color:#d8b4fe; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700;" title="그룹 내 다른 사용자 워크로드 (보호됨 · 클릭 시 로그만 조회)">
+            <span style="cursor:pointer;" onclick="viewRunLog('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}')">👥 타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
           </span>`
       )
       .join(" ");
@@ -1275,7 +1291,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       allCurrentActiveIds.add(String(r.id ?? r.runId));
     }
   }
-  if (allCurrentActiveIds.size > 0) {
+  if (Array.isArray(fleet?.jobs)) {
     for (const selId of Array.from(selectedWorkerRunIds)) {
       if (!allCurrentActiveIds.has(String(selId))) {
         selectedWorkerRunIds.delete(selId);
@@ -1361,20 +1377,20 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         key: `active-${wIdStr}`,
         sig: slotSig,
         html: `
-        <div class="mono" onclick="viewRunLog('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}')"
+        <div class="mono" onclick="viewRunLog('${escapeJsStr(wIdStr)}', '${escapeJsStr(w.name)}')"
           title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(wIdStr)}) · 상태: ${escapeHtml(w.status)} · ${pillHeaderLabel} · 신청: ${srcTag} · ⚡자동승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · ✅승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${bg}; border:${isSelected ? "2px" : "1px"} solid ${border}; ${isSelected ? "box-shadow:0 0 0 2px rgba(56,189,248,0.28);" : ""} color:${color}; font-weight:600;">
           <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
             <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:4px; cursor:pointer; margin:0; font-weight:700; color:${color};">
-              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(wIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
+              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(wIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
               <span>${dot} ${pillHeaderLabel} <span style="opacity:0.9;">(#${escapeHtml(wIdStr)})</span></span>
             </label>
             <div style="display:inline-flex; align-items:center; gap:3px;" onclick="event.stopPropagation();">
               <button type="button" class="danger sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800;"
-                onclick="killSingleWorkerSlot('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}', '${escapeHtml(pillHeaderLabel)}', false, '${escapeHtml(jf.jobId)}')"
+                onclick="killSingleWorkerSlot('${escapeJsStr(wIdStr)}', '${escapeJsStr(w.name)}', '${escapeJsStr(pillHeaderLabel)}', false, '${escapeJsStr(jf.jobId)}')"
                 title="이 슬롯(#${escapeHtml(wIdStr)})을 즉시 강제 종료(Stop/Kill)합니다 (자동충원 유지)">🛑Kill</button>
               <button type="button" class="secondary sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800; border-color:rgba(244,63,94,0.65); color:#fecdd3; background:rgba(159,18,57,0.45);"
-                onclick="killSingleWorkerSlot('${escapeHtml(wIdStr)}', '${escapeHtml(w.name)}', '${escapeHtml(pillHeaderLabel)}', true, '${escapeHtml(jf.jobId)}')"
+                onclick="killSingleWorkerSlot('${escapeJsStr(wIdStr)}', '${escapeJsStr(w.name)}', '${escapeJsStr(pillHeaderLabel)}', true, '${escapeJsStr(jf.jobId)}')"
                 title="이 슬롯(#${escapeHtml(wIdStr)})을 즉시 종료(Kill)하고 목표 워커 수를 -1 차감하여 다시 생성되지 않게 영구 삭제합니다">🗑️삭제</button>
             </div>
           </div>
@@ -1405,8 +1421,8 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           style="display:inline-flex; align-items:center; justify-content:space-between; gap:6px; padding:4px 8px; border-radius:6px; font-size:11.5px; background:${bg}; border:1px dashed ${border}; color:${color};">
           <span>${isNext ? "⚡" : "🔄"} 워커 #${nextSlotNum} <span style="font-size:10.5px;">${isNext ? "(다음 생성)" : "(자동생성 대기)"}</span></span>
           <button type="button" class="secondary sm" style="padding:1px 5px; font-size:9.5px; border-color:rgba(244,63,94,0.5); color:#fda4af;"
-            onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', ${Math.max(1, targetCnt - 1)})"
-            title="대기 슬롯 1개를 삭제하여 목표 워커 수를 ${Math.max(1, targetCnt - 1)}개로 줄입니다">🗑️-1</button>
+            onclick="quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', { delta: -1 })"
+            title="대기 슬롯 1개를 삭제하여 목표 워커 수를 -1 차감합니다">🗑️-1</button>
         </div>
       `,
       });
@@ -1426,16 +1442,16 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         key: `unmatched-${uIdStr}`,
         sig: `${uIdStr}|${u.status}|${isSelected ? 1 : 0}|${u.coreCount}`,
         html: `
-        <div class="mono" onclick="viewRunLog('${escapeHtml(uIdStr)}', '${escapeHtml(u.name)}')"
+        <div class="mono" onclick="viewRunLog('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}')"
           title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(uIdStr)}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${pillBg}; border:${isSelected ? "2px" : "1px"} solid ${pillBorder}; color:${pillColor}; font-weight:600;">
           <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
             <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:4px; cursor:pointer; margin:0; color:${pillColor};">
-              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(uIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
+              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(uIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
               <span>${isMine ? "📌 규칙외(내 런)" : `👥 타유저(${escapeHtml(u.userName)})`} <b>${escapeHtml(u.name)}</b> (#${escapeHtml(uIdStr)})</span>
             </label>
             <button type="button" class="danger sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800;"
-              onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeHtml(uIdStr)}', '${escapeHtml(u.name)}', '규칙외 #${escapeHtml(uIdStr)}', false, '')"
+              onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(uIdStr)}', false, '')"
               title="이 워크로드(#${escapeHtml(uIdStr)})를 즉시 강제 종료(Stop/Kill)합니다">🛑Kill</button>
           </div>
           <span style="font-size:10px; opacity:0.9;">${u.isRunning ? "🟢 Running" : `⏳ ${escapeHtml(u.status)}`} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
@@ -1473,7 +1489,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
                     .join(" · ")
                 : "";
               return `
-            <div class="mono" onclick="viewRunLog('${escapeHtml(String(w.id))}', '${escapeHtml(w.name)}')"
+            <div class="mono" onclick="viewRunLog('${escapeJsStr(String(w.id))}', '${escapeJsStr(w.name)}')"
               style="cursor:pointer; font-size:11px; padding:4px 8px; border-radius:5px; background:${
                 w.hasLogError
                   ? "rgba(239,68,68,0.18)"
@@ -2076,7 +2092,10 @@ async function quickUpdateTargetPending(jobId, valueOrOpts) {
   if (pendInput) pendInput.value = targetPending;
   if (jf) {
     jf.targetPendingCount = targetPending;
-    jf.remainingToSpawn = targetPending > 0 ? Math.max(0, targetPending - (jf.pendingCount || 0)) : Math.max(0, (jf.targetCount || 1) - (jf.activeCount || 0));
+    jf.remainingToCreate =
+      targetPending > 0
+        ? Math.max(0, targetPending - (jf.pendingCount || 0))
+        : Math.max(0, (jf.targetCount || 1) - (jf.activeCount || 0));
     renderWorkerFleetBoard(latestWorkerFleet, { force: true });
   }
   try {
@@ -2837,7 +2856,7 @@ async function discoverSpaceResources(opts = {}) {
       if (cores.length === 0) {
         const pill = document.createElement("div");
         pill.className = "pill";
-        pill.innerHTML = `🟦 <b>[Standard] ${pName}</b> (groupPoolId: ${pId})`;
+        pill.innerHTML = `🟦 <b>[Standard] ${escapeHtml(pName)}</b> (groupPoolId: ${escapeHtml(String(pId))})`;
         pill.onclick = () => {
           onChangeRunType("standard", true);
           document.getElementById("jobGroupPoolId").value = pId;
@@ -2852,7 +2871,7 @@ async function discoverSpaceResources(opts = {}) {
           const cName = c.name ?? c.coreName ?? c.gpuType ?? `Core #${cId}`;
           const pill = document.createElement("div");
           pill.className = "pill";
-          pill.innerHTML = `🟦 <b>[Standard] ${pName}</b> (Pool ID: ${pId}) · <span style="color:#60a5fa; font-weight:700;">${cName}</span> (Core ID: ${cId})`;
+          pill.innerHTML = `🟦 <b>[Standard] ${escapeHtml(pName)}</b> (Pool ID: ${escapeHtml(String(pId))}) · <span style="color:#60a5fa; font-weight:700;">${escapeHtml(cName)}</span> (Core ID: ${escapeHtml(String(cId))})`;
           pill.onclick = () => {
             onChangeRunType("standard", true);
             document.getElementById("jobGroupPoolId").value = pId;
@@ -2988,7 +3007,7 @@ async function discoverSpaceResources(opts = {}) {
 
       const pill = document.createElement("div");
       pill.className = "pill";
-      pill.innerHTML = `📋 <b>${sName}</b> (#${sId})`;
+      pill.innerHTML = `📋 <b>${escapeHtml(sName)}</b> (#${escapeHtml(String(sId))})`;
       pill.onclick = () => {
         document.getElementById("jobUseSpecId").value = sId;
         onSelectSpecForJob(sId);
@@ -3351,28 +3370,28 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
               targetPendingCnt > 0 ? ` · 목표Pending: <b>${targetPendingCnt}개</b>` : ""
             }</div>`;
         const badge = j.enabled
-          ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
-          : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
+          ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeJsStr(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
+          : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeJsStr(j.id)}', true)" title="클릭하면 주기적 자동 생성을 켭니다">⚪ OFF (켜기)</button>`;
         const runTypeBadge = j.allowSpot
           ? `<span class="badge warn" style="margin-right:4px;">🟧 Spot</span>`
           : `<span class="badge ok" style="margin-right:4px; background:rgba(59,130,246,0.2); color:#93c5fd;">🟦 Std</span>`;
         return `
           <tr style="${isSelected ? "background:rgba(59,130,246,0.14); outline:1px solid rgba(59,130,246,0.45);" : ""}">
             <td>${badge}</td>
-            <td class="mono" style="cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)" title="클릭하면 이 규칙을 선택합니다">
+            <td class="mono" style="cursor:pointer;" onclick="selectAndEditJobRule('${escapeJsStr(j.id)}', false)" title="클릭하면 이 규칙을 선택합니다">
               <b>${escapeHtml(j.name)}</b>
               ${isSelected ? `<div style="font-size:10px; color:#60a5fa; font-weight:700;">✏️ 현재 선택/편집 중</div>` : ""}
             </td>
             <td>${fleetBadges}</td>
             <td class="mono" style="font-size:11.5px;">${runTypeBadge}Core:${escapeHtml(String(j.coreId || "자동"))} × ${j.coreCount || 1}GPU</td>
-            <td class="mono" style="color:#93c5fd; font-size:12px; cursor:pointer;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', false)">${escapeHtml(j.executionCommand)}</td>
+            <td class="mono" style="color:#93c5fd; font-size:12px; cursor:pointer;" onclick="selectAndEditJobRule('${escapeJsStr(j.id)}', false)">${escapeHtml(j.executionCommand)}</td>
             <td style="font-size:11.5px;">${escapeHtml(j.lastStatus || "대기 중")}</td>
             <td>
               <div class="btn-row" style="gap:4px;">
-                <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeHtml(j.id)}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">▶ +1 실행</button>
-                <button class="secondary sm" style="padding:4px 8px;" onclick="selectAndEditJobRule('${escapeHtml(j.id)}', true)">✏️ 수정</button>
-                <button class="secondary sm" style="padding:4px 8px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;" onclick="duplicateJobRule('${escapeHtml(j.id)}')" title="이 규칙을 복제하여 새 규칙으로 바로 추가합니다">📋 복제추가</button>
-                <button class="danger sm" style="padding:4px 8px;" onclick="deleteJob('${escapeHtml(j.id)}')">삭제</button>
+                <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeJsStr(j.id)}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">▶ +1 실행</button>
+                <button class="secondary sm" style="padding:4px 8px;" onclick="selectAndEditJobRule('${escapeJsStr(j.id)}', true)">✏️ 수정</button>
+                <button class="secondary sm" style="padding:4px 8px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;" onclick="duplicateJobRule('${escapeJsStr(j.id)}')" title="이 규칙을 복제하여 새 규칙으로 바로 추가합니다">📋 복제추가</button>
+                <button class="danger sm" style="padding:4px 8px;" onclick="deleteJob('${escapeJsStr(j.id)}')">삭제</button>
               </div>
             </td>
           </tr>
@@ -3418,15 +3437,15 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
               targetPendingCnt > 0 ? ` · 목표Pending: <b>${targetPendingCnt}개</b>` : ""
             }</div>`;
         const badge = j.enabled
-          ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', false)">🟢 ON (가동중)</button>`
-          : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeHtml(j.id)}', true)">⚪ OFF (켜기)</button>`;
+          ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeJsStr(j.id)}', false)">🟢 ON (가동중)</button>`
+          : `<button class="secondary sm" style="padding:4px 9px; font-size:11.5px; border-color:rgba(248,113,113,0.5); color:#fca5a5;" onclick="toggleJobEnabled('${escapeJsStr(j.id)}', true)">⚪ OFF (켜기)</button>`;
         const runTypeBadge = j.allowSpot
           ? `<span class="badge warn" style="margin-right:4px;">🟧 Spot</span>`
           : `<span class="badge ok" style="margin-right:4px; background:rgba(59,130,246,0.2); color:#93c5fd;">🟦 Std</span>`;
         return `
           <tr style="${isFocused ? "background:rgba(59,130,246,0.12);" : ""}">
             <td>${badge}</td>
-            <td class="mono" style="cursor:pointer;" onclick="selectFleetJobTab('${escapeHtml(j.id)}')" title="클릭하면 위 모니터링 보드에서 이 규칙 현황을 봅니다">
+            <td class="mono" style="cursor:pointer;" onclick="selectFleetJobTab('${escapeJsStr(j.id)}')" title="클릭하면 위 모니터링 보드에서 이 규칙 현황을 봅니다">
               <b>${escapeHtml(j.name)}</b>
             </td>
             <td>${fleetBadges}</td>
@@ -3435,8 +3454,8 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
             <td style="font-size:11.5px;">${escapeHtml(j.lastStatus || "대기 중")}</td>
             <td>
               <div class="btn-row" style="gap:4px;">
-                <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeHtml(j.id)}')" title="워커 1개 즉시 실행">▶ +1 즉시실행</button>
-                <button class="secondary sm" style="padding:4px 8px;" onclick="editJobRuleInSetup('${escapeHtml(j.id)}')" title="설정 화면에서 이 규칙을 수정합니다">⚙️ 설정 수정</button>
+                <button class="success sm" style="padding:4px 8px;" onclick="triggerJobNow('${escapeJsStr(j.id)}')" title="워커 1개 즉시 실행">▶ +1 즉시실행</button>
+                <button class="secondary sm" style="padding:4px 8px;" onclick="editJobRuleInSetup('${escapeJsStr(j.id)}')" title="설정 화면에서 이 규칙을 수정합니다">⚙️ 설정 수정</button>
               </div>
             </td>
           </tr>
@@ -3722,9 +3741,11 @@ async function triggerSchedulerTick() {
 // ============================================================================
 async function loadApprovals() {
   if (!sessionPassword) return;
+  const reqSiteId = currentSiteId;
   const tbody = document.getElementById("approvalsTableBody");
   try {
     const data = await api("/api/space/approvals");
+    if (currentSiteId !== reqSiteId) return;
     if (data.schedulerLoopStats) {
       latestSchedulerStats = data.schedulerLoopStats;
     }
@@ -3871,8 +3892,8 @@ async function loadApprovals() {
       .map((row) => {
         const actionBtns = row.isPending
           ? `<div class="btn-row">
-              <button class="success sm" onclick="approveSingleItem('${row.approvalId || ""}', '${escapeHtml(row.runId)}')">✅ Admin 승인(Approve)</button>
-              <button class="danger sm" onclick="rejectSingleItem('${row.approvalId || ""}', '${escapeHtml(row.runId)}')">❌ 반려(Reject)</button>
+              <button class="success sm" onclick="approveSingleItem('${escapeJsStr(row.approvalId || "")}', '${escapeJsStr(row.runId)}')">✅ Admin 승인(Approve)</button>
+              <button class="danger sm" onclick="rejectSingleItem('${escapeJsStr(row.approvalId || "")}', '${escapeJsStr(row.runId)}')">❌ 반려(Reject)</button>
             </div>`
           : `<span class="mono" style="color:#6ee7b7; font-weight:700; font-size:12px;">${escapeHtml(row.approvedInfo || "승인 통과됨")}</span>`;
         return `
@@ -4154,13 +4175,31 @@ async function killSingleWorkerSlot(runId, runName = "", slotLabel = "", reduceT
     }
     if (res.targetAdjustment) {
       const adj = res.targetAdjustment;
+      const isSameFormJob = String(document.getElementById("jobId")?.value) === String(adj.jobId);
       const minInput = document.getElementById("jobMinConcurrent");
-      if (minInput && String(document.getElementById("jobId")?.value) === String(adj.jobId)) {
+      if (minInput && isSameFormJob && adj.newTarget !== undefined) {
         minInput.value = adj.newTarget;
       }
-      showToast(
-        `🗑️ [${label}] 강제 종료 + 규칙 [${adj.jobName}] 목표 워커 수 ${adj.previousTarget}개 → ${adj.newTarget}개로 영구 차감 완료!`
-      );
+      const pendInput = document.getElementById("jobTargetPending");
+      if (pendInput && isSameFormJob && adj.newPendingTarget !== undefined) {
+        pendInput.value = adj.newPendingTarget;
+      }
+      const quickPendInput = document.getElementById("quickTargetPendingInput");
+      if (quickPendInput && adj.newPendingTarget !== undefined && String(focusedFleetJobId || "") === String(adj.jobId)) {
+        quickPendInput.value = adj.newPendingTarget;
+      }
+      const pendingChanged =
+        adj.previousPendingTarget !== undefined &&
+        adj.newPendingTarget !== undefined &&
+        adj.previousPendingTarget !== adj.newPendingTarget;
+      const runningChanged = adj.previousTarget !== adj.newTarget;
+      const detailMsg =
+        pendingChanged && !runningChanged
+          ? `목표 Pending ${adj.previousPendingTarget}개 → ${adj.newPendingTarget}개로 영구 차감`
+          : pendingChanged && runningChanged
+          ? `목표 워커 ${adj.previousTarget}→${adj.newTarget}개 · 목표 Pending ${adj.previousPendingTarget}→${adj.newPendingTarget}개 차감`
+          : `목표 워커 수 ${adj.previousTarget}개 → ${adj.newTarget}개로 영구 차감`;
+      showToast(`🗑️ [${label}] 강제 종료 + 규칙 [${adj.jobName}] ${detailMsg} 완료!`);
     } else {
       showToast(`🛑 [${label} (#${idStr})] 즉시 강제 종료(Kill) 완료!`);
     }
@@ -4226,12 +4265,32 @@ async function executeSelectedWorkersKill(reduceTarget = false, jobId = "") {
 
     if (res.targetAdjustment) {
       const adj = res.targetAdjustment;
+      const isSameFormJob = String(document.getElementById("jobId")?.value) === String(adj.jobId);
       const minInput = document.getElementById("jobMinConcurrent");
-      if (minInput && String(document.getElementById("jobId")?.value) === String(adj.jobId)) {
+      if (minInput && isSameFormJob && adj.newTarget !== undefined) {
         minInput.value = adj.newTarget;
       }
+      const pendInput = document.getElementById("jobTargetPending");
+      if (pendInput && isSameFormJob && adj.newPendingTarget !== undefined) {
+        pendInput.value = adj.newPendingTarget;
+      }
+      const quickPendInput = document.getElementById("quickTargetPendingInput");
+      if (quickPendInput && adj.newPendingTarget !== undefined && String(focusedFleetJobId || "") === String(adj.jobId)) {
+        quickPendInput.value = adj.newPendingTarget;
+      }
+      const pendingChanged =
+        adj.previousPendingTarget !== undefined &&
+        adj.newPendingTarget !== undefined &&
+        adj.previousPendingTarget !== adj.newPendingTarget;
+      const runningChanged = adj.previousTarget !== adj.newTarget;
+      const detailMsg =
+        pendingChanged && !runningChanged
+          ? `목표 Pending ${adj.previousPendingTarget}개 → ${adj.newPendingTarget}개로 차감`
+          : pendingChanged && runningChanged
+          ? `목표 워커 ${adj.previousTarget}→${adj.newTarget}개 · 목표 Pending ${adj.previousPendingTarget}→${adj.newPendingTarget}개 차감`
+          : `목표 워커 ${adj.previousTarget}개 → ${adj.newTarget}개로 차감`;
       showToast(
-        `🗑️ 선택 슬롯 ${res.terminatedCount || targetIds.length}개 영구 삭제 완료! (규칙 [${adj.jobName}] 목표 워커 ${adj.previousTarget}개 → ${adj.newTarget}개로 차감)`
+        `🗑️ 선택 슬롯 ${res.terminatedCount || targetIds.length}개 영구 삭제 완료! (규칙 [${adj.jobName}] ${detailMsg})`
       );
     } else {
       showToast(`🛑 선택 슬롯 ${res.terminatedCount || targetIds.length}개 즉시 강제 종료(Stop/Kill) 완료!`);
@@ -4409,9 +4468,13 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
 
       const seqLabelText = isRun ? `워커 #${runSeq}` : isAct ? `Pending대기 #${pendSeq}` : `종료 #${idx + 1}`;
       const seqBadge = isRun
-        ? `<label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0;"><input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(idStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" /><span class="mono" style="color:#34d399; font-weight:800;">🟢 #${runSeq}</span></label>`
+        ? mine
+          ? `<label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0;"><input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(idStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" /><span class="mono" style="color:#34d399; font-weight:800;">🟢 #${runSeq}</span></label>`
+          : `<span class="mono" style="color:#34d399; font-weight:800;">🟢 #${runSeq}</span>`
         : isAct
-        ? `<label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0;"><input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeHtml(idStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" /><span class="mono" style="color:#fde68a; font-weight:800;">⏳ 대기#${pendSeq}</span></label><div class="mono" style="font-size:10px; color:#94a3b8; padding-left:18px;">(활성#${idx + 1})</div>`
+        ? mine
+          ? `<label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0;"><input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(idStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8;" /><span class="mono" style="color:#fde68a; font-weight:800;">⏳ 대기#${pendSeq}</span></label><div class="mono" style="font-size:10px; color:#94a3b8; padding-left:18px;">(활성#${idx + 1})</div>`
+          : `<span class="mono" style="color:#fde68a; font-weight:800;">⏳ 대기#${pendSeq}</span><div class="mono" style="font-size:10px; color:#94a3b8;">(활성#${idx + 1})</div>`
         : `<span class="mono" style="color:#94a3b8;">종료 #${idx + 1}</span>`;
 
       const isAlreadyApproved = String(r.approvalStatus || "").toLowerCase() === "approved";
@@ -4437,8 +4500,8 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
         ? `<span style="background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.45); color:#7dd3fc; padding:1px 5px; border-radius:4px; font-size:10px; margin-left:4px;">📌 규칙외</span>`
         : "";
       const approveBtn =
-        stUpper.includes("PENDING") && !isAlreadyApproved
-          ? `<button class="success sm" onclick="approveSingleItem('', '${escapeHtml(idStr)}')">✅ Admin 승인</button>`
+        stUpper.includes("PENDING") && !isAlreadyApproved && mine
+          ? `<button class="success sm" onclick="approveSingleItem('', '${escapeJsStr(idStr)}')">✅ Admin 승인</button>`
           : "";
       return `
         <tr style="${isSelected ? "background:rgba(56,189,248,0.16);" : !mine && isAct ? "background:rgba(168,85,247,0.08);" : ""}">
@@ -4456,11 +4519,13 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
           <td>
             <div class="btn-row">
               ${approveBtn}
-              <button class="secondary sm" onclick="viewRunLog('${escapeHtml(idStr)}', '${escapeHtml(name)}')">📜 로그</button>
+              <button class="secondary sm" onclick="viewRunLog('${escapeJsStr(idStr)}', '${escapeJsStr(name)}')">📜 로그</button>
               ${
-                isAct
-                  ? `<button class="danger sm" onclick="killSingleWorkerSlot('${escapeHtml(idStr)}', '${escapeHtml(name)}', '${escapeHtml(seqLabelText)}', false, '${escapeHtml(matchedJobId)}')" title="이 슬롯(#${escapeHtml(idStr)})만 즉시 강제 종료(Stop/Kill)합니다 (자동충원 유지)">🛑 Kill</button>
-                     <button class="secondary sm" style="background:rgba(159,18,57,0.5); border-color:#f43f5e; color:#ffe4e6;" onclick="killSingleWorkerSlot('${escapeHtml(idStr)}', '${escapeHtml(name)}', '${escapeHtml(seqLabelText)}', true, '${escapeHtml(matchedJobId)}')" title="이 슬롯(#${escapeHtml(idStr)})을 강제 종료(Kill)하고 목표 워커 수를 -1 차감하여 다시 생성되지 않게 영구 삭제합니다">🗑️ 삭제(-1)</button>`
+                isAct && mine
+                  ? `<button class="danger sm" onclick="killSingleWorkerSlot('${escapeJsStr(idStr)}', '${escapeJsStr(name)}', '${escapeJsStr(seqLabelText)}', false, '${escapeJsStr(matchedJobId)}')" title="이 슬롯(#${escapeHtml(idStr)})만 즉시 강제 종료(Stop/Kill)합니다 (자동충원 유지)">🛑 Kill</button>
+                     <button class="secondary sm" style="background:rgba(159,18,57,0.5); border-color:#f43f5e; color:#ffe4e6;" onclick="killSingleWorkerSlot('${escapeJsStr(idStr)}', '${escapeJsStr(name)}', '${escapeJsStr(seqLabelText)}', true, '${escapeJsStr(matchedJobId)}')" title="이 슬롯(#${escapeHtml(idStr)})을 강제 종료(Kill)하고 목표 수량을 -1 차감하여 다시 생성되지 않게 영구 삭제합니다">🗑️ 삭제(-1)</button>`
+                  : isAct && !mine
+                  ? `<span class="mono" style="font-size:10.5px; color:#d8b4fe; padding:2px 6px; border:1px solid rgba(168,85,247,0.4); border-radius:4px;">🔒 타유저 보호</span>`
                   : ""
               }
             </div>
@@ -4473,9 +4538,15 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
 
 async function loadSpaceRuns(options = {}) {
   if (!sessionPassword) return;
+  const reqSiteId = currentSiteId;
   const tbody = document.getElementById("runsTableBody");
   try {
     const data = await api("/api/space/runs");
+    if (currentSiteId !== reqSiteId) return;
+    if (data.sites) {
+      latestSitesSummary = data.sites;
+      renderSiteSelectorBar();
+    }
     if (data.workerFleet) {
       latestWorkerFleet = data.workerFleet;
       renderWorkerFleetBoard(latestWorkerFleet, options);
@@ -4486,6 +4557,7 @@ async function loadSpaceRuns(options = {}) {
     latestRawSpaceRuns = data.runs || [];
     renderSpaceRunsTable(latestRawSpaceRuns, latestWorkerFleet, options);
   } catch (e) {
+    if (currentSiteId !== reqSiteId) return;
     if (tbody) {
       tbody.innerHTML = `<tr><td colspan="7" class="hint" style="color:#f87171;">런 목록 조회 오류: ${escapeHtml(e.message)}</td></tr>`;
     }
@@ -4645,18 +4717,18 @@ function renderPresetsBar(presets = []) {
       (p) => `
       <div style="display:inline-flex; align-items:center; gap:4px; background:rgba(15,23,42,0.82); border:1px solid rgba(245,158,11,0.45); border-radius:6px; padding:4px 8px;">
         <button type="button" class="secondary sm" style="padding:2px 7px; font-size:11.5px; border:none; background:transparent; color:#fde68a; font-weight:700;"
-          onclick="applyJobPreset('${escapeHtml(p.id)}', false, false)"
+          onclick="applyJobPreset('${escapeJsStr(p.id)}', false, false)"
           title="클릭 시 현재 선택된 규칙에 [${escapeHtml(p.name)}] 설정 적용 (명령어: ${escapeHtml(p.executionCommand || "")} · 목표 ${p.minConcurrentRuns}워커)">
           ${escapeHtml(p.name)} <span class="mono" style="font-size:10.5px; color:#93c5fd;">[${escapeHtml(p.badge || `${p.minConcurrentRuns}W`)}]</span>
         </button>
         <button type="button" class="secondary sm" style="padding:2px 6px; font-size:10.5px; border-color:rgba(16,185,129,0.5); color:#6ee7b7;"
-          onclick="applyJobPreset('${escapeHtml(p.id)}', false, true)"
+          onclick="applyJobPreset('${escapeJsStr(p.id)}', false, true)"
           title="이 프리셋으로 새 규칙을 목록에 바로 추가합니다">➕새규칙</button>
         <button type="button" class="success sm" style="padding:2px 6px; font-size:10.5px;"
-          onclick="applyJobPreset('${escapeHtml(p.id)}', true, false)"
+          onclick="applyJobPreset('${escapeJsStr(p.id)}', true, false)"
           title="프리셋 적용과 동시에 즉시 할당 트리거">🚀적용+실행</button>
         <button type="button" class="secondary sm" style="padding:1px 5px; font-size:10px; color:#94a3b8;"
-          onclick="deleteJobPreset('${escapeHtml(p.id)}')"
+          onclick="deleteJobPreset('${escapeJsStr(p.id)}')"
           title="이 프리셋 삭제">✕</button>
       </div>
     `
@@ -4751,13 +4823,27 @@ async function deleteJobPreset(presetId) {
 // =========================================================================
 function exportTelemetryReport(format = "csv") {
   const pw = encodeURIComponent(sessionPassword || "");
-  const url = `/api/telemetry/export?format=${encodeURIComponent(format)}&pw=${pw}`;
+  const siteParam = encodeURIComponent(currentSiteId || "n9");
+  const url = `/api/telemetry/export?format=${encodeURIComponent(format)}&siteId=${siteParam}&pw=${pw}`;
   window.open(url, "_blank");
-  showToast(`📥 누적 GPU-Hours 리포트(${format.toUpperCase()}) 다운로드를 시작합니다.`);
+  showToast(`📥 [${currentSiteId.toUpperCase()}] 누적 GPU-Hours 리포트(${format.toUpperCase()}) 다운로드를 시작합니다.`);
 }
 
 function escapeHtml(str) {
   return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeJsStr(str) {
+  return String(str ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, "")
+    .replace(/\n/g, "\\n")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

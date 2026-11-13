@@ -290,6 +290,20 @@ function loadState() {
               lastSampleAtMs: Number(raw.telemetry.lastSampleAtMs || 0),
             }
           : structuredClone(DEFAULT_STATE.telemetry);
+      const rawTelemetryBySite = {};
+      if (raw.telemetryBySite && typeof raw.telemetryBySite === "object") {
+        for (const [tSid, tObj] of Object.entries(raw.telemetryBySite)) {
+          if (!tObj || typeof tObj !== "object") continue;
+          rawTelemetryBySite[normalizeSiteId(tSid)] = {
+            totalGpuHours: Number(tObj.totalGpuHours || 0),
+            dailyGpuHours: tObj.dailyGpuHours || {},
+            jobGpuHours: tObj.jobGpuHours || {},
+            timeSeries: Array.isArray(tObj.timeSeries) ? tObj.timeSeries.slice(-60) : [],
+            lastAccountingAtMs: Number(tObj.lastAccountingAtMs || 0),
+            lastSampleAtMs: Number(tObj.lastSampleAtMs || 0),
+          };
+        }
+      }
 
       const mergedConfig = { ...DEFAULT_STATE.config, ...(raw.config || {}) };
       const mergedSites = structuredClone(DEFAULT_STATE.sites);
@@ -418,6 +432,7 @@ function loadState() {
         presets: rawPresets,
         scriptFiles: rawScriptFiles,
         telemetry: rawTelemetry,
+        telemetryBySite: rawTelemetryBySite,
         history: rawHistory,
         approvalHistory: rawApprovalHistory,
         alerts: rawAlerts,
@@ -763,32 +778,10 @@ function extractItemsArray(res) {
 }
 
 /**
- * 🛡️ Real-Time Server & SPACE API Load Telemetry
+ * 🛡️ Real-Time Server & SPACE API Load Telemetry (Site-Scoped via `getSiteRuntime()`)
  * Tracks API latency samples, requests-per-minute (RPM), cache hits, error rates, and auto-backoff cooldowns.
  */
-const loadMonitorStats = {
-  recentLatenciesMs: [], // Last 40 SPACE API call latencies
-  requestTimestampsMs: [], // Timestamps within the last 60s for RPM calculation
-  cacheHitTimestampsMs: [], // Cache hits within the last 60s
-  lastLatencyMs: 0,
-  avgLatencyMs: 0,
-  p95LatencyMs: 0,
-  maxLatencyMs: 0,
-  totalRequests: 0,
-  totalCacheHits: 0,
-  totalErrors: 0,
-  consecutiveErrors: 0,
-  lastErrorAt: null,
-  lastErrorStatus: null,
-  lastErrorMessage: null,
-  backoffUntilMs: 0,
-  backoffReason: null,
-  lastHoldReason: null,
-  lastHoldLogAtMs: 0,
-  poolGpuFree: null,
-  poolGpuTotal: null,
-  poolGpuUpdatedAt: null,
-};
+const loadMonitorStats = createSiteRuntimeObjectProxy("loadMonitorStats");
 
 function recordCacheHit() {
   const now = Date.now();
@@ -831,6 +824,9 @@ function recordApiTelemetry({ endpoint, latencyMs, status, ok, errorMsg = null }
   } else {
     loadMonitorStats.totalErrors += 1;
     loadMonitorStats.consecutiveErrors += 1;
+    if (status === 429) {
+      loadMonitorStats.rateLimitCount = (loadMonitorStats.rateLimitCount || 0) + 1;
+    }
     loadMonitorStats.lastErrorAt = new Date(now).toISOString();
     loadMonitorStats.lastErrorStatus = status;
     loadMonitorStats.lastErrorMessage = String(errorMsg || `HTTP ${status}`).slice(0, 180);
@@ -1045,6 +1041,70 @@ function getSiteRuntime(siteId = getCurrentSiteId()) {
         lastAutoAllocatedRunName: null,
         totalAutoAllocatedCount: 0,
         totalManualAllocatedCount: 0,
+      },
+      loadMonitorStats: {
+        recentLatenciesMs: [],
+        requestTimestampsMs: [],
+        cacheHitTimestampsMs: [],
+        requestsPerMinute: 0,
+        cacheHitsPerMinute: 0,
+        lastLatencyMs: 0,
+        avgLatencyMs: 0,
+        p95LatencyMs: 0,
+        maxLatencyMs: 0,
+        totalRequests: 0,
+        totalCacheHits: 0,
+        totalErrors: 0,
+        consecutiveErrors: 0,
+        rateLimitCount: 0,
+        throttleCount: 0,
+        lastThrottleReason: null,
+        lastThrottleAt: null,
+        lastPoolCheck: null,
+        lastErrorAt: null,
+        lastErrorStatus: null,
+        lastErrorMessage: null,
+        backoffUntilMs: 0,
+        backoffReason: null,
+        lastHoldReason: null,
+        lastHoldLogAtMs: 0,
+        poolGpuFree: null,
+        poolGpuTotal: null,
+        poolGpuUpdatedAt: null,
+      },
+      watchdogStats: {
+        lastSweepAt: null,
+        zombieTerminatedCount: 0,
+        logErrorDetectedCount: 0,
+        logErrorRestartedCount: 0,
+        lastActionMessage: null,
+        workerLogSnippets: {},
+        roundRobinIndex: 0,
+      },
+      hybridFallbackStats: {
+        fallbackTriggeredCount: 0,
+        lastFallbackAt: null,
+        lastFallbackReason: null,
+        lastFallbackMode: null,
+      },
+      badNodeStats: {
+        rapidFailCount: 0,
+        hwErrorCount: 0,
+        consecutiveRapidFails: 0,
+        cooldownUntilMs: 0,
+        lastBadRunId: null,
+        lastBadRunName: null,
+        lastReason: null,
+        lastDetectedAt: null,
+        seenFailedRunIds: new Set(),
+      },
+      pipelineStats: {
+        completedCount: 0,
+        stageTransitionCount: 0,
+        lastCompletedAt: null,
+        lastCompletedReason: null,
+        lastTransitionedAt: null,
+        lastStageCommand: null,
       },
     });
   }
@@ -1679,8 +1739,16 @@ async function fetchApprovalStatusSummary(forceFresh = false) {
             if (!item) continue;
             const rId = String(item.runId || "");
             if (rId) {
+              if (rt.lastKnownApprovalsMap.has(rId)) {
+                rt.lastKnownApprovalsMap.delete(rId);
+              }
               rt.lastKnownApprovalsMap.set(rId, item);
             }
+          }
+          while (rt.lastKnownApprovalsMap.size > 300) {
+            const oldestKey = rt.lastKnownApprovalsMap.keys().next().value;
+            if (oldestKey === undefined) break;
+            rt.lastKnownApprovalsMap.delete(oldestKey);
           }
 
           const seenIds = new Set();
@@ -1849,8 +1917,24 @@ function buildAutoApprovalTimeline(allRuns = getSiteKnownRuns()) {
     }
   }
 
+  const curUser = resolveCurrentUserName(curSiteId);
+  const approvalScope = state.config.autoApprovalScope || "all_group";
+  const isRelevantRunOrItem = (rId, rName, itemUser = "", runObj = null) => {
+    if ((rId && byRunId.has(rId)) || (rName && byName.has(rName))) return true;
+    const probeObj = runObj || { id: rId, containerName: rName };
+    if (state.jobs.some((j) => doesRunMatchJob(probeObj, j, state.jobs))) return true;
+    if (approvalScope === "all_group") return true;
+    if (curUser && curUser !== "admin" && itemUser && String(itemUser).toLowerCase() === curUser.toLowerCase()) {
+      return true;
+    }
+    return false;
+  };
+
   for (const [rId, item] of lastKnownApprovalsMap.entries()) {
-    const entry = ensureEntry(rId, item.runName || item.name);
+    const rName = String(item.runName || item.name || "");
+    const itemUser = String(item.userId || item.userName || "");
+    if (!isRelevantRunOrItem(rId, rName, itemUser)) continue;
+    const entry = ensureEntry(rId, rName);
     if (item.id && !entry.approvalId) entry.approvalId = item.id;
     const reqAt = item.requestedAt || item.createdAt || item.requestTime || item.createTime || null;
     const appAt = item.approvedAt || item.approveTime || item.updatedAt || null;
@@ -1865,6 +1949,9 @@ function buildAutoApprovalTimeline(allRuns = getSiteKnownRuns()) {
     const rId = String(r.id ?? r.runId ?? "");
     const rName = String(r.containerName ?? r.name ?? "");
     if (!rId && !rName) continue;
+    const runUser = String(r.userId || r.userName || r.user || "");
+    const matchedSiteJob = state.jobs.some((j) => doesRunMatchJob(r, j, state.jobs));
+    if (!isRelevantRunOrItem(rId, rName, runUser, r)) continue;
     const entry = ensureEntry(rId, rName);
     entry.runStatus = String(r.status || r.state || r.phase || "Running");
     entry.coreCount = Number(r.coreCount ?? r.coreNum ?? entry.coreCount ?? 4);
@@ -1881,7 +1968,7 @@ function buildAutoApprovalTimeline(allRuns = getSiteKnownRuns()) {
       entry.approvedAt = new Date(new Date(r.startTime).getTime() + 1200).toISOString();
     }
     if (!entry.triggerSource) {
-      entry.triggerSource = "auto_scheduler";
+      entry.triggerSource = matchedSiteJob ? "auto_scheduler" : "manual";
     }
   }
 
@@ -2007,7 +2094,7 @@ async function processPendingApprovals(options = {}) {
       if (jobPrefixes.some((pref) => pref && (rName.startsWith(pref) || rId.startsWith(pref)))) return true;
 
       if (scope === "my_runs") {
-        if (!currentUser || !itemUser || itemUser.toLowerCase() === currentUser.toLowerCase()) {
+        if (currentUser && currentUser !== "admin" && itemUser && itemUser.toLowerCase() === currentUser.toLowerCase()) {
           return true;
         }
       }
@@ -2204,7 +2291,6 @@ async function trackAndApproveCreatedRun({ runId, containerName, job = null }) {
         processPendingApprovals({
           targetRunId: runId,
           targetRunName: containerName,
-          forceAll: true,
         })
       );
       if (res.approvedCount > 0) {
@@ -2226,7 +2312,6 @@ async function trackAndApproveCreatedRun({ runId, containerName, job = null }) {
           const res = await processPendingApprovals({
             targetRunId: runId,
             targetRunName: containerName,
-            forceAll: true,
           });
           if (res.approvedCount > 0) {
             if (job) {
@@ -2437,28 +2522,18 @@ const DEFAULT_ERROR_KEYWORDS = [
   "Killed",
 ];
 
-const watchdogStats = {
-  lastSweepAt: null,
-  zombieTerminatedCount: 0,
-  logErrorDetectedCount: 0,
-  logErrorRestartedCount: 0,
-  lastActionMessage: null,
-  workerLogSnippets: {}, // runId -> { lastLine, hasError, matchedKeyword, updatedAt }
-  roundRobinIndex: 0,
-};
-
-const hybridFallbackStats = {
-  fallbackTriggeredCount: 0,
-  lastFallbackAt: null,
-  lastFallbackReason: null,
-  lastFallbackMode: null,
-};
+const watchdogStats = createSiteRuntimeObjectProxy("watchdogStats");
+const hybridFallbackStats = createSiteRuntimeObjectProxy("hybridFallbackStats");
 
 const recentAlertDedupeMap = new Map(); // key -> timestampMs
-let lastTokenExpiryAlertBucket = null;
 
 async function pushAlertNotification(level, title, message, meta = {}) {
   const now = Date.now();
+  if (recentAlertDedupeMap.size > 100) {
+    for (const [k, ts] of recentAlertDedupeMap.entries()) {
+      if (now - ts > 5 * 60 * 1000) recentAlertDedupeMap.delete(k);
+    }
+  }
   const dedupeKey = `${level}:${title}:${meta.dedupeKey || message}`;
   const prevTs = recentAlertDedupeMap.get(dedupeKey) || 0;
   if (now - prevTs < 60 * 1000) {
@@ -2662,26 +2737,8 @@ const BAD_NODE_ERROR_KEYWORDS = [
   "device-side assert",
 ];
 
-let badNodeStats = {
-  rapidFailCount: 0,
-  hwErrorCount: 0,
-  consecutiveRapidFails: 0,
-  cooldownUntilMs: 0,
-  lastBadRunId: null,
-  lastBadRunName: null,
-  lastReason: null,
-  lastDetectedAt: null,
-  seenFailedRunIds: new Set(),
-};
-
-let pipelineStats = {
-  completedCount: 0,
-  stageTransitionCount: 0,
-  lastCompletedAt: null,
-  lastCompletedReason: null,
-  lastTransitionedAt: null,
-  lastStageCommand: null,
-};
+const badNodeStats = createSiteRuntimeObjectProxy("badNodeStats");
+const pipelineStats = createSiteRuntimeObjectProxy("pipelineStats");
 
 function parseWorkerLogProgress(text = "") {
   const s = String(text || "");
@@ -2779,6 +2836,23 @@ function parseWorkerLogProgress(text = "") {
   };
 }
 
+function getSiteTelemetryObject(siteId = getCurrentSiteId()) {
+  const sid = normalizeSiteId(siteId);
+  if (sid === "n9") {
+    if (!state.telemetry) {
+      state.telemetry = structuredClone(DEFAULT_STATE.telemetry);
+    }
+    return state.telemetry;
+  }
+  if (!state.telemetryBySite || typeof state.telemetryBySite !== "object") {
+    state.telemetryBySite = {};
+  }
+  if (!state.telemetryBySite[sid]) {
+    state.telemetryBySite[sid] = structuredClone(DEFAULT_STATE.telemetry);
+  }
+  return state.telemetryBySite[sid];
+}
+
 function updateGpuTelemetry(
   runsList = [],
   totalRunningWorkers = 0,
@@ -2787,11 +2861,9 @@ function updateGpuTelemetry(
   totalTargetGpus = 0,
   avgApiMs = 0
 ) {
-  if (!state.telemetry) {
-    state.telemetry = structuredClone(DEFAULT_STATE.telemetry);
-  }
+  const siteTel = getSiteTelemetryObject();
   const now = Date.now();
-  const prevMs = Number(state.telemetry.lastAccountingAtMs || 0);
+  const prevMs = Number(siteTel.lastAccountingAtMs || 0);
   const kstDate = new Date(now + 9 * 60 * 60 * 1000);
   const dateKey = kstDate.toISOString().slice(0, 10);
   const timeLabel = kstDate.toISOString().slice(11, 19);
@@ -2800,18 +2872,18 @@ function updateGpuTelemetry(
     const elapsedSec = Math.min(300, (now - prevMs) / 1000);
     if (elapsedSec > 0 && totalRunningGpus > 0) {
       const addedGpuHours = (totalRunningGpus * elapsedSec) / 3600;
-      state.telemetry.totalGpuHours = Math.round((Number(state.telemetry.totalGpuHours || 0) + addedGpuHours) * 10000) / 10000;
-      if (!state.telemetry.dailyGpuHours) state.telemetry.dailyGpuHours = {};
-      state.telemetry.dailyGpuHours[dateKey] =
-        Math.round((Number(state.telemetry.dailyGpuHours[dateKey] || 0) + addedGpuHours) * 10000) / 10000;
+      siteTel.totalGpuHours = Math.round((Number(siteTel.totalGpuHours || 0) + addedGpuHours) * 10000) / 10000;
+      if (!siteTel.dailyGpuHours) siteTel.dailyGpuHours = {};
+      siteTel.dailyGpuHours[dateKey] =
+        Math.round((Number(siteTel.dailyGpuHours[dateKey] || 0) + addedGpuHours) * 10000) / 10000;
     }
   }
-  state.telemetry.lastAccountingAtMs = now;
+  siteTel.lastAccountingAtMs = now;
 
-  const lastSampleMs = Number(state.telemetry.lastSampleAtMs || 0);
+  const lastSampleMs = Number(siteTel.lastSampleAtMs || 0);
   if (!lastSampleMs || now - lastSampleMs >= 15000) {
-    if (!Array.isArray(state.telemetry.timeSeries)) state.telemetry.timeSeries = [];
-    state.telemetry.timeSeries.push({
+    if (!Array.isArray(siteTel.timeSeries)) siteTel.timeSeries = [];
+    siteTel.timeSeries.push({
       time: timeLabel,
       isoTime: new Date(now).toISOString(),
       runningWorkers: totalRunningWorkers,
@@ -2819,20 +2891,20 @@ function updateGpuTelemetry(
       runningGpus: totalRunningGpus,
       targetGpus: totalTargetGpus,
       avgApiMs: Math.round(Number(avgApiMs || 0)),
-      totalGpuHours: Math.round(Number(state.telemetry.totalGpuHours || 0) * 100) / 100,
+      totalGpuHours: Math.round(Number(siteTel.totalGpuHours || 0) * 100) / 100,
     });
-    if (state.telemetry.timeSeries.length > 60) {
-      state.telemetry.timeSeries = state.telemetry.timeSeries.slice(-60);
+    if (siteTel.timeSeries.length > 60) {
+      siteTel.timeSeries = siteTel.timeSeries.slice(-60);
     }
-    state.telemetry.lastSampleAtMs = now;
+    siteTel.lastSampleAtMs = now;
   }
 
   return {
-    totalGpuHours: Math.round(Number(state.telemetry.totalGpuHours || 0) * 100) / 100,
-    todayGpuHours: Math.round(Number(state.telemetry.dailyGpuHours?.[dateKey] || 0) * 100) / 100,
+    totalGpuHours: Math.round(Number(siteTel.totalGpuHours || 0) * 100) / 100,
+    todayGpuHours: Math.round(Number(siteTel.dailyGpuHours?.[dateKey] || 0) * 100) / 100,
     todayDate: dateKey,
-    dailyGpuHours: state.telemetry.dailyGpuHours || {},
-    timeSeries: state.telemetry.timeSeries || [],
+    dailyGpuHours: siteTel.dailyGpuHours || {},
+    timeSeries: siteTel.timeSeries || [],
   };
 }
 
@@ -2844,10 +2916,34 @@ function updateGpuTelemetry(
  */
 async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = {}) {
   const runsList = Array.isArray(allRuns) ? allRuns : [];
+  // Prune stale `workerLogSnippets` entries so memory and `/api/state` payload stay bounded over multi-week runs
+  const snippetsObj = watchdogStats.workerLogSnippets;
+  if (snippetsObj && typeof snippetsObj === "object") {
+    const snippetKeys = Object.keys(snippetsObj);
+    if (snippetKeys.length > 80) {
+      const activeIdSet = new Set(
+        runsList
+          .filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE")
+          .map((r) => String(r.id ?? r.runId ?? ""))
+      );
+      const inactiveKeys = snippetKeys
+        .filter((k) => !activeIdSet.has(k))
+        .sort(
+          (a, b) =>
+            new Date(snippetsObj[b]?.updatedAt || 0).getTime() - new Date(snippetsObj[a]?.updatedAt || 0).getTime()
+        );
+      for (const oldKey of inactiveKeys.slice(30)) {
+        delete snippetsObj[oldKey];
+      }
+    }
+  }
+
+  // Strictly restrict log scanning & automated actions to runs matching our site's job rules (NEVER colleagues' group runs!)
   const runningRuns = runsList.filter(
     (r) =>
       classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
-      String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+      String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING") &&
+      state.jobs.some((j) => doesRunMatchJob(r, j, state.jobs))
   );
   if (runningRuns.length === 0) return { scannedCount: 0, snippets: watchdogStats.workerLogSnippets };
 
@@ -2941,10 +3037,7 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
 
       // Feature 3: Goal Completion / Stage 1 ➔ Stage 2 Pipeline Chaining
       if (matchedCompleteKw && !existing?.matchedCompleteKw && state.config.autoStopOnComplete !== false) {
-        const activeJob =
-          state.jobs.find((j) => j.enabled && doesRunMatchJob(run, j, state.jobs)) ||
-          state.jobs.find((j) => j.enabled) ||
-          state.jobs[0];
+        const activeJob = state.jobs.find((j) => j.enabled && doesRunMatchJob(run, j, state.jobs)) || null;
         if (activeJob && activeJob.enabled) {
           const nextCmd = String(activeJob.nextStageCommand || state.config.nextStageCommand || "").trim();
           if (nextCmd && !activeJob._stage2Transitioned && activeJob.executionCommand !== nextCmd) {
@@ -3007,6 +3100,7 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
         if (state.config.watchdogEnabled !== false && (state.config.logErrorAutoRestart || isBadNodeHwError)) {
           try {
             await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
             watchdogStats.logErrorRestartedCount += 1;
             watchdogStats.lastActionMessage = `로그 에러(${matchedKeyword}) 워커 #${rId} 자동 종료 후 재생성 대기`;
             addLog(
@@ -3041,7 +3135,12 @@ async function runWatchdogSweep(allRuns = getSiteKnownRuns()) {
   const now = Date.now();
   const runsList = Array.isArray(allRuns) ? allRuns : [];
 
-  const activeRuns = runsList.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
+  // Strictly restrict Watchdog termination to runs matching our site's job rules (NEVER terminate colleagues' Pending runs in the group!)
+  const activeRuns = runsList.filter(
+    (r) =>
+      classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
+      state.jobs.some((j) => doesRunMatchJob(r, j, state.jobs))
+  );
   const nonRunningActive = activeRuns.filter(
     (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
@@ -3567,6 +3666,17 @@ function doesRunMatchJob(run, job, allJobs = state.jobs) {
   return true;
 }
 
+function doesRunMatchSiteJobs(run, jobs = state.jobs, targetJobId = null) {
+  if (!run || !Array.isArray(jobs) || jobs.length === 0) return false;
+  if (targetJobId) {
+    const specificJob = jobs.find((j) => String(j.id) === String(targetJobId));
+    if (specificJob) {
+      return doesRunMatchJob(run, specificJob, jobs);
+    }
+  }
+  return jobs.some((j) => doesRunMatchJob(run, j, jobs));
+}
+
 /**
  * Compute real-time Worker Fleet & Auto-Creation progress statistics for the UI
  */
@@ -4076,6 +4186,11 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       const fId = String(fr.id ?? fr.runId ?? "");
       if (!fId || badNodeStats.seenFailedRunIds.has(fId)) continue;
       badNodeStats.seenFailedRunIds.add(fId);
+      while (badNodeStats.seenFailedRunIds.size > 500) {
+        const oldestFailedId = badNodeStats.seenFailedRunIds.values().next().value;
+        if (oldestFailedId === undefined) break;
+        badNodeStats.seenFailedRunIds.delete(oldestFailedId);
+      }
       const startMs = fr.startTime ? new Date(fr.startTime).getTime() : 0;
       const endMs = fr.endTime ? new Date(fr.endTime).getTime() : now;
       const runDurSec = startMs > 0 ? Math.max(0, Math.floor((endMs - startMs) / 1000)) : 9999;
@@ -4201,7 +4316,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
 
     // 🛡️ Smart Load-Safe Guard #1: API Backoff / Rate-Limit Cooldown
     if (loadStatus.enabled && loadStatus.api.backoffRemainingSec > 0) {
-      loadMonitorStats.throttleCount += 1;
+      loadMonitorStats.throttleCount = (loadMonitorStats.throttleCount || 0) + 1;
       loadMonitorStats.lastThrottleAt = new Date(now).toISOString();
       loadMonitorStats.lastThrottleReason = `API 보호 쿨다운 (${loadStatus.api.backoffRemainingSec}초 대기)`;
       job.lastStatus = `🛡️ [서버 과부하 보호] SPACE API 응답 안정화 대기 중 (${loadStatus.api.backoffRemainingSec}초 후 자동 재개 · 남은 생성 예정: +${currentDeficit}개)`;
@@ -4503,7 +4618,7 @@ async function runSchedulerTick(manual = false, options = {}) {
 
     const anyJobAutoApprove = state.jobs.some((j) => j.autoApprove !== false);
     if (manual || state.config.autoApprovalScope !== "off" || anyJobAutoApprove) {
-      approvalTickResult = await processPendingApprovals({ forceAll: manual }).catch((e) => ({ error: e.message }));
+      approvalTickResult = await processPendingApprovals().catch((e) => ({ error: e.message }));
     }
 
     const enabledJobs = state.jobs.filter((j) => j.enabled);
@@ -4522,9 +4637,11 @@ async function runSchedulerTick(manual = false, options = {}) {
         try {
           const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
           if (targetPending > 0) {
-            // Check if any previously-Pending worker transitioned into Running since our last check
-            const matchingActivePre = allRuns.filter(
-              (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
+            const nowTickMs = Date.now();
+            // Check if any previously-Pending worker transitioned into Running/Succeeded (or Failed) since our last check
+            const matchingAllPre = allRuns.filter((r) => doesRunMatchJob(r, job, state.jobs));
+            const matchingActivePre = matchingAllPre.filter(
+              (r) => classifyRunStatus(r.status ?? r.state ?? r.phase) === "ACTIVE"
             );
             const matchingRunningPre = matchingActivePre.filter((r) =>
               String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
@@ -4532,10 +4649,29 @@ async function runSchedulerTick(manual = false, options = {}) {
             const matchingPendingPre = matchingActivePre.filter(
               (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
             );
+            const matchingSucceededPre = matchingAllPre.filter(
+              (r) => classifyRunStatus(r.status ?? r.state ?? r.phase) === "SUCCEEDED"
+            );
+            const matchingFailedPre = matchingAllPre.filter(
+              (r) => classifyRunStatus(r.status ?? r.state ?? r.phase) === "FAILED"
+            );
             const prevPendingIds = Array.isArray(job._knownPendingRunIds) ? job._knownPendingRunIds : [];
             const currentRunningIdSet = new Set(matchingRunningPre.map((r) => String(r.id ?? r.runId ?? "")));
-            const promotedToRunningIds = prevPendingIds.filter((id) => id && currentRunningIdSet.has(String(id)));
+            const currentSucceededIdSet = new Set(matchingSucceededPre.map((r) => String(r.id ?? r.runId ?? "")));
+            const currentFailedIdSet = new Set(matchingFailedPre.map((r) => String(r.id ?? r.runId ?? "")));
+            const promotedToRunningIds = prevPendingIds.filter(
+              (id) => id && (currentRunningIdSet.has(String(id)) || currentSucceededIdSet.has(String(id)))
+            );
+            const failedFromPendingIds =
+              job.restartOnFail !== false
+                ? prevPendingIds.filter(
+                    (id) => id && currentFailedIdSet.has(String(id)) && !rt.recentlyTerminatedRunsMap.has(String(id))
+                  )
+                : [];
             const immediateRefillRequested = Boolean(job._pendingRefillImmediate);
+            const retryBatchDue = Boolean(
+              job._incompletePendingBatchRetryAtMs && nowTickMs >= job._incompletePendingBatchRetryAtMs
+            );
 
             if (promotedToRunningIds.length > 0 && matchingPendingPre.length < targetPending) {
               addLog(
@@ -4545,13 +4681,17 @@ async function runSchedulerTick(manual = false, options = {}) {
             }
 
             const shouldBypassCooldown =
-              manual || Boolean(options?.bypassCooldown) || promotedToRunningIds.length > 0 || immediateRefillRequested;
+              manual ||
+              Boolean(options?.bypassCooldown) ||
+              promotedToRunningIds.length > 0 ||
+              immediateRefillRequested ||
+              retryBatchDue;
             job._pendingRefillImmediate = false;
 
             // Multi-spawn loop in a single tick when `targetPendingRuns > 0`:
             // Keep spawning missing Pending workers until `pendingCount >= targetPending` (with 1s spacing)
             // instead of spawning only 1 worker per 3~10 minute cooldown tick!
-            const maxRefillSteps = Math.min(20, Math.max(targetPending + 4, 6));
+            const maxRefillSteps = Math.min(64, Math.max(targetPending + 4, 6));
             let lastRes = null;
             let spawnedInPass = 0;
             let throttledInPass = false;
@@ -4588,7 +4728,7 @@ async function runSchedulerTick(manual = false, options = {}) {
                 }
                 continue;
               }
-              if (res?.throttled) {
+              if (res?.throttled || res?.loadThrottled) {
                 throttledInPass = true;
               }
               break;
@@ -4604,7 +4744,10 @@ async function runSchedulerTick(manual = false, options = {}) {
               (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
             );
             job._knownPendingRunIds = finalPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
-            if (finalPending.length < targetPending && (spawnedInPass > 0 || throttledInPass)) {
+            if (
+              finalPending.length < targetPending &&
+              (spawnedInPass > 0 || throttledInPass || failedFromPendingIds.length > 0)
+            ) {
               job._incompletePendingBatchRetryAtMs = Date.now() + 15 * 1000;
             } else {
               job._incompletePendingBatchRetryAtMs = 0;
@@ -4691,7 +4834,7 @@ async function runSchedulerTick(manual = false, options = {}) {
  * 2) Dedicated Admin Run-Approval Auto-Approver Loop (`approvalCheckIntervalSec`, min 1s; adapts interval when idle to reduce server load)
  */
 setInterval(() => {
-  const siteIds = Object.keys(rawState.sites || DEFAULT_SITES);
+  const siteIds = Object.keys(rawState.sites || DEFAULT_STATE.sites);
   for (const siteId of siteIds) {
     siteContextStorage.run(siteId, async () => {
       try {
@@ -4805,9 +4948,33 @@ setInterval(() => {
             let eligibleMs = lastTrigMs ? lastTrigMs + jobCooldownSec * 1000 : now;
 
             if (targetPending > 0) {
+              const matchingAll = knownRuns.filter((r) => doesRunMatchJob(r, job, state.jobs));
               const prevPendingIds = Array.isArray(job._knownPendingRunIds) ? job._knownPendingRunIds : [];
-              const currentRunningIdSet = new Set(matchingRunning.map((r) => String(r.id ?? r.runId ?? "")));
-              const hasPromotedToRunning = prevPendingIds.some((id) => id && currentRunningIdSet.has(String(id)));
+              const currentRunningOrSucceededSet = new Set(
+                matchingAll
+                  .filter(
+                    (r) =>
+                      String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING") ||
+                      classifyRunStatus(r.status || r.state || r.phase) === "SUCCEEDED"
+                  )
+                  .map((r) => String(r.id ?? r.runId ?? ""))
+              );
+              const currentFailedIdSet = new Set(
+                matchingAll
+                  .filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "FAILED")
+                  .map((r) => String(r.id ?? r.runId ?? ""))
+              );
+              const hasPromotedToRunning = prevPendingIds.some(
+                (id) => id && currentRunningOrSucceededSet.has(String(id))
+              );
+              const hasFailedFromPending =
+                job.restartOnFail !== false &&
+                prevPendingIds.some(
+                  (id) => id && currentFailedIdSet.has(String(id)) && !rt.recentlyTerminatedRunsMap.has(String(id))
+                );
+              if (hasFailedFromPending && !job._incompletePendingBatchRetryAtMs) {
+                job._incompletePendingBatchRetryAtMs = now + 15 * 1000;
+              }
               if (job._pendingRefillImmediate || hasPromotedToRunning) {
                 job._pendingRefillImmediate = true;
                 eligibleMs = now;
@@ -4886,7 +5053,7 @@ function sendJson(res, status, obj) {
 
 function buildSitesSummaryPayload() {
   const out = {};
-  for (const [sid, profile] of Object.entries(rawState.sites || DEFAULT_SITES)) {
+  for (const [sid, profile] of Object.entries(rawState.sites || DEFAULT_STATE.sites)) {
     const jwt = decodeJwtPayload(profile.accessToken);
     const remSec = jwt?.exp ? Math.floor(jwt.exp - Date.now() / 1000) : null;
     const siteJobs = (rawState.jobs || []).filter((j) => normalizeSiteId(j.siteId || "n9") === sid);
@@ -4898,7 +5065,11 @@ function buildSitesSummaryPayload() {
       0
     );
     const knownRuns = getSiteKnownRuns(sid);
-    const activeRuns = knownRuns.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
+    const allActiveRuns = knownRuns.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
+    const activeRuns =
+      siteJobs.length > 0
+        ? allActiveRuns.filter((r) => siteJobs.some((j) => doesRunMatchJob(r, j, siteJobs)))
+        : allActiveRuns;
     const runningRuns = activeRuns.filter((r) =>
       String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
     );
@@ -5516,7 +5687,8 @@ const server = http.createServer(async (req, res) => {
           .filter(
             (r) =>
               classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
-              String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+              String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING") &&
+              doesRunMatchSiteJobs(r, state.jobs, body.jobId)
           )
           .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
         const batchSize = Math.max(1, Math.min(8, Number(body.batchSize || 2)));
@@ -5527,6 +5699,7 @@ const server = http.createServer(async (req, res) => {
           if (!rId) continue;
           try {
             await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
             terminatedIds.push(rId);
             await sleep(250);
           } catch {
@@ -5594,25 +5767,59 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req).catch(() => ({}));
       const reduceTarget = Boolean(body?.reduceTarget);
       const targetRun = (getSiteKnownRuns() || []).find((r) => String(r.id ?? r.runId ?? "") === String(runId)) || null;
+      const myUser = resolveCurrentUserName();
+      const targetRunUser = String(targetRun?.userId || targetRun?.userName || targetRun?.user || "").trim();
+      if (
+        targetRun &&
+        myUser &&
+        myUser !== "admin" &&
+        targetRunUser &&
+        targetRunUser.toLowerCase() !== String(myUser).toLowerCase() &&
+        !body?.allowOtherUser
+      ) {
+        return sendJson(res, 403, {
+          error: `타 사용자(${targetRunUser})의 워크로드(#${runId})는 오작동 방지를 위해 종료가 차단되어 있습니다.`,
+        });
+      }
       const runName = targetRun?.containerName || targetRun?.name || `#${runId}`;
+      const wasRunningBeforeStop = targetRun
+        ? String(targetRun.status || targetRun.state || targetRun.phase || "").toUpperCase().includes("RUNNING")
+        : true;
       const out = await spaceApi.terminateRun(runId);
       markRunRecentlyTerminated(runId);
 
       let updatedJob = null;
+      let targetAdjustment = null;
       if (reduceTarget) {
         const matchedJob =
           (body?.jobId && state.jobs.find((j) => String(j.id) === String(body.jobId))) ||
           (targetRun && state.jobs.find((j) => doesRunMatchJob(targetRun, j, state.jobs))) ||
-          state.jobs.find((j) => j.enabled) ||
-          state.jobs[0];
+          null;
         if (matchedJob) {
           const prevTarget = Math.max(1, Number(matchedJob.minConcurrentRuns || 1));
-          const nextTarget = Math.max(1, prevTarget - 1);
-          matchedJob.minConcurrentRuns = nextTarget;
-          if (prevTarget === 1) {
-            matchedJob.enabled = false;
+          const prevPendingTarget = Math.max(0, Number(matchedJob.targetPendingRuns ?? 0));
+          if (prevPendingTarget > 0 && !wasRunningBeforeStop) {
+            // Deleting a Pending queue slot when targetPendingRuns > 0 reduces targetPendingRuns without touching Running target
+            matchedJob.targetPendingRuns = Math.max(0, prevPendingTarget - 1);
+          } else {
+            const nextTarget = Math.max(1, prevTarget - 1);
+            matchedJob.minConcurrentRuns = nextTarget;
+            if (prevTarget === 1 && prevPendingTarget === 0) {
+              matchedJob.enabled = false;
+            }
+          }
+          if (Array.isArray(matchedJob._knownPendingRunIds)) {
+            matchedJob._knownPendingRunIds = matchedJob._knownPendingRunIds.filter((id) => String(id) !== String(runId));
           }
           updatedJob = matchedJob;
+          targetAdjustment = {
+            jobId: matchedJob.id,
+            jobName: matchedJob.name,
+            previousTarget: prevTarget,
+            newTarget: matchedJob.minConcurrentRuns,
+            previousPendingTarget: prevPendingTarget,
+            newPendingTarget: Math.max(0, Number(matchedJob.targetPendingRuns ?? 0)),
+          };
           saveState();
         }
       }
@@ -5621,15 +5828,20 @@ const server = http.createServer(async (req, res) => {
       addLog(
         "warn",
         reduceTarget && updatedJob
-          ? `🗑️ [워커 슬롯 삭제] ${runName} (#${runId}) 강제 종료 + [${updatedJob.name}] 목표 워커 수 ${updatedJob.minConcurrentRuns}개로 자동 축소 (재생성 방지)`
+          ? `🗑️ [워커 슬롯 삭제] ${runName} (#${runId}) 강제 종료 + [${updatedJob.name}] 목표 워커 수 ${targetAdjustment.previousTarget}개 ➔ ${updatedJob.minConcurrentRuns}개로 축소${
+              targetAdjustment.previousPendingTarget !== targetAdjustment.newPendingTarget
+                ? ` (목표 Pending ${targetAdjustment.previousPendingTarget}개 ➔ ${targetAdjustment.newPendingTarget}개)`
+                : ""
+            } (재생성 방지)`
           : `🛑 [워커 즉시 Kill] ${runName} (#${runId}) 강제 종료 완료`,
-        { runId, runName, reduceTarget, newTarget: updatedJob?.minConcurrentRuns }
+        { runId, runName, reduceTarget, newTarget: updatedJob?.minConcurrentRuns, targetAdjustment }
       );
       return sendJson(res, 200, {
         ok: true,
         data: out,
         reduceTarget,
         updatedJob,
+        targetAdjustment,
         jobs: state.jobs,
         workerFleet: computeWorkerFleetStats(getSiteKnownRuns()),
       });
@@ -5685,9 +5897,26 @@ const server = http.createServer(async (req, res) => {
         const terminatedIds = [];
         const terminatedNames = [];
         const perJobTerminatedCount = new Map();
+        const perJobRunningDeletedCount = new Map();
+        const perJobPendingDeletedCount = new Map();
+        const myUser = resolveCurrentUserName();
 
         for (const rId of targetIdsList) {
           const runObj = runs.find((r) => String(r.id ?? r.runId ?? "") === rId) || null;
+          const runUser = String(runObj?.userId || runObj?.userName || runObj?.user || "").trim();
+          if (
+            runObj &&
+            myUser &&
+            myUser !== "admin" &&
+            runUser &&
+            runUser.toLowerCase() !== String(myUser).toLowerCase() &&
+            !body?.allowOtherUser
+          ) {
+            continue;
+          }
+          const wasRunRunning = runObj
+            ? String(runObj.status || runObj.state || runObj.phase || "").toUpperCase().includes("RUNNING")
+            : true;
           try {
             await spaceApi.terminateRun(rId);
             markRunRecentlyTerminated(rId);
@@ -5699,6 +5928,11 @@ const server = http.createServer(async (req, res) => {
                 (runObj && state.jobs.find((j) => doesRunMatchJob(runObj, j, state.jobs)));
               if (matchedJob) {
                 perJobTerminatedCount.set(matchedJob.id, (perJobTerminatedCount.get(matchedJob.id) || 0) + 1);
+                if (wasRunRunning) {
+                  perJobRunningDeletedCount.set(matchedJob.id, (perJobRunningDeletedCount.get(matchedJob.id) || 0) + 1);
+                } else {
+                  perJobPendingDeletedCount.set(matchedJob.id, (perJobPendingDeletedCount.get(matchedJob.id) || 0) + 1);
+                }
               }
             }
             if (targetIdsList.length > 1) {
@@ -5709,19 +5943,49 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
+        let targetAdjustment = null;
         if (reduceTarget && perJobTerminatedCount.size > 0) {
           for (const [jId, delCnt] of perJobTerminatedCount.entries()) {
             const jobObj = state.jobs.find((j) => String(j.id) === String(jId));
             if (!jobObj) continue;
-            // Compute new target so scheduler does not respawn the deleted workers
+            const prevTarget = Math.max(1, Number(jobObj.minConcurrentRuns || 1));
+            const prevPendingTarget = Math.max(0, Number(jobObj.targetPendingRuns ?? 0));
+            const runningDelCnt = perJobRunningDeletedCount.get(jId) || 0;
+            const pendingDelCnt = perJobPendingDeletedCount.get(jId) || 0;
             const remainingActiveForJob = activeRuns.filter(
               (r) => !terminatedIds.includes(String(r.id ?? r.runId ?? "")) && doesRunMatchJob(r, jobObj, state.jobs)
             ).length;
-            const prevTarget = Math.max(1, Number(jobObj.minConcurrentRuns || 1));
-            const nextTargetBySub = Math.max(1, prevTarget - delCnt);
-            jobObj.minConcurrentRuns = Math.min(nextTargetBySub, Math.max(1, remainingActiveForJob));
-            if (remainingActiveForJob === 0 && prevTarget <= delCnt) {
-              jobObj.enabled = false;
+
+            if (prevPendingTarget > 0) {
+              if (pendingDelCnt > 0) {
+                jobObj.targetPendingRuns = Math.max(0, prevPendingTarget - pendingDelCnt);
+              }
+              if (runningDelCnt > 0) {
+                jobObj.minConcurrentRuns = Math.max(1, prevTarget - runningDelCnt);
+              }
+              if (remainingActiveForJob === 0 && jobObj.targetPendingRuns === 0 && prevTarget <= runningDelCnt) {
+                jobObj.enabled = false;
+              }
+            } else {
+              const nextTargetBySub = Math.max(1, prevTarget - delCnt);
+              jobObj.minConcurrentRuns = Math.min(nextTargetBySub, Math.max(1, remainingActiveForJob));
+              if (remainingActiveForJob === 0 && prevTarget <= delCnt) {
+                jobObj.enabled = false;
+              }
+            }
+            if (Array.isArray(jobObj._knownPendingRunIds)) {
+              const termSet = new Set(terminatedIds.map(String));
+              jobObj._knownPendingRunIds = jobObj._knownPendingRunIds.filter((id) => !termSet.has(String(id)));
+            }
+            if (!targetAdjustment) {
+              targetAdjustment = {
+                jobId: jobObj.id,
+                jobName: jobObj.name,
+                previousTarget: prevTarget,
+                newTarget: jobObj.minConcurrentRuns,
+                previousPendingTarget: prevPendingTarget,
+                newPendingTarget: Math.max(0, Number(jobObj.targetPendingRuns ?? 0)),
+              };
             }
           }
           saveState();
@@ -5734,7 +5998,7 @@ const server = http.createServer(async (req, res) => {
           reduceTarget
             ? `🗑️ [선택 워커 슬롯 영구 삭제] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료하고 목표 워커 수를 자동 축소했습니다.`
             : `🛑 [선택 워커 슬롯 즉시 Kill] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료했습니다.`,
-          { terminatedIds, terminatedNames, reduceTarget }
+          { terminatedIds, terminatedNames, reduceTarget, targetAdjustment }
         );
         return sendJson(res, 200, {
           ok: true,
@@ -5743,6 +6007,7 @@ const server = http.createServer(async (req, res) => {
           terminatedCount: terminatedIds.length,
           terminatedIds,
           terminatedNames,
+          targetAdjustment,
           jobs: state.jobs,
           workerFleet: fleet,
         });
@@ -5809,8 +6074,10 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (action === "stop_pending") {
+        // Strictly restrict bulk cancel to Pending runs matching our site's job rules (NEVER cancel colleagues' Pending runs!)
+        const matchedPendingRuns = pendingRuns.filter((r) => doesRunMatchSiteJobs(r, state.jobs, body.jobId));
         const terminatedIds = [];
-        for (const r of pendingRuns) {
+        for (const r of matchedPendingRuns) {
           const rId = String(r.id ?? r.runId ?? "");
           if (!rId) continue;
           try {
@@ -5824,7 +6091,7 @@ const server = http.createServer(async (req, res) => {
         }
         const updatedRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
         const fleet = computeWorkerFleetStats(updatedRuns);
-        addLog("warn", `⏳ [Pending 워커 일괄 취소] 준비 대기 중인 워커 ${terminatedIds.length}개를 일괄 취소했습니다.`, {
+        addLog("warn", `⏳ [Pending 워커 일괄 취소] 규칙에 매칭된 준비 대기 워커 ${terminatedIds.length}개를 일괄 취소했습니다.`, {
           terminatedIds,
         });
         return sendJson(res, 200, {
@@ -5837,8 +6104,10 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (action === "rolling_restart") {
+        // Strictly restrict rolling restart to Running runs matching our site's job rules (NEVER restart colleagues' runs!)
+        const matchedRunningRuns = runningRuns.filter((r) => doesRunMatchSiteJobs(r, state.jobs, body.jobId));
         const batchSize = Math.max(1, Math.min(8, Number(body.batchSize || 1)));
-        const targets = runningRuns.slice(0, batchSize);
+        const targets = matchedRunningRuns.slice(0, batchSize);
         const terminatedIds = [];
         const terminatedNames = [];
         for (const r of targets) {
@@ -5873,11 +6142,18 @@ const server = http.createServer(async (req, res) => {
 
       if (action === "stop_all") {
         if (body.pauseAutoCreate !== false) {
-          for (const j of state.jobs) j.enabled = false;
+          if (body.jobId) {
+            const targetJob = state.jobs.find((j) => String(j.id) === String(body.jobId));
+            if (targetJob) targetJob.enabled = false;
+          } else {
+            for (const j of state.jobs) j.enabled = false;
+          }
           saveState();
         }
+        // Strictly restrict `stop_all` to active runs matching our site's job rules (NEVER terminate colleagues' active runs in the group!)
+        const matchedActiveRuns = activeRuns.filter((r) => doesRunMatchSiteJobs(r, state.jobs, body.jobId));
         const terminatedIds = [];
-        for (const r of activeRuns) {
+        for (const r of matchedActiveRuns) {
           const rId = String(r.id ?? r.runId ?? "");
           if (!rId) continue;
           try {
@@ -5893,7 +6169,7 @@ const server = http.createServer(async (req, res) => {
         const fleet = computeWorkerFleetStats(updatedRuns);
         addLog(
           "warn",
-          `🛑 [전체 워커 일괄 종료] 활성 워커 ${terminatedIds.length}개를 일괄 종료했습니다.${body.pauseAutoCreate !== false ? " (주기 자동생성 OFF 전환됨)" : ""}`,
+          `🛑 [전체 워커 일괄 종료] 규칙에 매칭된 활성 워커 ${terminatedIds.length}개를 일괄 종료했습니다.${body.pauseAutoCreate !== false ? " (주기 자동생성 OFF 전환됨)" : ""}`,
           { terminatedIds }
         );
         return sendJson(res, 200, {
@@ -6125,9 +6401,11 @@ const server = http.createServer(async (req, res) => {
       const format = String(parsedUrl.searchParams.get("format") || "csv").toLowerCase();
       const fleet = computeWorkerFleetStats(getSiteKnownRuns());
       const tel = fleet.telemetry || {};
+      const exportSid = getCurrentSiteId();
       if (format === "json") {
         return sendJson(res, 200, {
           exportedAt: new Date().toISOString(),
+          siteId: exportSid,
           groupId: state.config.groupId,
           totalGpuHours: tel.totalGpuHours || 0,
           todayGpuHours: tel.todayGpuHours || 0,
@@ -6163,7 +6441,7 @@ const server = http.createServer(async (req, res) => {
       const csvText = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
       res.writeHead(200, {
         "Content-Type": "text/csv; charset=utf-8",
-        "Content-Disposition": `attachment; filename="space-gpu-telemetry-${new Date().toISOString().slice(0, 10)}.csv"`,
+        "Content-Disposition": `attachment; filename="space-gpu-telemetry-${exportSid}-${new Date().toISOString().slice(0, 10)}.csv"`,
       });
       res.end("\uFEFF" + csvText);
       return;
@@ -6618,7 +6896,7 @@ function getLocalIpv4Addresses() {
 
 server.listen(PORT, HOST, () => {
   const lanIps = getLocalIpv4Addresses();
-  const siteSummaryList = Object.values(rawState.sites || DEFAULT_SITES)
+  const siteSummaryList = Object.values(rawState.sites || DEFAULT_STATE.sites)
     .map((s) => `${s.id.toUpperCase()}[${s.gpuModel}]: ${s.baseUrl}`)
     .join(" | ");
   console.log(`======================================================================`);
@@ -6630,7 +6908,7 @@ server.listen(PORT, HOST, () => {
   console.log(`👉 Localhost        : http://localhost:${PORT} (Password: ${ADMIN_PASSWORD})`);
   console.log(`👉 Managed Sites    : ${siteSummaryList}`);
   console.log(`======================================================================`);
-  const siteKeys = Object.keys(rawState.sites || DEFAULT_SITES);
+  const siteKeys = Object.keys(rawState.sites || DEFAULT_STATE.sites);
   for (const siteKey of siteKeys) {
     siteContextStorage.run(siteKey, () => {
       if (state.config.accessToken) {
