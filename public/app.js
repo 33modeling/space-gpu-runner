@@ -4309,7 +4309,23 @@ function setSpaceRunsFilter(filterMode) {
 
 function classifyUiRunStatus(status) {
   const s = String(status || "").toUpperCase();
-  if (["RUNNING", "PENDING", "CREATING", "STAGING", "INITIALIZING", "QUEUED", "STARTING", "APPROVED", "ADMITTED", "SCHEDULED", "WAITING"].some((k) => s.includes(k))) {
+  if (
+    [
+      "RUNNING",
+      "PENDING",
+      "CREATING",
+      "STAGING",
+      "INITIALIZING",
+      "QUEUED",
+      "STARTING",
+      "WAIT",
+      "WAITING",
+      "APPROVAL",
+      "APPROVED",
+      "ADMITTED",
+      "SCHEDULED",
+    ].some((k) => s.includes(k))
+  ) {
     return "ACTIVE";
   }
   if (["SUCCEEDED", "COMPLETED", "FINISHED", "DONE"].some((k) => s.includes(k))) {

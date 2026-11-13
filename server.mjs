@@ -2334,9 +2334,23 @@ async function trackAndApproveCreatedRun({ runId, containerName, job = null }) {
 function classifyRunStatus(statusRaw) {
   const s = String(statusRaw || "").toUpperCase();
   if (
-    ["RUNNING", "PENDING", "STAGING", "CREATING", "SUBMITTED", "QUEUED", "STARTING", "INITIALIZING", "MIGRATING", "WAITING", "APPROVED", "ADMITTED", "SCHEDULED"].some((k) =>
-      s.includes(k)
-    )
+    [
+      "RUNNING",
+      "PENDING",
+      "STAGING",
+      "CREATING",
+      "SUBMITTED",
+      "QUEUED",
+      "STARTING",
+      "INITIALIZING",
+      "MIGRATING",
+      "WAIT",
+      "WAITING",
+      "APPROVAL",
+      "APPROVED",
+      "ADMITTED",
+      "SCHEDULED",
+    ].some((k) => s.includes(k))
   ) {
     return "ACTIVE";
   }
@@ -2764,8 +2778,9 @@ function parseWorkerLogProgress(text = "") {
   let stepInfo = null;
   const epochMatch = recentChunk.match(/\b(epoch\s*\d+(?:\s*\/\s*\d+)?)/i);
   const stepMatch =
-    recentChunk.match(/\b(?:step|iter|batch)?\s*(\d+\s*\/\s*\d+)\b/i) ||
-    recentChunk.match(/\|\s*(\d+\/\d+)\s*\[/);
+    recentChunk.match(/\b(?:step|iter|batch)\s*(\d+\s*\/\s*\d+)\b/i) ||
+    recentChunk.match(/\|\s*(\d+\/\d+)\s*\[/) ||
+    (!epochMatch ? recentChunk.match(/\b(\d+\s*\/\s*\d+)\b/) : null);
   if (epochMatch && stepMatch) {
     stepInfo = `${epochMatch[1]} · ${stepMatch[1].replace(/\s+/g, "")}`;
   } else if (epochMatch) {

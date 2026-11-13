@@ -5,7 +5,9 @@
   "type": "module",
   "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test tests/run-tests.mjs",
+    "check": "node --check server.mjs && node --check public/app.js"
   },
   "engines": {
     "node": ">=20.0.0"
