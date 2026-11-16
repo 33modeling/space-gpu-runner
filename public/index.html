@@ -665,17 +665,29 @@
             <input type="text" id="jobName" value="group-vol-worker" class="mono" placeholder="예: qwen-worker, eval-job-2" style="font-size:13.5px; font-weight:700;" />
           </div>
 
-          <!-- ② 목표 동시 워커 수 -->
+          <!-- ② 목표 동시 워커 수 & 목표 총 GPU 장수 -->
           <div class="form-group">
-            <label style="font-size:12.5px; font-weight:700; color:#e2e8f0;">② 유지할 전체 목표 워커 개수 (`minConcurrentRuns`)</label>
+            <label style="font-size:12.5px; font-weight:700; color:#e2e8f0;">② 유지할 목표 워커 수 (`minConcurrentRuns`) &amp; 목표 총 GPU (`targetGpus`)</label>
             <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap;">
-              <input type="number" id="jobMinConcurrent" min="1" max="9999" value="1" class="mono" style="width:78px; font-size:14px; font-weight:800; color:#60a5fa;" />
-              <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=1">1개</button>
-              <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=8">8개</button>
-              <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=16">16개</button>
-              <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=32">32개</button>
-              <button type="button" class="secondary sm" style="padding:4px 7px;" onclick="document.getElementById('jobMinConcurrent').value=48">48개</button>
+              <span style="font-size:11.5px; color:#93c5fd; font-weight:700;">워커:</span>
+              <input type="number" id="jobMinConcurrent" min="1" max="9999" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('workers')" style="width:72px; font-size:14px; font-weight:800; color:#60a5fa;" />
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobMinConcurrent').value=1; syncJobFormWorkerGpuInputs('workers')">1개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobMinConcurrent').value=8; syncJobFormWorkerGpuInputs('workers')">8개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobMinConcurrent').value=16; syncJobFormWorkerGpuInputs('workers')">16개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobMinConcurrent').value=30; syncJobFormWorkerGpuInputs('workers')">30개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobMinConcurrent').value=48; syncJobFormWorkerGpuInputs('workers')">48개</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobMinConcurrent').value=60; syncJobFormWorkerGpuInputs('workers')">60개</button>
             </div>
+            <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+              <span style="font-size:11.5px; color:#6ee7b7; font-weight:700;">총 GPU:</span>
+              <input type="number" id="jobTargetGpus" min="1" max="99999" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('gpus')" style="width:76px; font-size:14px; font-weight:800; color:#34d399; border-color:rgba(16,185,129,0.55);" title="목표 총 GPU 장수를 입력하면 워커당 GPU 수에 맞춰 목표 워커 개수가 자동 계산됩니다" />
+              <button type="button" class="secondary sm" style="padding:4px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="document.getElementById('jobTargetGpus').value=32; syncJobFormWorkerGpuInputs('gpus')">32장</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="document.getElementById('jobTargetGpus').value=64; syncJobFormWorkerGpuInputs('gpus')">64장</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="document.getElementById('jobTargetGpus').value=120; syncJobFormWorkerGpuInputs('gpus')">120장</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="document.getElementById('jobTargetGpus').value=160; syncJobFormWorkerGpuInputs('gpus')">160장</button>
+              <button type="button" class="secondary sm" style="padding:4px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="document.getElementById('jobTargetGpus').value=240; syncJobFormWorkerGpuInputs('gpus')">240장</button>
+            </div>
+            <div id="jobTargetGpuCalcHint" class="hint" style="margin-top:3px; font-size:11px; color:#6ee7b7;">워커 1개 × GPU 1장 = 목표 총 GPU 1장 (상한 엄격 적용)</div>
           </div>
 
           <!-- ②-2 목표 Pending 대기 개수 -->
@@ -691,7 +703,7 @@
               <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=8">8개</button>
               <button type="button" class="secondary sm" style="padding:4px 6px;" onclick="document.getElementById('jobTargetPending').value=10">10개</button>
             </div>
-            <div class="hint" style="margin-top:2px; font-size:11px; color:#fcd34d;">1 이상 입력 시 Running 개수와 무관하게 대기열(Pending)을 항상 해당 개수로 유지합니다.</div>
+            <div class="hint" style="margin-top:2px; font-size:11px; color:#fcd34d;">전체 목표 워커(총 GPU) 상한 범위 내에서 대기열(Pending)을 해당 개수로 자동 유지합니다.</div>
           </div>
 
           <!-- ③ 실행 방식 (Standard vs Spot) & GPU 선택 -->
@@ -705,7 +717,7 @@
               </select>
               <div style="display:flex; align-items:center; gap:4px; font-size:12px;">
                 <span>워커당 GPU:</span>
-                <input type="number" id="jobCoreCount" min="1" max="64" value="1" class="mono" style="width:58px;" />
+                <input type="number" id="jobCoreCount" min="1" max="64" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('coreCount')" style="width:58px;" />
                 <span>장</span>
               </div>
             </div>

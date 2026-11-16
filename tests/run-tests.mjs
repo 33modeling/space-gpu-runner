@@ -63,6 +63,8 @@ function createServerLogicSandbox() {
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
+    "computeJobTargetMetrics",
+    "computeAdjustedTargetsAfterSlotDelete",
   ];
 
   const context = vm.createContext({
@@ -248,61 +250,154 @@ describe("Suite 3: 스케줄러 상태 분류, 부족분(Deficit), 슬롯 예약
     }
   });
 
-  test("TC-10: `targetPendingRuns` 활성화 여부에 따른 부족분(Deficit) 계산 정확성 검증", () => {
-    const computeDeficit = ({ minConcurrent, targetPending, runningCount, pendingCount, inFlightCount }) => {
-      const effectiveActiveCount = runningCount + pendingCount + inFlightCount;
-      const effectivePendingCount = pendingCount + inFlightCount;
-      return targetPending > 0
-        ? Math.max(0, targetPending - effectivePendingCount)
-        : Math.max(0, minConcurrent - effectiveActiveCount);
-    };
+  test("TC-10: `computeJobTargetMetrics`가 전체 목표(`minConcurrentRuns`) 상한 내에서 `deficit`을 정확히 계산", () => {
+    // Case 1: v8 운영 시나리오 (목표 56, Running 20개 가동 중, targetPending = 6, 현재 Pending = 4, InFlight = 0 -> 2개 즉시 보충)
+    const m1 = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 56,
+      targetPendingRuns: 6,
+      coreCount: 4,
+      runningCount: 20,
+      pendingCount: 4,
+      inFlightCount: 0,
+    });
+    assert.equal(m1.deficit, 2);
+    assert.equal(m1.targetCount, 56);
+    assert.equal(m1.targetGpuCount, 224);
 
-    // Case 1: v8 운영 시나리오 (Running 20개 가동 중, targetPending = 6, 현재 Pending = 4, InFlight = 0 -> 2개 즉시 보충)
-    assert.equal(
-      computeDeficit({ minConcurrent: 56, targetPending: 6, runningCount: 20, pendingCount: 4, inFlightCount: 0 }),
-      2
-    );
     // Case 2: In-Flight 예약 2개가 이미 생성 중이면 중복 생성 0개
-    assert.equal(
-      computeDeficit({ minConcurrent: 56, targetPending: 6, runningCount: 20, pendingCount: 4, inFlightCount: 2 }),
-      0
-    );
+    const m2 = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 56,
+      targetPendingRuns: 6,
+      coreCount: 4,
+      runningCount: 20,
+      pendingCount: 4,
+      inFlightCount: 2,
+    });
+    assert.equal(m2.deficit, 0);
+
     // Case 3: targetPending = 0 일반 모드 (목표 20, Running 15 + Pending 3 = 18 -> 부족분 2개)
-    assert.equal(
-      computeDeficit({ minConcurrent: 20, targetPending: 0, runningCount: 15, pendingCount: 3, inFlightCount: 0 }),
-      2
-    );
+    const m3 = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 20,
+      targetPendingRuns: 0,
+      coreCount: 4,
+      runningCount: 15,
+      pendingCount: 3,
+      inFlightCount: 0,
+    });
+    assert.equal(m3.deficit, 2);
+    assert.equal(m3.targetGpuCount, 80);
   });
 
-  test("TC-11: 슬롯 영구 삭제(`reduceTarget: true`) 시 Running 목표와 Pending 목표의 독립 차감 검증", () => {
-    function applySingleSlotPermanentDelete(job, wasRunningBeforeStop) {
-      const prevTarget = Math.max(1, Number(job.minConcurrentRuns || 1));
-      const prevPendingTarget = Math.max(0, Number(job.targetPendingRuns ?? 0));
-      if (prevPendingTarget > 0 && !wasRunningBeforeStop) {
-        job.targetPendingRuns = Math.max(0, prevPendingTarget - 1);
-      } else {
-        job.minConcurrentRuns = Math.max(1, prevTarget - 1);
-        if (prevTarget === 1 && prevPendingTarget === 0) {
-          job.enabled = false;
-        }
-      }
-      return job;
-    }
+  test("TC-11: `computeAdjustedTargetsAfterSlotDelete`가 목표 범위 내 슬롯 영구 삭제 시 목표를 정확히 차감", () => {
+    // Pending 대기 슬롯 삭제 시 (Running 20 + Pending 6 = 26 <= 목표 56): Running 목표(56) 유지, targetPendingRuns 6 -> 5 차감
+    const resA = srv.computeAdjustedTargetsAfterSlotDelete({
+      prevTarget: 56,
+      prevPendingTarget: 6,
+      activeBefore: 26,
+      pendingBefore: 6,
+      runningDeletedCount: 0,
+      pendingDeletedCount: 1,
+    });
+    assert.equal(resA.newTarget, 56);
+    assert.equal(resA.newPendingTarget, 5);
+    assert.equal(resA.shouldDisable, false);
 
-    // Pending 대기 슬롯 삭제 시: Running 목표(56)는 유지되고 targetPendingRuns만 6 -> 5 차감
-    const jobA = applySingleSlotPermanentDelete({ minConcurrentRuns: 56, targetPendingRuns: 6, enabled: true }, false);
-    assert.equal(jobA.minConcurrentRuns, 56);
-    assert.equal(jobA.targetPendingRuns, 5);
+    // Running 가동 슬롯 삭제 시 (Running 50 + Pending 6 = 56 <= 목표 56): minConcurrentRuns 56 -> 55 차감
+    const resB = srv.computeAdjustedTargetsAfterSlotDelete({
+      prevTarget: 56,
+      prevPendingTarget: 6,
+      activeBefore: 56,
+      pendingBefore: 6,
+      runningDeletedCount: 1,
+      pendingDeletedCount: 0,
+    });
+    assert.equal(resB.newTarget, 55);
+    assert.equal(resB.newPendingTarget, 6);
+    assert.equal(resB.shouldDisable, false);
 
-    // Running 가동 슬롯 삭제 시: minConcurrentRuns만 56 -> 55 차감, targetPendingRuns(6)는 유지
-    const jobB = applySingleSlotPermanentDelete({ minConcurrentRuns: 56, targetPendingRuns: 6, enabled: true }, true);
-    assert.equal(jobB.minConcurrentRuns, 55);
-    assert.equal(jobB.targetPendingRuns, 6);
+    // targetPendingRuns = 0 인 상태에서 마지막 1개 슬롯 삭제 시: 자동생성 shouldDisable = true 전환
+    const resC = srv.computeAdjustedTargetsAfterSlotDelete({
+      prevTarget: 1,
+      prevPendingTarget: 0,
+      activeBefore: 1,
+      pendingBefore: 0,
+      runningDeletedCount: 1,
+      pendingDeletedCount: 0,
+    });
+    assert.equal(resC.newTarget, 1);
+    assert.equal(resC.shouldDisable, true);
+  });
 
-    // targetPendingRuns = 0 인 상태에서 마지막 1개 슬롯 삭제 시: 자동생성 enabled = false 전환
-    const jobC = applySingleSlotPermanentDelete({ minConcurrentRuns: 1, targetPendingRuns: 0, enabled: true }, true);
-    assert.equal(jobC.minConcurrentRuns, 1);
-    assert.equal(jobC.enabled, false);
+  test("TC-24: [회귀 방지] `targetPendingRuns > 0`이어도 목표 워커·총 GPU(`minConcurrentRuns * coreCount`)를 절대 부풀리거나 초과 생성하지 않음", () => {
+    // 실제 장애 재현 1: 목표 60워커(240 GPU), Running 103 + Pending 6, targetPendingRuns 6
+    // 과거 버그: targetCount가 109(436 GPU)로 덮어써지고 excessPendingCount가 0이 되었음!
+    const over60 = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 60,
+      targetPendingRuns: 6,
+      coreCount: 4,
+      runningCount: 103,
+      pendingCount: 6,
+      inFlightCount: 0,
+    });
+    assert.equal(over60.targetCount, 60);
+    assert.equal(over60.targetGpuCount, 240);
+    assert.equal(over60.deficit, 0);
+    assert.equal(over60.remainingToCreate, 0);
+    assert.equal(over60.excessActiveCount, 49);
+    assert.equal(over60.excessPendingCount, 6);
+
+    // 실제 장애 재현 2: 목표 30워커(120 GPU), Running 31 + Pending 2, targetPendingRuns 2
+    const over30 = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 30,
+      targetPendingRuns: 2,
+      coreCount: 4,
+      runningCount: 31,
+      pendingCount: 2,
+      inFlightCount: 0,
+    });
+    assert.equal(over30.targetCount, 30);
+    assert.equal(over30.targetGpuCount, 120);
+    assert.equal(over30.deficit, 0);
+    assert.equal(over30.excessActiveCount, 3);
+    assert.equal(over30.excessPendingCount, 2);
+
+    // 경계 조건: 목표 30워커(120 GPU), Running 29 + Pending 0, targetPendingRuns 2 -> 총 목표 상한(30) 때문에 1개만 생성해야 함!
+    const boundary = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 30,
+      targetPendingRuns: 2,
+      coreCount: 4,
+      runningCount: 29,
+      pendingCount: 0,
+      inFlightCount: 0,
+    });
+    assert.equal(boundary.targetCount, 30);
+    assert.equal(boundary.deficit, 1);
+    assert.equal(boundary.remainingGpuToCreate, 4);
+  });
+
+  test("TC-25: [회귀 방지] 목표 초과 상태(`activeBefore > prevTarget`)에서 초과 워커 슬롯 삭제 시 설정된 목표(`prevTarget`)가 깎이지 않고 보존됨", () => {
+    // 실제 장애 재현: 목표 60워커 상태에서 103개 가동 중 초과분 1개를 슬롯 삭제해도 목표 60이 59로 줄어들면 안 됨!
+    const keep60 = srv.computeAdjustedTargetsAfterSlotDelete({
+      prevTarget: 60,
+      prevPendingTarget: 0,
+      activeBefore: 103,
+      pendingBefore: 0,
+      runningDeletedCount: 1,
+      pendingDeletedCount: 0,
+    });
+    assert.equal(keep60.newTarget, 60);
+    assert.equal(keep60.shouldDisable, false);
+
+    // 초과분 43개를 넘어 총 44개를 일괄 삭제해 남은 활성 워커가 59개가 된 경우에만 60 -> 59로 1개 차감됨
+    const trim44 = srv.computeAdjustedTargetsAfterSlotDelete({
+      prevTarget: 60,
+      prevPendingTarget: 0,
+      activeBefore: 103,
+      pendingBefore: 0,
+      runningDeletedCount: 44,
+      pendingDeletedCount: 0,
+    });
+    assert.equal(trim44.newTarget, 59);
   });
 
   test("TC-12: `pickNextWorkerSlot` 및 `reserveWorkerSlot` 인플라이트 슬롯 번호 중복 할당 방지", () => {
@@ -528,5 +623,26 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     const jsonN6 = await expN6.json();
     assert.equal(jsonN9.siteId, "n9");
     assert.equal(jsonN6.siteId, "n6");
+  });
+
+  test("TC-26: 라이브 `GET /api/state`의 모든 규칙에서 `targetCount`·`targetGpuCount`가 설정값(`minConcurrentRuns * coreCount`)과 정확히 일치", async (t) => {
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
+    const res = await fetch(`${BASE_URL}/api/state`, {
+      headers: { "X-Admin-Password": ADMIN_PW, "X-Site-Id": "n9" },
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    const jobMap = new Map((data.jobs || []).map((j) => [j.id, j]));
+    for (const jf of data.workerFleet?.jobs || []) {
+      const cfgJob = jobMap.get(jf.jobId);
+      assert.ok(cfgJob, `workerFleet job ${jf.jobId} must exist in state.jobs`);
+      const expectedWorkers = Math.max(1, Number(cfgJob.minConcurrentRuns || 1));
+      const expectedGpus = expectedWorkers * Math.max(1, Number(cfgJob.coreCount || 1));
+      assert.equal(jf.targetCount, expectedWorkers, `[${cfgJob.name}] targetCount가 설정값과 일치해야 함`);
+      assert.equal(jf.targetGpuCount, expectedGpus, `[${cfgJob.name}] targetGpuCount가 설정값과 일치해야 함`);
+      if (jf.activeCount >= expectedWorkers) {
+        assert.equal(jf.remainingToCreate, 0, `[${cfgJob.name}] 목표 도달/초과 시 remainingToCreate는 0이어야 함`);
+      }
+    }
   });
 });

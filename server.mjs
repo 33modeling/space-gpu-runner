@@ -3693,6 +3693,189 @@ function doesRunMatchSiteJobs(run, jobs = state.jobs, targetJobId = null) {
 }
 
 /**
+ * Compute authoritative target worker/GPU ceiling, sliding Pending queue deficit,
+ * and excess counts for a job rule.
+ * - `minConcurrentRuns` (`targetCount`) is ALWAYS the strict total active worker ceiling (`targetGpuCount = targetCount * coreCountPerWorker`).
+ * - `targetPendingRuns` (`targetPendingCount`) maintains a Pending queue buffer UP TO `targetCount` (never exceeding `targetCount`).
+ */
+function computeJobTargetMetrics({
+  minConcurrentRuns = 1,
+  targetPendingRuns = 0,
+  coreCount = 1,
+  runningCount = 0,
+  pendingCount = 0,
+  inFlightCount = 0,
+} = {}) {
+  const targetCount = Math.max(1, Number(minConcurrentRuns || 1));
+  const targetPendingCount = Math.max(0, Number(targetPendingRuns ?? 0));
+  const coreCountPerWorker = Math.max(1, Number(coreCount || 1));
+  const runCnt = Math.max(0, Number(runningCount || 0));
+  const pendCnt = Math.max(0, Number(pendingCount || 0));
+  const flightCnt = Math.max(0, Number(inFlightCount || 0));
+
+  const activeCount = runCnt + pendCnt;
+  const effectiveActiveCount = activeCount + flightCnt;
+  const effectivePendingCount = pendCnt + flightCnt;
+
+  const remainingToTarget = Math.max(0, targetCount - effectiveActiveCount);
+  const effectiveTargetPending =
+    targetPendingCount > 0 ? Math.min(targetPendingCount, Math.max(0, targetCount - runCnt)) : 0;
+  const deficit =
+    targetPendingCount > 0
+      ? Math.min(Math.max(0, targetPendingCount - effectivePendingCount), remainingToTarget)
+      : remainingToTarget;
+
+  const excessActiveCount = Math.max(0, activeCount - targetCount);
+  const excessRunningCount = Math.max(0, runCnt - targetCount);
+  const excessPendingByTotal = Math.min(pendCnt, excessActiveCount);
+  const excessPendingByQueue = targetPendingCount > 0 ? Math.max(0, pendCnt - targetPendingCount) : 0;
+  const excessPendingCount = Math.max(excessPendingByTotal, excessPendingByQueue);
+
+  return {
+    targetCount,
+    targetPendingCount,
+    effectiveTargetPending,
+    coreCountPerWorker,
+    activeCount,
+    effectiveActiveCount,
+    effectivePendingCount,
+    remainingToTarget,
+    remainingToCreate: deficit,
+    deficit,
+    runningDeficit: Math.max(0, targetCount - runCnt),
+    excessActiveCount,
+    excessRunningCount,
+    excessPendingCount,
+    runningGpuCount: runCnt * coreCountPerWorker,
+    pendingGpuCount: pendCnt * coreCountPerWorker,
+    activeGpuCount: activeCount * coreCountPerWorker,
+    targetGpuCount: targetCount * coreCountPerWorker,
+    remainingGpuToCreate: deficit * coreCountPerWorker,
+    excessActiveGpuCount: excessActiveCount * coreCountPerWorker,
+  };
+}
+
+/**
+ * Compute updated `minConcurrentRuns` & `targetPendingRuns` when permanently deleting slot(s) (`reduceTarget: true`).
+ * Workers that were already over-target (`activeBefore > prevTarget`) are trimmed first without corrupting `prevTarget`.
+ */
+function computeAdjustedTargetsAfterSlotDelete({
+  prevTarget = 1,
+  prevPendingTarget = 0,
+  activeBefore = 0,
+  pendingBefore = 0,
+  runningDeletedCount = 0,
+  pendingDeletedCount = 0,
+} = {}) {
+  const curTarget = Math.max(1, Number(prevTarget || 1));
+  const curPendingTarget = Math.max(0, Number(prevPendingTarget ?? 0));
+  const actBefore = Math.max(0, Number(activeBefore || 0));
+  const pendBefore = Math.max(0, Number(pendingBefore || 0));
+  const runDel = Math.max(0, Number(runningDeletedCount || 0));
+  const pendDel = Math.max(0, Number(pendingDeletedCount || 0));
+  const totalDel = runDel + pendDel;
+  const remainingActive = Math.max(0, actBefore - totalDel);
+
+  const excessActiveBefore = Math.max(0, actBefore - curTarget);
+  let nextTarget = curTarget;
+  let nextPendingTarget = curPendingTarget;
+
+  if (curPendingTarget > 0) {
+    if (pendDel > 0) {
+      const runningBefore = Math.max(0, actBefore - pendBefore);
+      const effectivePendCap = Math.min(curPendingTarget, Math.max(0, curTarget - runningBefore));
+      const excessPendBefore = Math.max(0, pendBefore - effectivePendCap);
+      const withinPendDeleted = Math.max(0, pendDel - excessPendBefore);
+      nextPendingTarget = Math.max(0, curPendingTarget - withinPendDeleted);
+    }
+    if (runDel > 0) {
+      const runningBefore = Math.max(0, actBefore - pendBefore);
+      const excessRunBefore = Math.max(0, runningBefore - curTarget);
+      const withinRunDeleted = Math.max(0, runDel - excessRunBefore);
+      nextTarget = Math.max(1, curTarget - withinRunDeleted);
+    }
+  } else {
+    const withinTargetDeleted = Math.max(0, totalDel - excessActiveBefore);
+    nextTarget = Math.max(1, curTarget - withinTargetDeleted);
+    if (actBefore <= curTarget && remainingActive > 0) {
+      nextTarget = Math.min(nextTarget, Math.max(1, remainingActive));
+    }
+  }
+
+  const shouldDisable =
+    remainingActive === 0 &&
+    nextPendingTarget === 0 &&
+    totalDel > 0 &&
+    curTarget - Math.max(0, totalDel - excessActiveBefore) <= 0;
+
+  return {
+    newTarget: nextTarget,
+    newPendingTarget: nextPendingTarget,
+    shouldDisable,
+  };
+}
+
+/**
+ * Safely cancel ONLY excess non-Running (`Pending`/`Creating`/`Approved`) runs for a job
+ * that exceed either `job.minConcurrentRuns` (total target ceiling) or `job.targetPendingRuns`.
+ * Never touches `Running` containers and never touches colleagues' runs.
+ */
+async function trimExcessPendingWorkersForJob(job, runsInput = getSiteKnownRuns()) {
+  if (!job) return { terminatedIds: [], terminatedNames: [] };
+  const runsList = Array.isArray(runsInput) ? runsInput : [];
+  const myUser = resolveCurrentUserName();
+  const matchingActive = runsList.filter(
+    (r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" && doesRunMatchJob(r, job, state.jobs)
+  );
+  const matchingRunning = matchingActive.filter((r) =>
+    String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+  );
+  const matchingPending = matchingActive
+    .filter((r) => {
+      if (String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")) return false;
+      const runUser = String(r.userId || r.userName || r.user || "").trim();
+      if (myUser && myUser !== "admin" && runUser && runUser.toLowerCase() !== String(myUser).toLowerCase()) {
+        return false;
+      }
+      return true;
+    })
+    .sort((a, b) => Number(b.id ?? b.runId ?? 0) - Number(a.id ?? a.runId ?? 0)); // newest Pending first
+
+  const metrics = computeJobTargetMetrics({
+    minConcurrentRuns: job.minConcurrentRuns,
+    targetPendingRuns: job.targetPendingRuns,
+    coreCount: job.coreCount,
+    runningCount: matchingRunning.length,
+    pendingCount: matchingPending.length,
+    inFlightCount: 0,
+  });
+  const excessCnt = metrics.excessPendingCount;
+  if (excessCnt <= 0) return { terminatedIds: [], terminatedNames: [] };
+
+  const toTerminate = matchingPending.slice(0, excessCnt);
+  const terminatedIds = [];
+  const terminatedNames = [];
+  for (const r of toTerminate) {
+    const rId = String(r.id ?? r.runId ?? "");
+    if (!rId) continue;
+    try {
+      await spaceApi.terminateRun(rId);
+      markRunRecentlyTerminated(rId);
+      terminatedIds.push(rId);
+      terminatedNames.push(r.containerName || r.name || `#${rId}`);
+      if (toTerminate.length > 1) await sleep(180);
+    } catch {
+      // ignore individual failure
+    }
+  }
+  if (terminatedIds.length > 0 && Array.isArray(job._knownPendingRunIds)) {
+    const termSet = new Set(terminatedIds.map(String));
+    job._knownPendingRunIds = job._knownPendingRunIds.filter((id) => !termSet.has(String(id)));
+  }
+  return { terminatedIds, terminatedNames };
+}
+
+/**
  * Compute real-time Worker Fleet & Auto-Creation progress statistics for the UI
  */
 function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
@@ -3723,9 +3906,14 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
   let totalRemainingGpus = 0;
   let globalNextSpawnInSec = null;
   const anyJobEnabled = state.jobs.some((j) => j.enabled);
+  const anyJobHasActiveRuns = state.jobs.some((j) =>
+    runsList.some(
+      (r) => doesRunMatchJob(r, j, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+    )
+  );
   const matchedActiveRunIds = new Set();
 
-  const jobFleetList = state.jobs.map((job) => {
+  const jobFleetList = state.jobs.map((job, jobIdx) => {
     const matchingRuns = runsList.filter((r) => doesRunMatchJob(r, job, state.jobs));
 
     const activeRuns = matchingRuns
@@ -3751,21 +3939,30 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     const activeCount = activeRuns.length;
     const runningCount = runningRuns.length;
     const pendingCount = pendingRuns.length;
-    const targetCount = targetPendingCount > 0 ? Math.max(rawMinConcurrent, runningCount + targetPendingCount) : rawMinConcurrent;
-    const remainingToCreate =
-      targetPendingCount > 0 ? Math.max(0, targetPendingCount - pendingCount) : Math.max(0, targetCount - activeCount);
-    const runningDeficit = Math.max(0, targetCount - runningCount);
-    const excessPendingCount =
-      targetPendingCount > 0
-        ? Math.max(0, pendingCount - targetPendingCount)
-        : Math.max(0, Math.min(pendingCount, activeCount - targetCount));
-
-    const coreCountPerWorker = Math.max(1, Number(job.coreCount || 1));
-    const runningGpuCount = runningCount * coreCountPerWorker;
-    const pendingGpuCount = pendingCount * coreCountPerWorker;
-    const activeGpuCount = activeCount * coreCountPerWorker;
-    const targetGpuCount = targetCount * coreCountPerWorker;
-    const remainingGpuToCreate = remainingToCreate * coreCountPerWorker;
+    const metrics = computeJobTargetMetrics({
+      minConcurrentRuns: rawMinConcurrent,
+      targetPendingRuns: targetPendingCount,
+      coreCount: job.coreCount,
+      runningCount,
+      pendingCount,
+      inFlightCount: 0,
+    });
+    const {
+      targetCount,
+      effectiveTargetPending,
+      coreCountPerWorker,
+      remainingToCreate,
+      runningDeficit,
+      excessActiveCount,
+      excessRunningCount,
+      excessPendingCount,
+      runningGpuCount,
+      pendingGpuCount,
+      activeGpuCount,
+      targetGpuCount,
+      remainingGpuToCreate,
+      excessActiveGpuCount,
+    } = metrics;
 
     const baseCooldownSec = Math.max(1, Number(job.cooldownSec || configuredSchedSec || 15));
     const pacedCooldownSec = loadStatus.enabled
@@ -3802,7 +3999,11 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       }
     }
 
-    const countInGlobalTarget = !anyJobEnabled || Boolean(job.enabled);
+    const countInGlobalTarget = anyJobEnabled
+      ? Boolean(job.enabled)
+      : anyJobHasActiveRuns
+      ? activeCount > 0
+      : jobIdx === 0;
     totalRunningWorkers += runningCount;
     totalPendingWorkers += pendingCount;
     totalActiveWorkers += activeCount;
@@ -3825,7 +4026,7 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       const assignedSlot = extractAssignedSlotFromRun(r) || idx + 1;
       const stateOrderIndex = isRunning ? idx + 1 : idx - runningCount + 1;
       const isExcessPending =
-        !isRunning && (targetPendingCount > 0 ? stateOrderIndex > targetPendingCount : idx + 1 > targetCount);
+        !isRunning && (idx + 1 > targetCount || (targetPendingCount > 0 && stateOrderIndex > targetPendingCount));
       const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
       const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
       const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
@@ -3892,9 +4093,9 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     // Keep `job.lastStatus` accurate even for disabled jobs so old/stale counts (e.g. "가동 40/40개" from days ago) never persist
     if (!job.enabled && runsList.length > 0) {
       if (activeCount === 0) {
-        job.lastStatus = `⚪ 일시정지됨 (현재 가동 0개 / 목표 ${targetCount}개 · 자동생성 OFF)`;
+        job.lastStatus = `⚪ 일시정지됨 (현재 가동 0개 / 목표 ${targetCount}개(${targetGpuCount}GPU) · 자동생성 OFF)`;
       } else {
-        job.lastStatus = `⚪ 자동생성 OFF (현재 🟢 Running ${runningCount}개${pendingCount > 0 ? ` · ⏳ Pending ${pendingCount}개` : ""} 가동 중)`;
+        job.lastStatus = `⚪ 자동생성 OFF (현재 🟢 Running ${runningCount}개(${runningGpuCount}GPU)${pendingCount > 0 ? ` · ⏳ Pending ${pendingCount}개` : ""} / 목표 ${targetCount}개(${targetGpuCount}GPU))`;
       }
     }
 
@@ -3916,18 +4117,22 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       minConcurrentRuns: rawMinConcurrent,
       targetPendingCount,
       targetPendingRuns: targetPendingCount,
+      effectiveTargetPending,
       targetCount,
       activeCount,
       runningCount,
       pendingCount,
       remainingToCreate,
       runningDeficit,
+      excessActiveCount,
+      excessRunningCount,
       excessPendingCount,
       runningGpuCount,
       pendingGpuCount,
       activeGpuCount,
       targetGpuCount,
       remainingGpuToCreate,
+      excessActiveGpuCount,
       runningGpus: runningGpuCount,
       pendingGpus: pendingGpuCount,
       activeGpus: activeGpuCount,
@@ -4189,7 +4394,9 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
 
   const rawMinConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
   const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
-  const minConcurrent = targetPending > 0 ? Math.max(rawMinConcurrent, runningRuns.length + targetPending) : rawMinConcurrent;
+  const minConcurrent = rawMinConcurrent;
+  const coreCountPerWorker = Math.max(1, Number(job.coreCount || 1));
+  const targetGpuTotal = minConcurrent * coreCountPerWorker;
   const loadStatus = computeServerLoadStatus(allRuns);
 
   // Batch 2 - Feature 6: Detect Rapid-Fail runs (`FAILED` within `< badNodeRapidFailSec` seconds) & trigger Bad-Node Cooldown
@@ -4275,31 +4482,33 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
 
   if (!forceTrigger) {
     const inFlightSlots = getInFlightReservationsForJob(job.id);
-    const effectiveActiveCount = activeRuns.length + inFlightSlots.length;
-    const effectivePendingCount = pendingJobRuns.length + inFlightSlots.length;
-    const currentDeficit =
-      targetPending > 0
-        ? Math.max(0, targetPending - effectivePendingCount)
-        : Math.max(0, minConcurrent - effectiveActiveCount);
+    const metrics = computeJobTargetMetrics({
+      minConcurrentRuns: minConcurrent,
+      targetPendingRuns: targetPending,
+      coreCount: coreCountPerWorker,
+      runningCount: runningRuns.length,
+      pendingCount: pendingJobRuns.length,
+      inFlightCount: inFlightSlots.length,
+    });
+    const currentDeficit = metrics.deficit;
 
-    if (targetPending > 0 ? effectivePendingCount >= targetPending : effectiveActiveCount >= minConcurrent) {
-      if (targetPending > 0) {
-        const excessPending = Math.max(0, pendingJobRuns.length - targetPending);
-        job.lastStatus = `✅ 목표 Pending 대기 ${targetPending}개 유지 중! (⏳ 현재 Pending ${pendingJobRuns.length}/${targetPending}개${
-          excessPending > 0 ? `(목표초과 +${excessPending}개)` : ""
-        } · 🟢 Running ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}개 — Running 전환 시 자동 보충)`;
-        saveState();
-        return { triggered: false, reason: job.lastStatus, loadMonitor: loadStatus };
-      }
-      const excessPending = Math.max(0, Math.min(pendingJobRuns.length, activeRuns.length - minConcurrent));
+    if (currentDeficit <= 0) {
+      const excessPending = metrics.excessPendingCount;
+      const excessActive = metrics.excessActiveCount;
       const pendingStr =
         pendingJobRuns.length > 0
           ? ` · ⏳ Pending 대기 ${pendingJobRuns.length}개${excessPending > 0 ? `(목표초과 +${excessPending}개)` : ""}`
           : "";
-      if (runningRuns.length >= minConcurrent) {
-        job.lastStatus = `✅ 목표 Running ${minConcurrent}개 전원 가동 중! (🟢 Running ${runningRuns.length}개${pendingStr} · 전체 활성 ${activeRuns.length}/${minConcurrent}개)`;
+      if (metrics.effectiveActiveCount >= minConcurrent) {
+        if (runningRuns.length > minConcurrent) {
+          job.lastStatus = `⚠️ 목표(${minConcurrent}개 · ${targetGpuTotal}GPU) 초과 가동 중 (+${excessActive}개 · 🟢 Running ${runningRuns.length}개(${runningRuns.length * coreCountPerWorker}GPU)${pendingStr} — 신규 자동생성 중단됨)`;
+        } else if (runningRuns.length === minConcurrent) {
+          job.lastStatus = `✅ 목표 Running ${minConcurrent}개(${targetGpuTotal}GPU) 전원 가동 중! (🟢 Running ${runningRuns.length}개${pendingStr} · 전체 활성 ${activeRuns.length}/${minConcurrent}개)`;
+        } else {
+          job.lastStatus = `⏳ 목표 수량(${minConcurrent}개 · ${targetGpuTotal}GPU) 제출 완료 — 클러스터 Running 전환 대기 중 (🟢 실제 가동 ${runningRuns.length}개 / 목표 ${minConcurrent}개${pendingStr} · 전체 활성 ${activeRuns.length}개)`;
+        }
       } else {
-        job.lastStatus = `⏳ 목표 수량(${minConcurrent}개) 제출 완료 — 클러스터 Running 전환 대기 중 (🟢 실제 가동 ${runningRuns.length}개 / 목표 ${minConcurrent}개${pendingStr} · 전체 활성 ${activeRuns.length}개)`;
+        job.lastStatus = `✅ 목표 Pending 대기 ${metrics.effectiveTargetPending}개 유지 중! (⏳ 현재 Pending ${pendingJobRuns.length}/${metrics.effectiveTargetPending}개 · 🟢 Running ${runningRuns.length}개 · 전체 활성 ${activeRuns.length}/${minConcurrent}개(${targetGpuTotal}GPU) — Running 전환 시 목표까지 자동 보충)`;
       }
       if (
         runningRuns.length >= minConcurrent &&
@@ -4310,7 +4519,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
         pushAlertNotification(
           "success",
           `목표 워커 ${minConcurrent}개 전원 Running 달성! (${job.name})`,
-          `[${job.name}] 목표 워커 ${minConcurrent}개 (총 GPU ${minConcurrent * Math.max(1, Number(job.coreCount || 1))}장)가 모두 Running 상태로 가동 중입니다.`,
+          `[${job.name}] 목표 워커 ${minConcurrent}개 (총 GPU ${targetGpuTotal}장)가 모두 Running 상태로 가동 중입니다.`,
           { jobId: job.id, minConcurrent, dedupeKey: `target-${job.id}-${minConcurrent}` }
         ).catch(() => {});
       }
@@ -4420,10 +4629,11 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
   // Feature 3: Pick lowest missing Worker Slot Index (1..minConcurrent) and reserve it across concurrent calls
   const nextWorkerSlot = pickNextWorkerSlot(job, activeRuns, minConcurrent);
   const slotReservationKey = reserveWorkerSlot(job.id, nextWorkerSlot);
+  const remainingTargetCapAfterThis = Math.max(0, minConcurrent - (activeRuns.length + 1));
   const remainingAfterThis =
     targetPending > 0
-      ? Math.max(0, targetPending - (pendingJobRuns.length + 1))
-      : Math.max(0, minConcurrent - (activeRuns.length + 1));
+      ? Math.min(Math.max(0, targetPending - (pendingJobRuns.length + 1)), remainingTargetCapAfterThis)
+      : remainingTargetCapAfterThis;
   const triggerSource = forceTrigger ? "manual" : "auto_scheduler";
   const triggerLabel = forceTrigger ? "👆 [수동 클릭 신청]" : "🤖 [무클릭 자동 신청]";
   try {
@@ -4688,24 +4898,29 @@ async function runSchedulerTick(manual = false, options = {}) {
               job._incompletePendingBatchRetryAtMs && nowTickMs >= job._incompletePendingBatchRetryAtMs
             );
 
-            if (promotedToRunningIds.length > 0 && matchingPendingPre.length < targetPending) {
+            const jobMinConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
+            const effectivePendingGoalPre = Math.min(targetPending, Math.max(0, jobMinConcurrent - matchingRunningPre.length));
+            if (
+              promotedToRunningIds.length > 0 &&
+              matchingActivePre.length < jobMinConcurrent &&
+              matchingPendingPre.length < effectivePendingGoalPre
+            ) {
               addLog(
                 "info",
-                `⚡ [${job.name}] Pending 워커(${promotedToRunningIds.map((id) => `#${id}`).join(", ")}) Running 진입 감지 — 즉시 Pending 대기 목표(${matchingPendingPre.length}/${targetPending}개) 자동 보충!`
+                `⚡ [${job.name}] Pending 워커(${promotedToRunningIds.map((id) => `#${id}`).join(", ")}) Running 진입 감지 — 전체 목표(${jobMinConcurrent}개) 범위 내 Pending 대기(${matchingPendingPre.length}/${effectivePendingGoalPre}개) 자동 보충!`
               );
             }
 
             const shouldBypassCooldown =
               manual ||
               Boolean(options?.bypassCooldown) ||
-              promotedToRunningIds.length > 0 ||
+              (promotedToRunningIds.length > 0 && matchingActivePre.length < jobMinConcurrent) ||
               immediateRefillRequested ||
               retryBatchDue;
             job._pendingRefillImmediate = false;
 
-            // Multi-spawn loop in a single tick when `targetPendingRuns > 0`:
-            // Keep spawning missing Pending workers until `pendingCount >= targetPending` (with 1s spacing)
-            // instead of spawning only 1 worker per 3~10 minute cooldown tick!
+            // Multi-spawn loop in a single tick when `targetPendingRuns > 0` (strictly capped by `job.minConcurrentRuns`):
+            // Keep spawning missing Pending workers until `pendingCount >= targetPending` OR `activeCount >= jobMinConcurrent`!
             const maxRefillSteps = Math.min(64, Math.max(targetPending + 4, 6));
             let lastRes = null;
             let spawnedInPass = 0;
@@ -4728,7 +4943,7 @@ async function runSchedulerTick(manual = false, options = {}) {
                 const postPending = postActive.filter(
                   (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
                 );
-                if (postPending.length >= targetPending) {
+                if (postActive.length >= jobMinConcurrent || postPending.length >= targetPending) {
                   // Verify against fresh API state in case an earlier Pending worker already transitioned to Running/Failed during this burst
                   allRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
                   const verifiedActive = allRuns.filter(
@@ -4737,7 +4952,7 @@ async function runSchedulerTick(manual = false, options = {}) {
                   const verifiedPending = verifiedActive.filter(
                     (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
                   );
-                  if (verifiedPending.length >= targetPending) {
+                  if (verifiedActive.length >= jobMinConcurrent || verifiedPending.length >= targetPending) {
                     break;
                   }
                 }
@@ -4760,6 +4975,7 @@ async function runSchedulerTick(manual = false, options = {}) {
             );
             job._knownPendingRunIds = finalPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
             if (
+              finalActive.length < jobMinConcurrent &&
               finalPending.length < targetPending &&
               (spawnedInPass > 0 || throttledInPass || failedFromPendingIds.length > 0)
             ) {
@@ -5781,7 +5997,8 @@ const server = http.createServer(async (req, res) => {
       const runId = parts[parts.length - 2];
       const body = await readJsonBody(req).catch(() => ({}));
       const reduceTarget = Boolean(body?.reduceTarget);
-      const targetRun = (getSiteKnownRuns() || []).find((r) => String(r.id ?? r.runId ?? "") === String(runId)) || null;
+      const knownRunsBeforeStop = getSiteKnownRuns() || [];
+      const targetRun = knownRunsBeforeStop.find((r) => String(r.id ?? r.runId ?? "") === String(runId)) || null;
       const myUser = resolveCurrentUserName();
       const targetRunUser = String(targetRun?.userId || targetRun?.userName || targetRun?.user || "").trim();
       if (
@@ -5813,15 +6030,24 @@ const server = http.createServer(async (req, res) => {
         if (matchedJob) {
           const prevTarget = Math.max(1, Number(matchedJob.minConcurrentRuns || 1));
           const prevPendingTarget = Math.max(0, Number(matchedJob.targetPendingRuns ?? 0));
-          if (prevPendingTarget > 0 && !wasRunningBeforeStop) {
-            // Deleting a Pending queue slot when targetPendingRuns > 0 reduces targetPendingRuns without touching Running target
-            matchedJob.targetPendingRuns = Math.max(0, prevPendingTarget - 1);
-          } else {
-            const nextTarget = Math.max(1, prevTarget - 1);
-            matchedJob.minConcurrentRuns = nextTarget;
-            if (prevTarget === 1 && prevPendingTarget === 0) {
-              matchedJob.enabled = false;
-            }
+          const matchingActiveBefore = knownRunsBeforeStop.filter(
+            (r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" && doesRunMatchJob(r, matchedJob, state.jobs)
+          );
+          const matchingPendingBefore = matchingActiveBefore.filter(
+            (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+          );
+          const adj = computeAdjustedTargetsAfterSlotDelete({
+            prevTarget,
+            prevPendingTarget,
+            activeBefore: Math.max(1, matchingActiveBefore.length),
+            pendingBefore: matchingPendingBefore.length,
+            runningDeletedCount: wasRunningBeforeStop ? 1 : 0,
+            pendingDeletedCount: wasRunningBeforeStop ? 0 : 1,
+          });
+          matchedJob.minConcurrentRuns = adj.newTarget;
+          matchedJob.targetPendingRuns = adj.newPendingTarget;
+          if (adj.shouldDisable) {
+            matchedJob.enabled = false;
           }
           if (Array.isArray(matchedJob._knownPendingRunIds)) {
             matchedJob._knownPendingRunIds = matchedJob._knownPendingRunIds.filter((id) => String(id) !== String(runId));
@@ -5840,14 +6066,20 @@ const server = http.createServer(async (req, res) => {
       }
 
       await fetchCurrentRuns(true).catch(() => {});
+      const targetChanged =
+        targetAdjustment &&
+        (targetAdjustment.previousTarget !== targetAdjustment.newTarget ||
+          targetAdjustment.previousPendingTarget !== targetAdjustment.newPendingTarget);
       addLog(
         "warn",
         reduceTarget && updatedJob
-          ? `🗑️ [워커 슬롯 삭제] ${runName} (#${runId}) 강제 종료 + [${updatedJob.name}] 목표 워커 수 ${targetAdjustment.previousTarget}개 ➔ ${updatedJob.minConcurrentRuns}개로 축소${
-              targetAdjustment.previousPendingTarget !== targetAdjustment.newPendingTarget
-                ? ` (목표 Pending ${targetAdjustment.previousPendingTarget}개 ➔ ${targetAdjustment.newPendingTarget}개)`
-                : ""
-            } (재생성 방지)`
+          ? targetChanged
+            ? `🗑️ [워커 슬롯 삭제] ${runName} (#${runId}) 강제 종료 + [${updatedJob.name}] 목표 워커 수 ${targetAdjustment.previousTarget}개 ➔ ${updatedJob.minConcurrentRuns}개로 축소${
+                targetAdjustment.previousPendingTarget !== targetAdjustment.newPendingTarget
+                  ? ` (목표 Pending ${targetAdjustment.previousPendingTarget}개 ➔ ${targetAdjustment.newPendingTarget}개)`
+                  : ""
+              } (재생성 방지)`
+            : `🗑️ [목표 초과 워커 정리] ${runName} (#${runId}) 강제 종료 완료 ([${updatedJob.name}] 목표 ${updatedJob.minConcurrentRuns}개(${updatedJob.minConcurrentRuns * Math.max(1, Number(updatedJob.coreCount || 1))}GPU) 유지)`
           : `🛑 [워커 즉시 Kill] ${runName} (#${runId}) 강제 종료 완료`,
         { runId, runName, reduceTarget, newTarget: updatedJob?.minConcurrentRuns, targetAdjustment }
       );
@@ -5967,26 +6199,22 @@ const server = http.createServer(async (req, res) => {
             const prevPendingTarget = Math.max(0, Number(jobObj.targetPendingRuns ?? 0));
             const runningDelCnt = perJobRunningDeletedCount.get(jId) || 0;
             const pendingDelCnt = perJobPendingDeletedCount.get(jId) || 0;
-            const remainingActiveForJob = activeRuns.filter(
-              (r) => !terminatedIds.includes(String(r.id ?? r.runId ?? "")) && doesRunMatchJob(r, jobObj, state.jobs)
-            ).length;
-
-            if (prevPendingTarget > 0) {
-              if (pendingDelCnt > 0) {
-                jobObj.targetPendingRuns = Math.max(0, prevPendingTarget - pendingDelCnt);
-              }
-              if (runningDelCnt > 0) {
-                jobObj.minConcurrentRuns = Math.max(1, prevTarget - runningDelCnt);
-              }
-              if (remainingActiveForJob === 0 && jobObj.targetPendingRuns === 0 && prevTarget <= runningDelCnt) {
-                jobObj.enabled = false;
-              }
-            } else {
-              const nextTargetBySub = Math.max(1, prevTarget - delCnt);
-              jobObj.minConcurrentRuns = Math.min(nextTargetBySub, Math.max(1, remainingActiveForJob));
-              if (remainingActiveForJob === 0 && prevTarget <= delCnt) {
-                jobObj.enabled = false;
-              }
+            const matchingActiveBefore = activeRuns.filter((r) => doesRunMatchJob(r, jobObj, state.jobs));
+            const matchingPendingBefore = matchingActiveBefore.filter(
+              (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+            );
+            const adj = computeAdjustedTargetsAfterSlotDelete({
+              prevTarget,
+              prevPendingTarget,
+              activeBefore: Math.max(delCnt, matchingActiveBefore.length),
+              pendingBefore: matchingPendingBefore.length,
+              runningDeletedCount: runningDelCnt,
+              pendingDeletedCount: pendingDelCnt,
+            });
+            jobObj.minConcurrentRuns = adj.newTarget;
+            jobObj.targetPendingRuns = adj.newPendingTarget;
+            if (adj.shouldDisable) {
+              jobObj.enabled = false;
             }
             if (Array.isArray(jobObj._knownPendingRunIds)) {
               const termSet = new Set(terminatedIds.map(String));
@@ -6011,7 +6239,11 @@ const server = http.createServer(async (req, res) => {
         addLog(
           "warn",
           reduceTarget
-            ? `🗑️ [선택 워커 슬롯 영구 삭제] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료하고 목표 워커 수를 자동 축소했습니다.`
+            ? `🗑️ [선택 워커 슬롯 영구 삭제] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료했습니다.${
+                targetAdjustment
+                  ? ` ([${targetAdjustment.jobName}] 목표 워커 ${targetAdjustment.previousTarget}개 ➔ ${targetAdjustment.newTarget}개)`
+                  : ""
+              }`
             : `🛑 [선택 워커 슬롯 즉시 Kill] 선택한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 강제 종료했습니다.`,
           { terminatedIds, terminatedNames, reduceTarget, targetAdjustment }
         );
@@ -6046,36 +6278,16 @@ const server = http.createServer(async (req, res) => {
         const terminatedIds = [];
         const terminatedNames = [];
         for (const job of targetJobs) {
-          const matchingActive = activeRuns.filter((r) => doesRunMatchJob(r, job, state.jobs));
-          const matchingPending = matchingActive
-            .filter((r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING"))
-            .sort((a, b) => Number(b.id ?? b.runId ?? 0) - Number(a.id ?? a.runId ?? 0)); // newest Pending first
-          const targetPendingCnt = Math.max(0, Number(job.targetPendingRuns ?? 0));
-          const targetCnt = Math.max(1, Number(job.minConcurrentRuns || 1));
-          const excessCnt =
-            targetPendingCnt > 0
-              ? Math.max(0, matchingPending.length - targetPendingCnt)
-              : Math.max(0, Math.min(matchingPending.length, matchingActive.length - targetCnt));
-          const toTerminate = matchingPending.slice(0, excessCnt);
-          for (const r of toTerminate) {
-            const rId = String(r.id ?? r.runId ?? "");
-            if (!rId) continue;
-            try {
-              await spaceApi.terminateRun(rId);
-              markRunRecentlyTerminated(rId);
-              terminatedIds.push(rId);
-              terminatedNames.push(r.containerName || r.name || `#${rId}`);
-              await sleep(200);
-            } catch {
-              // ignore
-            }
-          }
+          const trimRes = await trimExcessPendingWorkersForJob(job, runs);
+          terminatedIds.push(...trimRes.terminatedIds);
+          terminatedNames.push(...trimRes.terminatedNames);
         }
+        saveState();
         const updatedRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
         const fleet = computeWorkerFleetStats(updatedRuns);
         addLog(
           "warn",
-          `✂️ [초과 Pending 워커 자동 정리] 목표 워커 수를 초과한 대기(Pending) 워커 ${terminatedIds.length}개(${terminatedNames.join(", ") || "-"})를 정리하여 목표 수량에 맞췄습니다.`,
+          `✂️ [초과 Pending 워커 자동 정리] 목표 워커/GPU 수를 초과한 대기(Pending) 워커 ${terminatedIds.length}개(${terminatedNames.join(", ") || "-"})를 정리하여 목표 수량에 맞췄습니다.`,
           { terminatedIds, terminatedNames }
         );
         return sendJson(res, 200, {
@@ -6084,6 +6296,71 @@ const server = http.createServer(async (req, res) => {
           terminatedCount: terminatedIds.length,
           terminatedIds,
           terminatedNames,
+          workerFleet: fleet,
+        });
+      }
+
+      if (action === "trim_to_target") {
+        const targetJobId = body.jobId ? String(body.jobId) : null;
+        const targetJobs = targetJobId
+          ? state.jobs.filter((j) => String(j.id) === targetJobId)
+          : state.jobs.filter((j) => j.enabled);
+        const myUser = resolveCurrentUserName();
+        const terminatedIds = [];
+        const terminatedNames = [];
+        for (const job of targetJobs) {
+          const targetCnt = Math.max(1, Number(job.minConcurrentRuns || 1));
+          const matchingActive = activeRuns.filter((r) => {
+            if (!doesRunMatchJob(r, job, state.jobs)) return false;
+            const runUser = String(r.userId || r.userName || r.user || "").trim();
+            if (myUser && myUser !== "admin" && runUser && runUser.toLowerCase() !== String(myUser).toLowerCase()) {
+              return false;
+            }
+            return true;
+          });
+          const excessTotal = Math.max(0, matchingActive.length - targetCnt);
+          if (excessTotal <= 0) continue;
+          // Trim non-Running Pending workers FIRST (newest first), then newest Running workers (preserving longest-running training containers!)
+          const pendingFirst = matchingActive
+            .filter((r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING"))
+            .sort((a, b) => Number(b.id ?? b.runId ?? 0) - Number(a.id ?? a.runId ?? 0));
+          const runningNewest = matchingActive
+            .filter((r) => String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING"))
+            .sort((a, b) => Number(b.id ?? b.runId ?? 0) - Number(a.id ?? a.runId ?? 0));
+          const candidates = [...pendingFirst, ...runningNewest].slice(0, excessTotal);
+          for (const r of candidates) {
+            const rId = String(r.id ?? r.runId ?? "");
+            if (!rId) continue;
+            try {
+              await spaceApi.terminateRun(rId);
+              markRunRecentlyTerminated(rId);
+              terminatedIds.push(rId);
+              terminatedNames.push(r.containerName || r.name || `#${rId}`);
+              if (candidates.length > 1) await sleep(180);
+            } catch {
+              // ignore
+            }
+          }
+          if (Array.isArray(job._knownPendingRunIds) && terminatedIds.length > 0) {
+            const termSet = new Set(terminatedIds.map(String));
+            job._knownPendingRunIds = job._knownPendingRunIds.filter((id) => !termSet.has(String(id)));
+          }
+        }
+        saveState();
+        const updatedRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
+        const fleet = computeWorkerFleetStats(updatedRuns);
+        addLog(
+          "warn",
+          `✂️ [목표 수량 맞춤 초과 워커 정리] 설정된 목표 워커/GPU 수를 초과한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 정리하여 목표 수량에 정확히 맞췄습니다.`,
+          { terminatedIds, terminatedNames }
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          terminatedCount: terminatedIds.length,
+          terminatedIds,
+          terminatedNames,
+          jobs: state.jobs,
           workerFleet: fleet,
         });
       }
@@ -6575,6 +6852,13 @@ const server = http.createServer(async (req, res) => {
       const idx = state.jobs.findIndex((j) => j.id === body.id);
       const existingJob = idx >= 0 ? state.jobs[idx] : null;
       const fallbackJob = state.jobs[0] || {};
+      const prevMinConcurrent = existingJob ? Math.max(1, Number(existingJob.minConcurrentRuns || 1)) : null;
+      const prevTargetPending = existingJob ? Math.max(0, Number(existingJob.targetPendingRuns || 0)) : null;
+      const resolvedCoreCount = Math.max(1, Number(body.coreCount ?? existingJob?.coreCount ?? 1));
+      const resolvedMinConcurrent =
+        body.targetGpus !== undefined && Number(body.targetGpus) > 0
+          ? Math.max(1, Math.ceil(Number(body.targetGpus) / resolvedCoreCount))
+          : Math.max(1, Number(body.minConcurrentRuns ?? existingJob?.minConcurrentRuns ?? 1));
       const jobObj = {
         id: body.id || `job-${Date.now()}`,
         siteId: normalizeSiteId(body.siteId || existingJob?.siteId || getCurrentSiteId()),
@@ -6584,7 +6868,7 @@ const server = http.createServer(async (req, res) => {
         useSpecId: String(body.useSpecId || "").trim(),
         groupPoolId: String(body.groupPoolId || existingJob?.groupPoolId || fallbackJob.groupPoolId || "").trim(),
         coreId: String(body.coreId || existingJob?.coreId || fallbackJob.coreId || "").trim(),
-        coreCount: Math.max(1, Number(body.coreCount || 1)),
+        coreCount: resolvedCoreCount,
         quotaId: String(body.quotaId || existingJob?.quotaId || fallbackJob.quotaId || "").trim(),
         allowSpot: Boolean(body.allowSpot),
         autoApprove: body.autoApprove !== false,
@@ -6593,7 +6877,7 @@ const server = http.createServer(async (req, res) => {
         executionCommand: String(body.executionCommand || "bash /group-volume/run.sh").trim(),
         expectedRunTime: String(body.expectedRunTime || "8h").trim(),
         enableWebConsole: body.enableWebConsole !== false,
-        minConcurrentRuns: Math.max(1, Number(body.minConcurrentRuns || 1)),
+        minConcurrentRuns: resolvedMinConcurrent,
         targetPendingRuns: Math.max(
           0,
           Number(body.targetPendingRuns !== undefined ? body.targetPendingRuns : existingJob?.targetPendingRuns ?? 0)
@@ -6614,20 +6898,44 @@ const server = http.createServer(async (req, res) => {
         lastRunId: existingJob ? existingJob.lastRunId : null,
         lastStatus: existingJob ? existingJob.lastStatus : "대기 중",
       };
+      const totalTargetGpus = jobObj.minConcurrentRuns * jobObj.coreCount;
       const pendingTargetNote = jobObj.targetPendingRuns > 0 ? ` · 목표 Pending: ${jobObj.targetPendingRuns}개` : "";
       if (idx >= 0) {
         state.jobs[idx] = jobObj;
-        addLog("info", `자동 실행 규칙 수정됨: ${jobObj.name} (목표 워커: ${jobObj.minConcurrentRuns}개${pendingTargetNote}, cmd: ${jobObj.executionCommand})`);
+        addLog(
+          "info",
+          `자동 실행 규칙 수정됨: ${jobObj.name} (목표 워커: ${jobObj.minConcurrentRuns}개 · 목표 GPU: ${totalTargetGpus}장${pendingTargetNote}, cmd: ${jobObj.executionCommand})`
+        );
       } else {
         state.jobs.push(jobObj);
-        addLog("info", `새 자동 실행 규칙 추가됨: ${jobObj.name} (목표 워커: ${jobObj.minConcurrentRuns}개${pendingTargetNote}, cmd: ${jobObj.executionCommand})`);
+        addLog(
+          "info",
+          `새 자동 실행 규칙 추가됨: ${jobObj.name} (목표 워커: ${jobObj.minConcurrentRuns}개 · 목표 GPU: ${totalTargetGpus}장${pendingTargetNote}, cmd: ${jobObj.executionCommand})`
+        );
       }
       saveState();
+      let trimmedPendingCount = 0;
+      const wasTargetLowered =
+        (prevMinConcurrent !== null && jobObj.minConcurrentRuns < prevMinConcurrent) ||
+        (prevTargetPending !== null && jobObj.targetPendingRuns > 0 && jobObj.targetPendingRuns < prevTargetPending);
+      if (wasTargetLowered && body.autoTrimPending !== false) {
+        const trimRes = await trimExcessPendingWorkersForJob(jobObj, getSiteKnownRuns()).catch(() => ({ terminatedIds: [] }));
+        trimmedPendingCount = trimRes.terminatedIds?.length || 0;
+        if (trimmedPendingCount > 0) {
+          addLog("info", `✂️ [${jobObj.name}] 목표 하향에 맞춰 초과 Pending 워커 ${trimmedPendingCount}개 자동 취소 완료`);
+        }
+      }
       if (jobObj.enabled && state.config.schedulerEnabled) {
         getSiteRuntime().lastSchedulerTickTime = 0;
         runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
       }
-      return sendJson(res, 200, { ok: true, job: jobObj, jobs: state.jobs, workerFleet: computeWorkerFleetStats(getSiteKnownRuns()) });
+      return sendJson(res, 200, {
+        ok: true,
+        job: jobObj,
+        jobs: state.jobs,
+        trimmedPendingCount,
+        workerFleet: computeWorkerFleetStats(getSiteKnownRuns()),
+      });
     }
 
     if (pathname === "/api/jobs/toggle" && req.method === "POST") {
@@ -6652,20 +6960,37 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/jobs/target" && req.method === "POST") {
       const body = await readJsonBody(req);
+      const knownRunsSnapshot = getSiteKnownRuns();
+      const hasActiveMatch = (j) =>
+        knownRunsSnapshot.some(
+          (r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" && doesRunMatchJob(r, j, state.jobs)
+        );
       const job =
         (body.jobId && state.jobs.find((j) => j.id === body.jobId)) ||
+        state.jobs.find((j) => j.enabled && hasActiveMatch(j)) ||
         state.jobs.find((j) => j.enabled) ||
+        state.jobs.find((j) => hasActiveMatch(j)) ||
         state.jobs[0];
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
+      const prevMinConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
+      const prevTargetPending = Math.max(0, Number(job.targetPendingRuns || 0));
       let shouldImmediateRefill = false;
-      if (body.minConcurrentRuns !== undefined) {
+      if (body.coreCount !== undefined) {
+        job.coreCount = Math.max(1, Number(body.coreCount || 1));
+      }
+      if (body.targetGpus !== undefined && Number(body.targetGpus) > 0) {
+        const gpusPerWorker = Math.max(1, Number(job.coreCount || 1));
+        const nextMinFromGpus = Math.max(1, Math.ceil(Number(body.targetGpus) / gpusPerWorker));
+        if (nextMinFromGpus !== job.minConcurrentRuns) shouldImmediateRefill = true;
+        job.minConcurrentRuns = nextMinFromGpus;
+      } else if (body.minConcurrentRuns !== undefined) {
         const nextMin = Math.max(1, Number(body.minConcurrentRuns || 1));
         if (nextMin !== job.minConcurrentRuns) shouldImmediateRefill = true;
         job.minConcurrentRuns = nextMin;
       }
       if (body.targetPendingRuns !== undefined) {
         const nextTargetPending = Math.max(0, Number(body.targetPendingRuns || 0));
-        if (nextTargetPending > 0) shouldImmediateRefill = true;
+        if (nextTargetPending > 0 && nextTargetPending !== job.targetPendingRuns) shouldImmediateRefill = true;
         job.targetPendingRuns = nextTargetPending;
       }
       if (body.cooldownSec !== undefined) {
@@ -6688,10 +7013,26 @@ const server = http.createServer(async (req, res) => {
         job._incompletePendingBatchRetryAtMs = 0;
       }
       saveState();
+      let trimmedPendingCount = 0;
+      const wasTargetLowered =
+        job.minConcurrentRuns < prevMinConcurrent ||
+        (job.targetPendingRuns > 0 && job.targetPendingRuns < prevTargetPending);
+      if (wasTargetLowered && body.autoTrimPending !== false) {
+        const trimRes = await trimExcessPendingWorkersForJob(job, getSiteKnownRuns()).catch(() => ({ terminatedIds: [] }));
+        trimmedPendingCount = trimRes.terminatedIds?.length || 0;
+        if (trimmedPendingCount > 0) {
+          addLog(
+            "info",
+            `✂️ [${job.name}] 목표 하향(${prevMinConcurrent}→${job.minConcurrentRuns}워커)에 맞춰 초과 Pending 워커 ${trimmedPendingCount}개 자동 취소 완료`
+          );
+        }
+      }
+      const gpusPerWorker = Math.max(1, Number(job.coreCount || 1));
+      const totalTargetGpus = job.minConcurrentRuns * gpusPerWorker;
       addLog(
         "info",
-        `🎯 [${job.name}] 워커 목표 설정 변경 — 목표 워커: ${job.minConcurrentRuns}개 · 목표 Pending 대기: ${
-          job.targetPendingRuns > 0 ? `${job.targetPendingRuns}개 유지` : "제한없음(전체 목표 기준)"
+        `🎯 [${job.name}] 워커·GPU 목표 설정 변경 — 목표 워커: ${job.minConcurrentRuns}개 (총 GPU ${totalTargetGpus}장 · 워커당 ${gpusPerWorker}GPU) · 목표 Pending 대기: ${
+          job.targetPendingRuns > 0 ? `${job.targetPendingRuns}개(상한 내 유지)` : "제한없음(전체 목표 기준)"
         } · 생성 주기: ${job.cooldownSec}초`
       );
       if (shouldImmediateRefill && job.enabled && state.config.schedulerEnabled) {
@@ -6704,6 +7045,7 @@ const server = http.createServer(async (req, res) => {
         job,
         jobs: state.jobs,
         config: state.config,
+        trimmedPendingCount,
         workerFleet: fleet,
         loadMonitor: fleet.loadMonitor,
       });
@@ -6808,7 +7150,10 @@ const server = http.createServer(async (req, res) => {
           expectedRunTime:
             d.expectedRunTime !== undefined ? String(d.expectedRunTime || "8h").trim() : String(existingJob?.expectedRunTime || "8h"),
           enableWebConsole: d.enableWebConsole !== undefined ? d.enableWebConsole !== false : existingJob?.enableWebConsole !== false,
-          minConcurrentRuns: Math.max(1, Number(d.minConcurrentRuns ?? existingJob?.minConcurrentRuns ?? 1)),
+          minConcurrentRuns:
+            d.targetGpus !== undefined && Number(d.targetGpus) > 0
+              ? Math.max(1, Math.ceil(Number(d.targetGpus) / Math.max(1, Number(d.coreCount ?? existingJob?.coreCount ?? 1))))
+              : Math.max(1, Number(d.minConcurrentRuns ?? existingJob?.minConcurrentRuns ?? 1)),
           targetPendingRuns: Math.max(0, Number(d.targetPendingRuns ?? existingJob?.targetPendingRuns ?? 0)),
           restartOnSuccess: d.restartOnSuccess !== undefined ? d.restartOnSuccess !== false : existingJob?.restartOnSuccess !== false,
           restartOnFail: d.restartOnFail !== undefined ? d.restartOnFail !== false : existingJob?.restartOnFail !== false,

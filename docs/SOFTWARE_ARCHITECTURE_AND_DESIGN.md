@@ -420,14 +420,20 @@ flowchart TD
   4. 이후 모델명 부분 일치 ➔ 첫 번째 비-CPU GPU 코어 순으로 안전하게 폴백합니다.
 
 ### 6.4 이중 목표 자동 할당 스케줄러 엔진
-- **주요 함수**: [`evaluateJobRule`](file:///home/kms/dev/space-gpu-runner/server.mjs#L4148-L4572), [`runSchedulerTick`](file:///home/kms/dev/space-gpu-runner/server.mjs#L4574-L4835), [`buildRunPayload`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3201-L3400)
+- **주요 함수**: [`computeJobTargetMetrics`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3701-L3756), [`computeAdjustedTargetsAfterSlotDelete`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3762-L3816), [`evaluateJobRule`](file:///home/kms/dev/space-gpu-runner/server.mjs#L4395-L4635), [`runSchedulerTick`](file:///home/kms/dev/space-gpu-runner/server.mjs#L4900-L4990), [`buildRunPayload`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3201-L3400)
 - **핵심 메커니즘**:
-  1. **규칙 매칭 정확도 보장 ([`doesRunMatchJob`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3630-L3667))**: 컨테이너 접두사 매칭 시 최장 접두사 우선 규칙(Longest-Prefix Wins)을 적용해 `worker-spot` 규칙이 `worker-spot-eval` 규칙의 컨테이너를 가로채지 못하도록 방지합니다.
-  2. **쿨다운 지터 보정**: 설정된 생성 간격(`cooldownSec`: 5s ~ 600s) 판정 시 API 왕복 지연으로 인해 정각 틱이 한 주기 밀리지 않도록 `Math.max(500, cooldownMs - 1500)`의 `1.5초` 지터 허용 마진을 적용합니다.
-  3. **`targetPendingRuns` 일괄 보충 및 즉시 복구**:
-     - `targetPendingRuns > 0`일 때 한 번의 스케줄러 틱에서 최대 `64`회 루프(`1초` 간격)를 돌며 부족한 Pending 수량을 한꺼번에 채웁니다.
-     - 이전 틱의 `_knownPendingRunIds`와 현재 상태를 비교하여 ① `Running`/`Succeeded` 승격 발생 시 쿨다운 즉시 우회 보충, ② 자발적 종료가 아닌 `Failed` 전이 발생 시 `15초` 뒤 빠른 재보충 타이머(`_incompletePendingBatchRetryAtMs`)를 가동합니다.
-  4. **컨테이너 실행 커맨드 자동 조립 (`buildRunPayload`)**:
+  1. **전체 목표 워커·총 GPU 상한 엄격 적용 ([`computeJobTargetMetrics`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3701-L3756))**:
+     - `minConcurrentRuns`(`targetCount`)와 `targetGpuCount = minConcurrentRuns * coreCount`는 항상 **엄격한 전체 활성 워커·총 GPU 상한(Ceiling)** 으로 작동하며, `POST /api/jobs` 및 `POST /api/jobs/target`에서 워커 수(`minConcurrentRuns`)뿐 아니라 **목표 총 GPU 장수(`targetGpus`)** 로도 직접 설정할 수 있습니다.
+     - `targetPendingRuns > 0`이 설정된 경우에도 `deficit = Math.min(Math.max(0, targetPendingRuns - effectivePendingCount), Math.max(0, minConcurrentRuns - effectiveActiveCount))` 수식을 적용하여, 전체 활성 워커(Running + Pending)가 `minConcurrentRuns`(`targetGpuCount`)를 절대 초과 생성하거나 UI 목표값을 덮어쓰지 않도록 보장합니다.
+     - 목표 하향 조정 시 초과된 비가동(`Pending`) 대기열은 `trimExcessPendingWorkersForJob`을 통해 최신 순으로 자동 취소되며(가동 중인 `Running` 컨테이너는 보존), 사용자가 원하는 경우 `bulk-action: trim_to_target` 버튼으로 초과분을 목표 수량에 즉시 맞출 수 있습니다.
+  2. **초과 가동 중 슬롯 삭제 시 목표 오염 방지 ([`computeAdjustedTargetsAfterSlotDelete`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3762-L3816))**:
+     - `activeBefore > prevTarget`인 초과 가동 상태에서 사용자가 초과 워커 슬롯을 영구 삭제(`reduceTarget: true`)하더라도, 초과분 범위 내에서는 설정된 `minConcurrentRuns`가 깎이지 않고 보존됩니다.
+  3. **규칙 매칭 정확도 보장 ([`doesRunMatchJob`](file:///home/kms/dev/space-gpu-runner/server.mjs#L3630-L3667))**: 컨테이너 접두사 매칭 시 최장 접두사 우선 규칙(Longest-Prefix Wins)을 적용해 `worker-spot` 규칙이 `worker-spot-eval` 규칙의 컨테이너를 가로채지 못하도록 방지합니다.
+  4. **쿨다운 지터 보정**: 설정된 생성 간격(`cooldownSec`: 5s ~ 1800s) 판정 시 API 왕복 지연으로 인해 정각 틱이 한 주기 밀리지 않도록 `Math.max(500, cooldownMs - 1500)`의 `1.5초` 지터 허용 마진을 적용합니다.
+  5. **`targetPendingRuns` 일괄 보충 및 즉시 복구**:
+     - `targetPendingRuns > 0`일 때 전체 목표 상한(`minConcurrentRuns`) 범위 내에서 한 번의 스케줄러 틱 동안 부족한 Pending 수량을 연속 보충합니다.
+     - 이전 틱의 `_knownPendingRunIds`와 현재 상태를 비교하여 ① `Running`/`Succeeded` 승격 발생 시 상한 미만이면 쿨다운을 우회해 즉시 보충, ② 자발적 종료가 아닌 `Failed` 전이 발생 시 `15초` 뒤 빠른 재보충 타이머(`_incompletePendingBatchRetryAtMs`)를 가동합니다.
+  6. **컨테이너 실행 커맨드 자동 조립 (`buildRunPayload`)**:
      - `/group-volume` 공유 볼륨 마운트 자동 주입
      - 옵션 활성화 시 대시보드 웹 에디터에서 수정한 스크립트 본문을 Base64 인코딩하여 컨테이너 시작 직전 자동 동기화
      - 옵션 활성화 시 `WORKER_ID`, `WORKER_SLOT`, `WORLD_SIZE`, `JOB_NAME` 분산 환경변수 자동 export

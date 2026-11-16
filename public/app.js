@@ -719,10 +719,16 @@ function patchSlotPillsGrid(gridEl, slotItems, forceRender = false) {
   }
 }
 
-function renderTopAutoStatusBanner() {
+function renderTopAutoStatusBanner(options = {}) {
   const banner = document.getElementById("topAutoStatusBanner");
   if (!banner) return;
-  if (document.activeElement?.id === "topQuickTargetInput") return;
+  const activeBannerInputId = document.activeElement?.id || "";
+  if (
+    !options.force &&
+    (activeBannerInputId === "topQuickTargetInput" || activeBannerInputId === "topQuickTargetGpusInput")
+  ) {
+    return;
+  }
 
   const cfg = serverState?.config || {};
   const fleet = latestWorkerFleet || {};
@@ -759,12 +765,14 @@ function renderTopAutoStatusBanner() {
   const pendingCnt = jf.pendingCount ?? fleet.totalPendingWorkers ?? 0;
   const targetCnt = jf.targetCount ?? jf.minConcurrentRuns ?? fleet.totalTargetWorkers ?? 1;
   const remainingCnt = jf.remainingToCreate ?? Math.max(0, targetCnt - activeCnt);
+  const excessActiveCnt = jf.excessActiveCount ?? Math.max(0, activeCnt - targetCnt);
   const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
   const gpusPerWorker = jf.coreCountPerWorker ?? jf.coreCount ?? 4;
   const runningGpus = jf.runningGpuCount ?? runningCnt * gpusPerWorker;
   const activeGpus = jf.activeGpuCount ?? activeCnt * gpusPerWorker;
   const targetGpus = jf.targetGpuCount ?? targetCnt * gpusPerWorker;
   const remainingGpus = jf.remainingGpuToCreate ?? remainingCnt * gpusPerWorker;
+  const excessActiveGpus = jf.excessActiveGpuCount ?? excessActiveCnt * gpusPerWorker;
 
   const isSchedOn = Boolean(cfg.schedulerEnabled && jf.enabled !== false);
   const isApprovalOn = (cfg.autoApprovalScope !== "off" || jf.autoApprove !== false) && appStats.running !== false;
@@ -877,45 +885,77 @@ function renderTopAutoStatusBanner() {
             </div>
           </div>
 
-          <div style="background:rgba(30,41,59,0.75); border-radius:8px; padding:9px 11px; border:1px solid rgba(245,158,11,0.35);">
-            <div style="font-size:11px; color:#94a3b8;">${remainingCnt > 0 ? "앞으로 무클릭 자동 신청될 워커" : runningCnt < targetCnt ? "⏳ 클러스터 Running 전환 대기 현황" : "앞으로 무클릭 자동 신청될 워커"}</div>
-            <div class="mono" style="font-size:20px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : runningCnt < targetCnt ? "#fde68a" : "#34d399"}; margin-top:2px;">
+          <div style="background:rgba(30,41,59,0.75); border-radius:8px; padding:9px 11px; border:1px solid ${excessActiveCnt > 0 ? "rgba(248,113,113,0.55)" : "rgba(245,158,11,0.35)"};">
+            <div style="font-size:11px; color:#94a3b8;">${
+              excessActiveCnt > 0
+                ? "⚠️ 목표 수량 초과 가동 중 (신규 자동신청 중단)"
+                : remainingCnt > 0
+                ? "앞으로 무클릭 자동 신청될 워커"
+                : runningCnt < targetCnt
+                ? "⏳ 클러스터 Running 전환 대기 현황"
+                : "앞으로 무클릭 자동 신청될 워커"
+            }</div>
+            <div class="mono" style="font-size:20px; font-weight:800; color:${
+              excessActiveCnt > 0 ? "#f87171" : remainingCnt > 0 ? "#fbbf24" : runningCnt < targetCnt ? "#fde68a" : "#34d399"
+            }; margin-top:2px;">
               ${
-                remainingCnt > 0
+                excessActiveCnt > 0
+                  ? `초과 +${excessActiveCnt}개 <span style="font-size:12.5px; color:#fca5a5;">(GPU +${excessActiveGpus}장)</span>`
+                  : remainingCnt > 0
                   ? `+${remainingCnt}개 <span style="font-size:12.5px; color:#fde68a;">(GPU +${remainingGpus}장)</span>`
                   : runningCnt < targetCnt
                   ? `⏳ 대기 ${pendingCnt}개 <span style="font-size:12.5px; color:#cbd5e1;">(Running 부족 ${targetCnt - runningCnt}개)</span>`
-                  : `+0개 <span style="font-size:12.5px; color:#6ee7b7;">(전원 Running!)</span>`
+                  : `+0개 <span style="font-size:12.5px; color:#6ee7b7;">(목표 ${targetCnt}개 · ${targetGpus}GPU 충족!)</span>`
               }
             </div>
             <div style="font-size:11px; color:#cbd5e1; margin-top:2px;">
               ${
-                remainingCnt > 0
-                  ? `${allocIntervalSec}초마다 1개씩 클릭 없이 자동 신청됨`
+                excessActiveCnt > 0
+                  ? `활성 ${activeCnt}개(${activeGpus}장) &gt; 목표 ${targetCnt}개(${targetGpus}장) — 아래 버튼으로 목표맞춤 정리 가능`
+                  : remainingCnt > 0
+                  ? `${allocIntervalSec}초마다 클릭 없이 목표(${targetCnt}개·${targetGpus}GPU)까지 자동 신청됨`
                   : runningCnt < targetCnt
-                  ? `목표 ${targetCnt}개 모두 신청 완료 · 클러스터 노드 배정 시 Running 전환`
-                  : `목표 Running ${targetCnt}개 100% 가동 중! (종료 시 즉시 자동 재신청)`
+                  ? `목표 ${targetCnt}개(${targetGpus}GPU) 신청 완료 · 노드 배정 시 Running 전환`
+                  : `목표 ${targetCnt}개(${targetGpus}GPU) 정상 가동 중! (종료 시에만 자동 재신청)`
               }
             </div>
           </div>
         </div>
 
-        <!-- Direct Target Worker Count Controls Right on the Top Banner (No Cap!) -->
-        <div style="background:rgba(30,58,138,0.28); border:1px solid rgba(96,165,250,0.45); border-radius:8px; padding:8px 11px; margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-          <div style="font-size:12px; font-weight:700; color:#bfdbfe;">
-            🎯 목표 워커 수 변경 (제한 없음):
+        <!-- Direct Target Worker & GPU Count Controls Right on the Top Banner -->
+        <div style="background:rgba(30,58,138,0.28); border:1px solid rgba(96,165,250,0.45); border-radius:8px; padding:8px 11px; margin-bottom:10px; display:flex; flex-direction:column; gap:6px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px;">
+            <div style="font-size:12px; font-weight:700; color:#bfdbfe;">
+              🎯 목표 워커 수 변경 (상한 엄격 적용):
+            </div>
+            <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+              <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', { delta: -4 })">-4</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', { delta: 4 })">+4</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 30)">30개</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 48)">48개</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 60)">60개</button>
+              <input type="number" id="topQuickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', Number(this.value || 1)); }" style="width:64px; padding:3px 6px; font-size:12.5px;" />
+              <button type="button" class="sm" style="padding:3px 8px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', Number(document.getElementById('topQuickTargetInput').value || 1))">워커 적용</button>
+            </div>
           </div>
-          <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', ${Math.max(1, targetCnt - 4)})">-4</button>
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', ${ targetCnt + 4 })">+4</button>
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', ${ targetCnt + 8 })">+8</button>
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 40)">40개</button>
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 48)">48개</button>
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 64)">64개</button>
-            <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 100)">100개</button>
-            <input type="number" id="topQuickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" style="width:68px; padding:3px 6px; font-size:12.5px;" />
-            <button type="button" class="sm" style="padding:3px 9px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId || "job-default-1")}', Number(document.getElementById('topQuickTargetInput').value || 1))">적용</button>
-            <button type="button" class="success sm" style="padding:3px 9px; background:#059669;" onclick="spawnExtraWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 4)">⚡ 즉시 +4개 생성</button>
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px; padding-top:5px; border-top:1px dashed rgba(148,163,184,0.24);">
+            <div style="font-size:11.5px; font-weight:700; color:#a7f3d0;">
+              💎 목표 총 GPU 직접 지정 (현재 목표: <b>${targetGpus}장</b> · 워커당 ${gpusPerWorker}장):
+            </div>
+            <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+              <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', { delta: -${gpusPerWorker * 4} })">-${gpusPerWorker * 4}장</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', { delta: ${gpusPerWorker * 4} })">+${gpusPerWorker * 4}장</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', 120)">120장</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', 160)">160장</button>
+              <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', 240)">240장</button>
+              <input type="number" id="topQuickTargetGpusInput" class="mono" min="1" max="99999" value="${targetGpus}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', Number(this.value || 1)); }" style="width:70px; padding:3px 6px; font-size:12.5px; border-color:rgba(16,185,129,0.55); color:#34d399; font-weight:800;" />
+              <button type="button" class="success sm" style="padding:3px 8px; background:#059669;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId || "job-default-1")}', Number(document.getElementById('topQuickTargetGpusInput').value || 1))">GPU 적용</button>
+              ${
+                excessActiveCnt > 0
+                  ? `<button type="button" class="danger sm" style="padding:3px 9px;" onclick="bulkControlWorkers('trim_to_target', { jobId: '${escapeHtml(jf.jobId || "job-default-1")}' })" title="초과된 Pending을 우선 취소하고, 여전히 초과된 경우 최신 Running 순으로 목표(${targetCnt}개·${targetGpus}GPU)에 맞춥니다">✂️ 초과 +${excessActiveCnt}개 목표맞춤 정리</button>`
+                  : `<button type="button" class="success sm" style="padding:3px 9px; background:#047857;" onclick="spawnExtraWorkers('${escapeHtml(jf.jobId || "job-default-1")}', 4)">⚡ 즉시 +4개 생성</button>`
+              }
+            </div>
           </div>
         </div>
 
@@ -1076,7 +1116,10 @@ function renderTopAutoStatusBanner() {
     pendingCnt,
     activeCnt,
     targetCnt,
+    targetGpus,
+    gpusPerWorker,
     remainingCnt,
+    excessActiveCnt,
     excessPendingCnt,
     isSchedOn,
     isApprovalOn,
@@ -1097,8 +1140,12 @@ function renderTopAutoStatusBanner() {
     timelineSig,
   ].join("|");
 
-  if (banner.getAttribute("data-banner-sig") === bannerStructuralSig) {
+  if (!options.force && banner.getAttribute("data-banner-sig") === bannerStructuralSig) {
     // Only update volatile live telemetry spans in-place without touching the rest of the banner DOM!
+    const topTargetEl = document.getElementById("topQuickTargetInput");
+    if (topTargetEl && document.activeElement !== topTargetEl) topTargetEl.value = targetCnt;
+    const topGpusEl = document.getElementById("topQuickTargetGpusInput");
+    if (topGpusEl && document.activeElement !== topGpusEl) topGpusEl.value = targetGpus;
     const scanTimeEl = document.getElementById("topQueueScanTimeSpan");
     if (scanTimeEl) scanTimeEl.textContent = formatPreciseTime(appStats.lastCheckedAt, true);
     const scanTickEl = document.getElementById("topQueueScanTickSpan");
@@ -1134,10 +1181,12 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   if (!panel) return;
   const activeElId = document.activeElement?.id || "";
   if (
-    activeElId === "quickTargetInput" ||
-    activeElId === "quickTargetPendingInput" ||
-    activeElId === "quickIntervalInput" ||
-    activeElId === "slotRangeKillInput"
+    !options.force &&
+    (activeElId === "quickTargetInput" ||
+      activeElId === "quickTargetGpusInput" ||
+      activeElId === "quickTargetPendingInput" ||
+      activeElId === "quickIntervalInput" ||
+      activeElId === "slotRangeKillInput")
   ) {
     return;
   }
@@ -1155,18 +1204,26 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   const activeCnt = jf.activeCount ?? 0;
   const runningCnt = jf.runningCount ?? 0;
   const pendingCnt = jf.pendingCount ?? 0;
-  const targetCnt = jf.targetCount ?? 1;
+  const targetCnt = jf.targetCount ?? jf.minConcurrentRuns ?? 1;
   const targetPendingCnt = jf.targetPendingCount ?? jf.targetPendingRuns ?? 0;
-  const remainingCnt = jf.remainingToCreate ?? (targetPendingCnt > 0 ? Math.max(0, targetPendingCnt - pendingCnt) : Math.max(0, targetCnt - activeCnt));
+  const maxAllowedByTotal = Math.max(0, targetCnt - activeCnt);
+  const remainingCnt =
+    jf.remainingToCreate ??
+    (targetPendingCnt > 0 ? Math.min(Math.max(0, targetPendingCnt - pendingCnt), maxAllowedByTotal) : maxAllowedByTotal);
+  const excessActiveCnt = jf.excessActiveCount ?? Math.max(0, activeCnt - targetCnt);
   const excessPendingCnt =
     jf.excessPendingCount ??
-    (targetPendingCnt > 0 ? Math.max(0, pendingCnt - targetPendingCnt) : Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt)));
+    Math.max(
+      Math.min(pendingCnt, Math.max(0, activeCnt - targetCnt)),
+      targetPendingCnt > 0 ? Math.max(0, pendingCnt - targetPendingCnt) : 0
+    );
   const gpusPerWorker = jf.coreCountPerWorker ?? jf.gpusPerWorker ?? 1;
   const runningGpus = jf.runningGpuCount ?? jf.runningGpus ?? runningCnt * gpusPerWorker;
   const pendingGpus = jf.pendingGpuCount ?? jf.pendingGpus ?? pendingCnt * gpusPerWorker;
   const activeGpus = jf.activeGpuCount ?? jf.activeGpus ?? activeCnt * gpusPerWorker;
   const targetGpus = jf.targetGpuCount ?? jf.targetGpus ?? targetCnt * gpusPerWorker;
   const remainingGpus = jf.remainingGpuToCreate ?? jf.remainingGpus ?? remainingCnt * gpusPerWorker;
+  const excessActiveGpus = jf.excessActiveGpuCount ?? excessActiveCnt * gpusPerWorker;
   const runningPct = targetCnt > 0 ? Math.min(100, Math.round((runningCnt / targetCnt) * 100)) : 100;
   const pendingPct = targetCnt > 0 ? Math.min(Math.max(0, 100 - runningPct), Math.round((pendingCnt / targetCnt) * 100)) : 0;
   const pct = targetCnt > 0 ? Math.min(100, Math.round((activeCnt / targetCnt) * 100)) : 100;
@@ -1203,7 +1260,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12.5px;">
             <span style="font-weight:800; color:#38bdf8;">📊 SPACE 실제 워커 실시간 대조표:</span>
             <span class="mono" style="background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.45); padding:3px 8px; border-radius:6px; color:#d1fae5;">
-              ① 규칙 <b>[${escapeHtml(jf.jobName)}]</b>: <b style="color:#34d399;">🟢 Running ${runningCnt}개</b>(${runningGpus}GPU) + <b style="color:#fde68a;">⏳ Pending ${pendingCnt}${targetPendingCnt > 0 ? `/${targetPendingCnt}(목표)` : ""}개</b>(${pendingGpus}GPU) = <b>활성 ${activeCnt}개</b> / 목표 ${targetCnt}개
+              ① 규칙 <b>[${escapeHtml(jf.jobName)}]</b>: <b style="color:#34d399;">🟢 Running ${runningCnt}개</b>(${runningGpus}GPU) + <b style="color:#fde68a;">⏳ Pending ${pendingCnt}${targetPendingCnt > 0 ? `/${targetPendingCnt}(목표)` : ""}개</b>(${pendingGpus}GPU) = <b>활성 ${activeCnt}개(${activeGpus}GPU)</b> / 목표 ${targetCnt}개(${targetGpus}GPU)
             </span>
             <span class="mono" style="background:rgba(59,130,246,0.15); border:1px solid rgba(59,130,246,0.45); padding:3px 8px; border-radius:6px; color:#dbeafe;">
               ② 내 계정 전체(<code>${escapeHtml(recon.currentUserName || "me")}</code>): <b style="color:#60a5fa;">🟢 Running ${recon.mySpaceRunningWorkers}개</b>(${recon.mySpaceRunningGpus}GPU) + ⏳ Pending ${recon.mySpacePendingWorkers}개 = <b>총 ${recon.mySpaceActiveWorkers}개</b>
@@ -1212,11 +1269,18 @@ function renderWorkerFleetBoard(fleet, options = {}) {
               ③ 그룹 전체(<code>${escapeHtml(recon.groupId || "Group")}</code>): <b>🟢 Running ${recon.spaceTotalRunningWorkers}개</b>(${recon.spaceTotalRunningGpus}GPU) + ⏳ Pending ${recon.spaceTotalPendingWorkers}개 = <b>총 ${recon.spaceTotalActiveWorkers}개</b>
             </span>
           </div>
-          ${
-            excessPendingCnt > 0
-              ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800; padding:4px 10px;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending +${excessPendingCnt}개 자동 정리 (${targetPendingCnt > 0 ? `목표 Pending ${targetPendingCnt}개` : `${targetCnt}개`} 맞춤)</button>`
-              : ""
-          }
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            ${
+              excessPendingCnt > 0
+                ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800; padding:4px 10px;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending +${excessPendingCnt}개 취소</button>`
+                : ""
+            }
+            ${
+              excessActiveCnt > 0
+                ? `<button type="button" class="danger sm" style="font-weight:800; padding:4px 10px;" onclick="bulkControlWorkers('trim_to_target', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 목표(${targetCnt}워커·${targetGpus}GPU) 맞춤 초과 +${excessActiveCnt}개 정리</button>`
+                : ""
+            }
+          </div>
         </div>
         ${
           myUnmatched.length > 0 || otherUsers.length > 0
@@ -1554,26 +1618,30 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   let statusHeadline = "";
   let statusBadgeClass = "ok";
   let statusBadgeLabel = "";
-  if (remainingCnt > 0) {
+  if (excessActiveCnt > 0) {
+    statusBadgeClass = "warn";
+    statusBadgeLabel = `⚠️ 목표 초과 가동 중 (활성 ${activeCnt}개 / 목표 ${targetCnt}개 · 총 ${targetGpus}GPU 상한)`;
+    statusHeadline = `⚠️ 현재 활성 <b>${activeCnt}개</b>(GPU <b>${activeGpus}장</b>)가 설정된 목표 <b>${targetCnt}개</b>(총 GPU <b>${targetGpus}장</b>)보다 <b style="color:#fca5a5;">+${excessActiveCnt}개(+${excessActiveGpus}GPU)</b> 초과 가동 중입니다 — 신규 자동생성은 중단되었으며, 우측 <b>[✂️ 초과분 목표맞춤 정리]</b> 버튼으로 목표 수량에 즉시 맞출 수 있습니다.`;
+  } else if (remainingCnt > 0) {
     statusBadgeClass = "warn";
     statusBadgeLabel = `🚀 자동 스케일업 진행 중 (🟢 Running ${runningCnt} · ⏳ 대기 ${pendingCnt} · 활성 ${activeCnt}/${targetCnt})`;
     if (isAutoOn) {
-      statusHeadline = `🔄 현재 <b>🟢 Running ${runningCnt}개</b> + ⏳ 대기 ${pendingCnt}개(활성 ${activeCnt}개) → 목표 <b>${targetCnt}개</b>까지 앞으로 <b style="color:#fde68a; font-size:15px;">+${remainingCnt}개</b> 워커(GPU <b>+${remainingGpus}장</b>)가 <b>${intervalSec}초 간격</b>으로 자동 생성됩니다!`;
+      statusHeadline = `🔄 현재 <b>🟢 Running ${runningCnt}개</b> + ⏳ 대기 ${pendingCnt}개(활성 ${activeCnt}개) → 목표 <b>${targetCnt}개</b>(총 <b>${targetGpus}GPU</b>)까지 앞으로 <b style="color:#fde68a; font-size:15px;">+${remainingCnt}개</b> 워커(GPU <b>+${remainingGpus}장</b>)가 자동 생성됩니다!`;
     } else {
       statusHeadline = `⏸️ 현재 <b>🟢 Running ${runningCnt}개</b> + ⏳ 대기 ${pendingCnt}개(활성 ${activeCnt}/${targetCnt}개 · 미달 <b>+${remainingCnt}개</b>) — 현재 자동 생성이 일시정지(OFF) 상태입니다.`;
     }
   } else if (runningCnt < targetCnt) {
     statusBadgeClass = "warn";
     statusBadgeLabel = `⏳ 클러스터 노드 대기 중 (🟢 Running ${runningCnt} / 목표 ${targetCnt}개 · Pending ${pendingCnt}개)`;
-    statusHeadline = `🟢 현재 실제 가동(Running) <b>${runningCnt}개</b>(GPU <b>${runningGpus}장</b>) + ⏳ 클러스터 대기(Pending) <b style="color:#fde68a;">${pendingCnt}개</b>(GPU <b>${pendingGpus}장</b>) = 전체 활성 <b>${activeCnt}개</b> (목표 <b>${targetCnt}개</b> 신청 완료${
+    statusHeadline = `🟢 현재 실제 가동(Running) <b>${runningCnt}개</b>(GPU <b>${runningGpus}장</b>) + ⏳ 클러스터 대기(Pending) <b style="color:#fde68a;">${pendingCnt}개</b>(GPU <b>${pendingGpus}장</b>) = 전체 활성 <b>${activeCnt}개</b> (목표 <b>${targetCnt}개 · ${targetGpus}GPU</b> 범위 내${
       excessPendingCnt > 0 ? ` · <span style="color:#fbbf24;">초과 Pending +${excessPendingCnt}개</span>` : ""
     })`;
   } else {
     statusBadgeClass = "ok";
-    statusBadgeLabel = `✅ 목표 Running 100% 달성 (🟢 Running ${runningCnt}/${targetCnt}개${pendingCnt > 0 ? ` · 대기 ${pendingCnt}개` : ""})`;
-    statusHeadline = `✅ 목표 워커 <b>${targetCnt}개</b> 중 <b>🟢 실제 가동(Running) ${runningCnt}개</b> (총 GPU <b>${runningGpus}장</b>)${
+    statusBadgeLabel = `✅ 목표 Running 100% 달성 (🟢 Running ${runningCnt}/${targetCnt}개 · ${targetGpus}GPU)`;
+    statusHeadline = `✅ 목표 워커 <b>${targetCnt}개</b>(총 GPU <b>${targetGpus}장</b>)가 <b>🟢 실제 가동(Running) ${runningCnt}개</b>${
       pendingCnt > 0 ? ` + ⏳ 대기 ${pendingCnt}개` : ""
-    } 가동 중입니다! (워커 종료 시 자동으로 즉시 재생성)`;
+    }로 정상 가동 중입니다! (워커 종료 시 목표 범위 내에서만 자동 재생성)`;
   }
 
   // Ensure persistent skeleton inside #workerFleetPanel so we never destroy scroll positions, hover states, or <details>
@@ -1615,6 +1683,8 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         pendingCnt,
         activeCnt,
         targetCnt,
+        targetGpus,
+        excessActiveCnt,
         excessPendingCnt,
         recon.mySpaceRunningWorkers,
         recon.mySpacePendingWorkers,
@@ -1629,7 +1699,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   updateHtmlIfSigChanged(document.getElementById("wfReconciliationBar"), reconSig, reconciliationBarHtml);
 
   // 3. Headline section
-  const headlineSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${remainingCnt}|${excessPendingCnt}|${isAutoOn}|${intervalSec}`;
+  const headlineSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${isAutoOn}|${intervalSec}`;
   const headlineHtml = `
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
       <div>
@@ -1649,6 +1719,11 @@ function renderWorkerFleetBoard(fleet, options = {}) {
             ? `<button type="button" class="secondary sm" style="border-color:#fbbf24; background:rgba(245,158,11,0.18); color:#fde68a; font-weight:800;" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과 Pending(+${excessPendingCnt}개) 정리</button>`
             : ""
         }
+        ${
+          excessActiveCnt > 0
+            ? `<button type="button" class="danger sm" style="font-weight:800;" onclick="bulkControlWorkers('trim_to_target', { jobId: '${escapeHtml(jf.jobId)}' })">✂️ 초과분(+${excessActiveCnt}개) 목표맞춤 정리</button>`
+            : ""
+        }
         <button type="button" class="secondary sm" style="border-color:rgba(245,158,11,0.5); color:#fde68a;" onclick="bulkControlWorkers('stop_pending')">⏳ Pending(${pendingCnt}개) 전체취소</button>
         <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all')">🛑 전체 워커 종료</button>
       </div>
@@ -1657,49 +1732,57 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   updateHtmlIfSigChanged(document.getElementById("wfHeadlineSection"), headlineSig, headlineHtml);
 
   // 4. Metric cards section (only update when worker/target/interval counts change)
-  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetPendingCnt}|${remainingCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}`;
+  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${targetPendingCnt}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}`;
   const metricHtml = `
-    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-bottom:12px;">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(225px, 1fr)); gap:10px; margin-bottom:12px;">
       <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(16,185,129,0.45); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">🟢 실제 가동 중(Running) 워커 수</div>
+        <div style="font-size:11.5px; color:#94a3b8;">🟢 실제 가동 중(Running) / 목표 상한</div>
         <div class="mono" style="font-size:22px; font-weight:800; color:#34d399; margin-top:2px;">
           ${runningCnt}개 <span style="font-size:14px; color:#cbd5e1;">/ 목표 ${targetCnt}개</span>
-          <span style="font-size:12.5px; font-weight:600; color:#a7f3d0;">(가동 GPU ${runningGpus}장)</span>
+          <span style="font-size:12.5px; font-weight:600; color:#a7f3d0;">(가동 ${runningGpus} / 목표 ${targetGpus}GPU)</span>
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
           ⏳ Pending 대기: <b style="color:#fde68a;">${pendingCnt}개${targetPendingCnt > 0 ? ` / 목표 ${targetPendingCnt}개` : ""}</b>(${pendingGpus}장) &nbsp;|&nbsp; 전체 활성: <b>${activeCnt}개</b>(${activeGpus}장)
         </div>
       </div>
 
-      <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(245,158,11,0.45); border-radius:8px; padding:10px 12px;">
+      <div style="background:rgba(15,23,42,0.75); border:1px solid ${excessActiveCnt > 0 ? "rgba(248,113,113,0.55)" : "rgba(245,158,11,0.45)"}; border-radius:8px; padding:10px 12px;">
         <div style="font-size:11.5px; color:#94a3b8;">${
-          targetPendingCnt > 0
-            ? `⏳ Pending 목표(${targetPendingCnt}개) 자동 유지 상태`
+          excessActiveCnt > 0
+            ? "⚠️ 목표 수량 초과 가동 상태 (추가 생성 중단)"
+            : targetPendingCnt > 0
+            ? `⏳ Pending 목표(${targetPendingCnt}개 · 총 ${targetCnt}워커 상한) 상태`
             : remainingCnt > 0
             ? "🔄 앞으로 자동 생성될 워커 수"
             : "⏳ 클러스터 Pending 대기 및 추가 생성"
         }</div>
-        <div class="mono" style="font-size:21px; font-weight:800; color:${remainingCnt > 0 ? "#fbbf24" : pendingCnt > 0 ? "#fde68a" : "#6ee7b7"}; margin-top:2px;">
+        <div class="mono" style="font-size:21px; font-weight:800; color:${
+          excessActiveCnt > 0 ? "#f87171" : remainingCnt > 0 ? "#fbbf24" : pendingCnt > 0 ? "#fde68a" : "#6ee7b7"
+        }; margin-top:2px;">
           ${
-            remainingCnt > 0
+            excessActiveCnt > 0
+              ? `목표초과 +${excessActiveCnt}개 <span style="font-size:12.5px; font-weight:600; color:#fca5a5;">(+${excessActiveGpus}GPU)</span>`
+              : remainingCnt > 0
               ? `+${remainingCnt}개 생성 예정 <span style="font-size:12.5px; font-weight:600; color:#fde68a;">(${
-                  targetPendingCnt > 0 ? `Pending ${pendingCnt}→${targetPendingCnt}개` : `GPU +${remainingGpus}장`
+                  targetPendingCnt > 0 ? `총목표 ${targetCnt}개 상한 내 보충` : `GPU +${remainingGpus}장`
                 })</span>`
               : pendingCnt > 0
               ? `⏳ Pending ${pendingCnt}개 대기 <span style="font-size:12.5px; font-weight:600; color:#cbd5e1;">(${
                   excessPendingCnt > 0
                     ? `목표초과 +${excessPendingCnt}개`
                     : targetPendingCnt > 0
-                    ? `목표 Pending ${targetPendingCnt}개 유지중`
+                    ? `상한 내 Pending 유지중`
                     : `Running 전환 대기`
                 })</span>`
-              : `대기 0개 <span style="font-size:12.5px; font-weight:600; color:#6ee7b7;">(전원 Running!)</span>`
+              : `대기 0개 <span style="font-size:12.5px; font-weight:600; color:#6ee7b7;">(목표 ${targetCnt}개 · ${targetGpus}GPU 충족!)</span>`
           }
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:2px;">
           ${
-            remainingCnt > 0 && targetPendingCnt > 0
-              ? `부족한 Pending <b>+${remainingCnt}개</b> 일괄 연속 보충 · Running 전환 시 즉시 보충 (주기 점검: <b>${
+            excessActiveCnt > 0
+              ? `전체 목표 <b>${targetCnt}개(${targetGpus}GPU)</b> 상한 도달로 추가 생성이 멈춰 있습니다`
+              : remainingCnt > 0 && targetPendingCnt > 0
+              ? `총 목표(${targetCnt}개·${targetGpus}GPU) 상한 내에서 Pending <b>+${remainingCnt}개</b> 보충 (주기: <b>${
                   intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분(${intervalSec}초)` : `${intervalSec}초`
                 }</b>)`
               : remainingCnt > 0
@@ -1707,10 +1790,10 @@ function renderWorkerFleetBoard(fleet, options = {}) {
                   intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분(${intervalSec}초)` : `${intervalSec}초`
                 }</b>마다 1개씩 자동 생성 · 약 <b>${Math.ceil((remainingCnt * intervalSec) / 60)}분</b> 내 전부 생성`
               : targetPendingCnt > 0
-              ? `목표 Pending <b>${targetPendingCnt}개</b> 유지 완료 · Running 진입 시 즉시 새 Pending 보충`
+              ? `총 목표(${targetCnt}개·${targetGpus}GPU) 상한 도달 — 워커 종료 시에만 새 Pending 보충`
               : pendingCnt > 0
-              ? `목표 ${targetCnt}개 신청 완료 · 클러스터 GPU 노드 배정 시 Running 진입`
-              : `추가 생성 대기 없음 (목표 Running 100% 충족)`
+              ? `목표 ${targetCnt}개(${targetGpus}GPU) 신청 완료 · 노드 배정 시 Running 진입`
+              : `추가 생성 대기 없음 (목표 ${targetCnt}개 · ${targetGpus}GPU 충족)`
           }
         </div>
       </div>
@@ -1718,7 +1801,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       <div style="background:rgba(15,23,42,0.82); border:1.5px solid ${
         targetPendingCnt > 0 ? "rgba(245,158,11,0.75)" : "rgba(245,158,11,0.38)"
       }; border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#fde68a; font-weight:700;">⏳ 유지할 목표 Pending 대기 개수 (빠른 지정)</div>
+        <div style="font-size:11.5px; color:#fde68a; font-weight:700;">⏳ 목표 Pending 대기 개수 (총 목표 상한 내 유지)</div>
         <div style="display:flex; align-items:center; gap:4px; margin-top:4px; flex-wrap:wrap;">
           <span class="mono" style="font-size:19px; font-weight:800; color:${
             targetPendingCnt > 0 ? "#fbbf24" : "#94a3b8"
@@ -1740,31 +1823,42 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           <button type="button" class="secondary sm" style="padding:2px 6px; ${
             targetPendingCnt === 10 ? "background:#d97706; border-color:#fbbf24; color:#fff;" : ""
           }" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 10)">10</button>
-          <input type="number" id="quickTargetPendingInput" class="mono" min="0" max="9999" value="${targetPendingCnt}" style="width:56px; padding:3px 5px; font-size:12px;" title="유지할 목표 Pending 대기 개수 (0=해제)" />
+          <input type="number" id="quickTargetPendingInput" class="mono" min="0" max="9999" value="${targetPendingCnt}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetPending('${escapeHtml(jf.jobId)}', Number(this.value || 0)); }" style="width:56px; padding:3px 5px; font-size:12px;" title="유지할 목표 Pending 대기 개수 (0=해제)" />
           <button type="button" class="sm" style="padding:3px 8px; background:#d97706;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetPendingInput').value || 0))">적용</button>
         </div>
         <div style="font-size:11px; color:#cbd5e1; margin-top:3px;">
           ${
             targetPendingCnt > 0
-              ? `현재 Pending <b style="color:#fde68a;">${pendingCnt}개</b> / 목표 <b style="color:#fbbf24;">${targetPendingCnt}개</b> (Running 진입 시 즉시 보충)`
-              : `1 이상 입력 시 해당 개수만큼 Pending 대기열을 항상 유지합니다`
+              ? `현재 Pending <b style="color:#fde68a;">${pendingCnt}개</b> / 설정 <b style="color:#fbbf24;">${targetPendingCnt}개</b> (전체 ${targetCnt}워커·${targetGpus}GPU 상한 초과 금지)`
+              : `1 이상 입력 시 전체 목표 상한 범위 내에서 Pending 대기열을 유지합니다`
           }
         </div>
       </div>
 
-      <div style="background:rgba(15,23,42,0.75); border:1px solid rgba(59,130,246,0.45); border-radius:8px; padding:10px 12px;">
-        <div style="font-size:11.5px; color:#94a3b8;">🎯 유지할 목표 총 워커 수 (빠른 변경)</div>
-        <div style="display:flex; align-items:center; gap:5px; margin-top:4px; flex-wrap:wrap;">
-          <span class="mono" style="font-size:20px; font-weight:800; color:#60a5fa; margin-right:4px;">${targetCnt}개</span>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: -4 })">-4</button>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: 4 })">+4</button>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 48)">48</button>
-          <button type="button" class="secondary sm" style="padding:2px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 56)">56</button>
-          <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" style="width:64px; padding:3px 6px; font-size:12.5px;" />
-          <button type="button" class="sm" style="padding:3px 8px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetInput').value || 1))">적용</button>
+      <div style="background:rgba(15,23,42,0.82); border:1.5px solid rgba(59,130,246,0.55); border-radius:8px; padding:10px 12px;">
+        <div style="font-size:11.5px; color:#93c5fd; font-weight:700;">🎯 유지할 목표 총 워커 / 총 GPU 수 (빠른 변경)</div>
+        <div style="display:flex; align-items:center; gap:4px; margin-top:4px; flex-wrap:wrap;">
+          <span class="mono" style="font-size:18px; font-weight:800; color:#60a5fa; margin-right:2px;">${targetCnt}워커</span>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: -4 })">-4</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: 4 })">+4</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 30)">30</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 48)">48</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 60)">60</button>
+          <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', Number(this.value || 1)); }" style="width:60px; padding:3px 5px; font-size:12px;" />
+          <button type="button" class="sm" style="padding:3px 7px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetInput').value || 1))">워커적용</button>
         </div>
-        <div style="font-size:11.5px; color:#cbd5e1; margin-top:3px;">
-          목표 총 GPU: <b>${targetGpus}장</b> (워커당 GPU ${gpusPerWorker}장)
+        <div style="display:flex; align-items:center; gap:4px; margin-top:6px; padding-top:5px; border-top:1px dashed rgba(148,163,184,0.22); flex-wrap:wrap;">
+          <span class="mono" style="font-size:17px; font-weight:800; color:#34d399; margin-right:2px;">${targetGpus}GPU</span>
+          <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', { delta: -${gpusPerWorker * 4} })">-${gpusPerWorker * 4}</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', { delta: ${gpusPerWorker * 4} })">+${gpusPerWorker * 4}</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', 120)">120장</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', 160)">160장</button>
+          <button type="button" class="secondary sm" style="padding:2px 6px; border-color:rgba(16,185,129,0.45); color:#a7f3d0;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', 240)">240장</button>
+          <input type="number" id="quickTargetGpusInput" class="mono" min="1" max="99999" value="${targetGpus}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', Number(this.value || 1)); }" style="width:66px; padding:3px 5px; font-size:12px; border-color:rgba(16,185,129,0.55); color:#34d399; font-weight:800;" />
+          <button type="button" class="success sm" style="padding:3px 7px; background:#059669;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetGpusInput').value || 1))">GPU적용</button>
+        </div>
+        <div style="font-size:11px; color:#cbd5e1; margin-top:3px;">
+          워커당 GPU <b>${gpusPerWorker}장</b> × 워커 <b>${targetCnt}개</b> = 총 목표 <b>${targetGpus}장</b>
         </div>
       </div>
 
@@ -1783,7 +1877,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
           <button type="button" class="secondary sm" style="padding:2px 6px; font-weight:800; ${intervalSec === 600 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : "border-color:rgba(192,132,252,0.55); color:#e9d5ff;"}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 600)">10분</button>
           <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 900 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 900)">15분</button>
           <button type="button" class="secondary sm" style="padding:2px 6px; ${intervalSec === 1800 ? "background:#7c3aed; border-color:#c084fc; color:#fff;" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 1800)">30분</button>
-          <input type="number" id="quickIntervalInput" class="mono" min="1" max="86400" value="${intervalSec}" style="width:62px; padding:3px 5px; font-size:12px;" title="직접 초 단위 입력 (예: 180=3분, 300=5분, 600=10분, 1800=30분)" />
+          <input type="number" id="quickIntervalInput" class="mono" min="1" max="86400" value="${intervalSec}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', Number(this.value || 15)); }" style="width:62px; padding:3px 5px; font-size:12px;" title="직접 초 단위 입력 (예: 180=3분, 300=5분, 600=10분, 1800=30분)" />
           <button type="button" class="sm" style="padding:3px 8px;" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickIntervalInput').value || 15))">적용</button>
         </div>
         <div style="font-size:11.5px; color:#cbd5e1; margin-top:3px;">
@@ -1792,7 +1886,16 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       </div>
     </div>
   `;
-  updateHtmlIfSigChanged(document.getElementById("wfMetricCardsSection"), metricSig, metricHtml);
+  if (!updateHtmlIfSigChanged(document.getElementById("wfMetricCardsSection"), metricSig, metricHtml)) {
+    const qTargetEl = document.getElementById("quickTargetInput");
+    if (qTargetEl && document.activeElement !== qTargetEl) qTargetEl.value = targetCnt;
+    const qGpusEl = document.getElementById("quickTargetGpusInput");
+    if (qGpusEl && document.activeElement !== qGpusEl) qGpusEl.value = targetGpus;
+    const qPendingEl = document.getElementById("quickTargetPendingInput");
+    if (qPendingEl && document.activeElement !== qPendingEl) qPendingEl.value = targetPendingCnt;
+    const qIntEl = document.getElementById("quickIntervalInput");
+    if (qIntEl && document.activeElement !== qIntEl) qIntEl.value = intervalSec;
+  }
 
   // 5. Dual Progress Bar (only update when percentages or load badge change)
   const progSig = `${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${runningPct}|${pendingPct}|${fleet.loadMonitor?.loadBadgeText || ""}`;
@@ -1980,35 +2083,45 @@ function updateWorkerCountdownBadge() {
   const pendingCnt = jf.pendingCount ?? 0;
   const activeCnt = jf.activeCount ?? 0;
   const targetCnt = jf.targetCount ?? 1;
+  const gpusPerWorker = jf.coreCountPerWorker ?? jf.coreCount ?? 1;
+  const targetGpus = jf.targetGpuCount ?? targetCnt * gpusPerWorker;
+  const activeGpus = jf.activeGpuCount ?? activeCnt * gpusPerWorker;
   const targetPendingCnt = jf.targetPendingCount ?? 0;
+  const excessActiveCnt = jf.excessActiveCount ?? Math.max(0, activeCnt - targetCnt);
   const excessPendingCnt = jf.excessPendingCount ?? Math.max(0, Math.min(pendingCnt, activeCnt - targetCnt));
   const isAutoOn = Boolean(latestWorkerFleet.schedulerEnabled && jf.enabled);
   const schedStats = latestSchedulerStats || {};
-  const effSchedSec = schedStats.effectiveIntervalSec || jf.scaleUpIntervalSec || 30;
   let nextSchedCheckSec = 0;
   if (schedStats.nextCheckAt) {
     nextSchedCheckSec = Math.max(0, Math.ceil((new Date(schedStats.nextCheckAt).getTime() - now) / 1000));
   }
 
+  if (excessActiveCnt > 0) {
+    const overMsg = `⚠️ 현재 활성 <b>${activeCnt}개(${activeGpus}GPU)</b>가 설정된 목표 <b>${targetCnt}개(${targetGpus}GPU)</b>보다 <b style="color:#fca5a5;">+${excessActiveCnt}개</b> 초과 상태입니다 — 신규 자동 생성은 중단되었으며 목표 이하로 내려갈 때만 재신청됩니다. (다음 감시 점검: <b>${nextSchedCheckSec}초 후</b>)`;
+    if (el) el.innerHTML = overMsg;
+    if (topAllocEl) topAllocEl.innerHTML = overMsg;
+    return;
+  }
+
   if (remainingCnt <= 0) {
     if (targetPendingCnt > 0) {
-      const waitMsg = `✅ 목표 Pending 대기 <b>${pendingCnt}/${targetPendingCnt}개</b> 유지 중! — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> 가동 중이며 <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>가 GPU 노드 배정을 기다리고 있습니다.${
-        excessPendingCnt > 0 ? ` (목표 Pending 대비 초과 +${excessPendingCnt}개)` : ""
-      } (Running 진입 시 즉시 새 Pending 보충 · 다음 점검: <b>${nextSchedCheckSec}초 후</b>)`;
+      const waitMsg = `✅ 목표 상한(<b>${targetCnt}워커 · ${targetGpus}GPU</b>) 내 운영 중 — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> + <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>(설정 Pending ${targetPendingCnt}개)${
+        excessPendingCnt > 0 ? ` · 초과 Pending +${excessPendingCnt}개` : ""
+      } (종료 발생 시 목표 범위 내에서만 보충 · 다음 점검: <b>${nextSchedCheckSec}초 후</b>)`;
       if (el) el.innerHTML = waitMsg;
       if (topAllocEl) topAllocEl.innerHTML = waitMsg;
     } else if (runningCnt < targetCnt) {
-      const waitMsg = `⏳ 목표 워커 <b>${targetCnt}개</b> 모두 신청 완료 — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> 가동 중이며 <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>가 클러스터 GPU 노드 배정을 기다리고 있습니다.${
+      const waitMsg = `⏳ 목표 워커 <b>${targetCnt}개(${targetGpus}GPU)</b> 모두 신청 완료 — 현재 <b style="color:#34d399;">🟢 Running ${runningCnt}개</b> 가동 중이며 <b style="color:#fde68a;">⏳ Pending ${pendingCnt}개</b>가 클러스터 GPU 노드 배정을 기다리고 있습니다.${
         excessPendingCnt > 0 ? ` (목표 대비 초과 Pending +${excessPendingCnt}개)` : ""
       } (다음 감시 점검: <b>${nextSchedCheckSec}초 후</b>)`;
       if (el) el.innerHTML = waitMsg;
       if (topAllocEl) topAllocEl.innerHTML = waitMsg;
     } else {
       if (el) {
-        el.innerHTML = `✨ 현재 목표 워커(<b>🟢 Running ${runningCnt}/${targetCnt}개</b>)가 전원 정상 가동 중입니다. (다음 자동 감시 점검: <b>${nextSchedCheckSec}초 후</b> · 종료 발생 시 즉시 자동 충원)`;
+        el.innerHTML = `✨ 현재 목표 워커(<b>🟢 Running ${runningCnt}/${targetCnt}개 · 총 ${targetGpus}GPU</b>)가 전원 정상 가동 중입니다. (다음 자동 감시 점검: <b>${nextSchedCheckSec}초 후</b> · 종료 발생 시 목표 범위 내 자동 충원)`;
       }
       if (topAllocEl) {
-        topAllocEl.innerHTML = `✅ 목표 Running 워커 <b>${runningCnt}/${targetCnt}개</b> 100% 가동 유지 중! (다음 무클릭 자동 감시 점검까지: <b style="color:#6ee7b7;">${nextSchedCheckSec}초</b> · 워커 종료 시 자동 재신청)`;
+        topAllocEl.innerHTML = `✅ 목표 Running 워커 <b>${runningCnt}/${targetCnt}개(${targetGpus}GPU)</b> 100% 가동 유지 중! (다음 무클릭 자동 감시 점검까지: <b style="color:#6ee7b7;">${nextSchedCheckSec}초</b> · 종료 시 자동 재신청)`;
       }
     }
     return;
@@ -2033,8 +2146,8 @@ function updateWorkerCountdownBadge() {
   const secs = totalEstSec % 60;
   const targetDesc =
     targetPendingCnt > 0
-      ? `남은 Pending 보충 <b>+${remainingCnt}개</b> (목표 Pending ${targetPendingCnt}개 일괄 채움)`
-      : `남은 <b>+${remainingCnt}개</b> 전체 자동 신청`;
+      ? `남은 Pending 보충 <b>+${remainingCnt}개</b> (총 목표 ${targetCnt}개·${targetGpus}GPU 상한 내)`
+      : `남은 <b>+${remainingCnt}개</b> 전체 자동 신청 (목표 ${targetCnt}개·${targetGpus}GPU)`;
   const msgHtml =
     remainSec > 0
       ? `⏱️ 다음 <b>워커#${nextSlotNum}</b> 무클릭 자동 신청까지: <b style="color:#fde68a; font-size:13.5px;">${remainSec}초</b> 남음 &nbsp;|&nbsp; ${targetDesc} 완료 예상: 약 <b>${mins > 0 ? `${mins}분 ` : ""}${secs}초</b>`
@@ -2043,77 +2156,194 @@ function updateWorkerCountdownBadge() {
   if (topAllocEl) topAllocEl.innerHTML = msgHtml;
 }
 
+function syncAllQuickTargetInputsDom(targetWorkers, gpusPerWorker, jobId = "") {
+  const safeWorkers = Math.max(1, Number(targetWorkers || 1));
+  const safeGpusPerWorker = Math.max(1, Number(gpusPerWorker || 1));
+  const safeTotalGpus = safeWorkers * safeGpusPerWorker;
+  const qTarget = document.getElementById("quickTargetInput");
+  if (qTarget) qTarget.value = safeWorkers;
+  const topTarget = document.getElementById("topQuickTargetInput");
+  if (topTarget) topTarget.value = safeWorkers;
+  const qGpus = document.getElementById("quickTargetGpusInput");
+  if (qGpus) qGpus.value = safeTotalGpus;
+  const topGpus = document.getElementById("topQuickTargetGpusInput");
+  if (topGpus) topGpus.value = safeTotalGpus;
+  const formJobId = document.getElementById("jobId")?.value || "";
+  if (!jobId || !formJobId || String(formJobId) === String(jobId)) {
+    const minInput = document.getElementById("jobMinConcurrent");
+    if (minInput) minInput.value = safeWorkers;
+    const formGpusInput = document.getElementById("jobTargetGpus");
+    if (formGpusInput) formGpusInput.value = safeTotalGpus;
+    if (typeof syncJobFormWorkerGpuInputs === "function") {
+      syncJobFormWorkerGpuInputs("workers");
+    }
+  }
+}
+
 async function quickUpdateTargetWorkers(jobId, valueOrOpts) {
-  const jf = (latestWorkerFleet?.jobs || []).find((j) => j.jobId === jobId) || latestWorkerFleet?.jobs?.[0] || null;
-  const quickInputEl = document.getElementById("quickTargetInput");
-  const baseVal = Number(quickInputEl?.value ?? jf?.targetCount ?? 1);
+  const jf =
+    (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(jobId)) ||
+    getFocusedJobFleet(latestWorkerFleet) ||
+    null;
+  const resolvedJobId = jobId || jf?.jobId || document.getElementById("jobId")?.value || "";
+  const gpusPerWorker = Math.max(
+    1,
+    Number(jf?.coreCountPerWorker ?? jf?.coreCount ?? document.getElementById("jobCoreCount")?.value ?? 1)
+  );
+  const baseVal = Number(jf?.minConcurrentRuns ?? jf?.targetCount ?? document.getElementById("quickTargetInput")?.value ?? 1);
   const rawTarget =
     typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
       ? baseVal + Number(valueOrOpts.delta || 0)
       : Number(valueOrOpts || 1);
-  const target = Math.max(1, Math.min(9999, rawTarget));
-  if (quickInputEl) quickInputEl.value = target;
-  const minInput = document.getElementById("jobMinConcurrent");
-  if (minInput) minInput.value = target;
+  const target = Math.max(1, Math.min(9999, Math.round(rawTarget)));
+  syncAllQuickTargetInputsDom(target, gpusPerWorker, resolvedJobId);
   if (jf) {
+    jf.minConcurrentRuns = target;
     jf.targetCount = target;
+    jf.targetGpuCount = target * gpusPerWorker;
+    const maxRem = Math.max(0, target - (jf.activeCount || 0));
+    jf.remainingToCreate =
+      (jf.targetPendingCount || 0) > 0
+        ? Math.min(Math.max(0, (jf.targetPendingCount || 0) - (jf.pendingCount || 0)), maxRem)
+        : maxRem;
+    jf.excessActiveCount = Math.max(0, (jf.activeCount || 0) - target);
+    jf.excessActiveGpuCount = jf.excessActiveCount * gpusPerWorker;
     renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+    renderTopAutoStatusBanner({ force: true });
   }
   try {
     const res = await api("/api/jobs/target", {
       method: "POST",
       body: JSON.stringify({
-        jobId,
+        jobId: resolvedJobId,
         minConcurrentRuns: target,
       }),
     });
+    const appliedWorkers = Number(res?.job?.minConcurrentRuns || target);
+    const appliedCoreCount = Math.max(1, Number(res?.job?.coreCount || gpusPerWorker));
+    const appliedGpus = appliedWorkers * appliedCoreCount;
+    syncAllQuickTargetInputsDom(appliedWorkers, appliedCoreCount, res?.job?.id || resolvedJobId);
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
       renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+      renderTopAutoStatusBanner({ force: true });
     }
-    showToast(`🎯 목표 워커 수가 ${target}개로 변경되었습니다!`);
+    const trimMsg = res.trimmedPendingCount > 0 ? ` (초과 Pending ${res.trimmedPendingCount}개 자동 취소됨)` : "";
+    showToast(`🎯 목표가 워커 ${appliedWorkers}개 · 총 GPU ${appliedGpus}장으로 설정되었습니다!${trimMsg}`);
     await loadServerState();
   } catch (e) {
     alert("목표 워커 수 변경 실패: " + e.message);
   }
 }
 
-async function quickUpdateTargetPending(jobId, valueOrOpts) {
-  const jf = (latestWorkerFleet?.jobs || []).find((j) => j.jobId === jobId) || latestWorkerFleet?.jobs?.[0] || null;
-  const quickInputEl = document.getElementById("quickTargetPendingInput");
-  const baseVal = Number(quickInputEl?.value ?? jf?.targetPendingCount ?? 0);
-  const rawTargetPending =
+async function quickUpdateTargetGpus(jobId, valueOrOpts) {
+  const jf =
+    (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(jobId)) ||
+    getFocusedJobFleet(latestWorkerFleet) ||
+    null;
+  const resolvedJobId = jobId || jf?.jobId || document.getElementById("jobId")?.value || "";
+  const gpusPerWorker = Math.max(
+    1,
+    Number(jf?.coreCountPerWorker ?? jf?.coreCount ?? document.getElementById("jobCoreCount")?.value ?? 1)
+  );
+  const baseGpus = Number(
+    jf?.targetGpuCount ?? (jf?.minConcurrentRuns ?? jf?.targetCount ?? 1) * gpusPerWorker
+  );
+  const rawTargetGpus =
     typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
-      ? baseVal + Number(valueOrOpts.delta || 0)
-      : Number(valueOrOpts ?? 0);
-  const targetPending = Math.max(0, Math.min(9999, rawTargetPending));
-  if (quickInputEl) quickInputEl.value = targetPending;
-  const pendInput = document.getElementById("jobTargetPending");
-  if (pendInput) pendInput.value = targetPending;
+      ? baseGpus + Number(valueOrOpts.delta || 0)
+      : Number(valueOrOpts || gpusPerWorker);
+  const requestedGpus = Math.max(1, Math.min(99999, Math.round(rawTargetGpus)));
+  const targetWorkers = Math.max(1, Math.ceil(requestedGpus / gpusPerWorker));
+  syncAllQuickTargetInputsDom(targetWorkers, gpusPerWorker, resolvedJobId);
   if (jf) {
-    jf.targetPendingCount = targetPending;
+    jf.minConcurrentRuns = targetWorkers;
+    jf.targetCount = targetWorkers;
+    jf.targetGpuCount = targetWorkers * gpusPerWorker;
+    const maxRem = Math.max(0, targetWorkers - (jf.activeCount || 0));
     jf.remainingToCreate =
-      targetPending > 0
-        ? Math.max(0, targetPending - (jf.pendingCount || 0))
-        : Math.max(0, (jf.targetCount || 1) - (jf.activeCount || 0));
+      (jf.targetPendingCount || 0) > 0
+        ? Math.min(Math.max(0, (jf.targetPendingCount || 0) - (jf.pendingCount || 0)), maxRem)
+        : maxRem;
+    jf.excessActiveCount = Math.max(0, (jf.activeCount || 0) - targetWorkers);
+    jf.excessActiveGpuCount = jf.excessActiveCount * gpusPerWorker;
     renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+    renderTopAutoStatusBanner({ force: true });
   }
   try {
     const res = await api("/api/jobs/target", {
       method: "POST",
       body: JSON.stringify({
-        jobId,
+        jobId: resolvedJobId,
+        targetGpus: requestedGpus,
+      }),
+    });
+    const appliedWorkers = Number(res?.job?.minConcurrentRuns || targetWorkers);
+    const appliedCoreCount = Math.max(1, Number(res?.job?.coreCount || gpusPerWorker));
+    const appliedGpus = appliedWorkers * appliedCoreCount;
+    syncAllQuickTargetInputsDom(appliedWorkers, appliedCoreCount, res?.job?.id || resolvedJobId);
+    if (res.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+      renderTopAutoStatusBanner({ force: true });
+    }
+    const roundNote =
+      appliedGpus !== requestedGpus
+        ? ` (워커당 ${appliedCoreCount}장 단위로 ${requestedGpus}장→${appliedGpus}장 맞춤)`
+        : "";
+    const trimMsg = res.trimmedPendingCount > 0 ? ` · 초과 Pending ${res.trimmedPendingCount}개 자동 취소됨` : "";
+    showToast(
+      `💎 목표 총 GPU가 ${appliedGpus}장 (워커 ${appliedWorkers}개 × ${appliedCoreCount}GPU)으로 설정되었습니다!${roundNote}${trimMsg}`
+    );
+    await loadServerState();
+  } catch (e) {
+    alert("목표 GPU 수 변경 실패: " + e.message);
+  }
+}
+
+async function quickUpdateTargetPending(jobId, valueOrOpts) {
+  const jf =
+    (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(jobId)) ||
+    getFocusedJobFleet(latestWorkerFleet) ||
+    null;
+  const resolvedJobId = jobId || jf?.jobId || document.getElementById("jobId")?.value || "";
+  const quickInputEl = document.getElementById("quickTargetPendingInput");
+  const baseVal = Number(jf?.targetPendingCount ?? quickInputEl?.value ?? 0);
+  const rawTargetPending =
+    typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
+      ? baseVal + Number(valueOrOpts.delta || 0)
+      : Number(valueOrOpts ?? 0);
+  const targetPending = Math.max(0, Math.min(9999, Math.round(rawTargetPending)));
+  if (quickInputEl) quickInputEl.value = targetPending;
+  const pendInput = document.getElementById("jobTargetPending");
+  if (pendInput) pendInput.value = targetPending;
+  if (jf) {
+    jf.targetPendingCount = targetPending;
+    const maxAllowedByTotal = Math.max(0, (jf.targetCount || 1) - (jf.activeCount || 0));
+    jf.remainingToCreate =
+      targetPending > 0
+        ? Math.min(Math.max(0, targetPending - (jf.pendingCount || 0)), maxAllowedByTotal)
+        : maxAllowedByTotal;
+    renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+    renderTopAutoStatusBanner({ force: true });
+  }
+  try {
+    const res = await api("/api/jobs/target", {
+      method: "POST",
+      body: JSON.stringify({
+        jobId: resolvedJobId,
         targetPendingRuns: targetPending,
       }),
     });
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
       renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+      renderTopAutoStatusBanner({ force: true });
     }
     showToast(
       targetPending > 0
-        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (부족 시 즉시 ${targetPending}개까지 일괄 보충)`
-        : `⏳ 목표 Pending 대기 개수 지정이 해제(0)되었습니다! (전체 목표 워커 수 기준으로 자동 운영)`
+        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (전체 목표 상한 범위 내에서 유지)`
+        : `⏳ 목표 Pending 대기 개수 지정이 해제(0)되었습니다! (전체 목표 워커·GPU 기준으로 자동 운영)`
     );
     await loadServerState();
   } catch (e) {
@@ -2504,6 +2734,18 @@ async function bulkControlWorkers(action, extra = {}) {
     } else if (action === "stop_pending") {
       const ok = confirm("현재 Pending / 준비 대기 중인 워커들을 모두 취소하시겠습니까?");
       if (!ok) return;
+    } else if (action === "trim_to_target") {
+      const jf =
+        (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(extra?.jobId)) ||
+        getFocusedJobFleet(latestWorkerFleet);
+      const tCnt = jf?.targetCount ?? 1;
+      const tGpus = jf?.targetGpuCount ?? tCnt * (jf?.coreCountPerWorker || 1);
+      const exCnt = jf?.excessActiveCount ?? Math.max(0, (jf?.activeCount || 0) - tCnt);
+      const ok = confirm(
+        `현재 활성 워커를 설정된 목표(${tCnt}워커 · 총 ${tGpus}GPU)에 맞춰 초과분(+${exCnt}개: Pending 우선 취소 후 최신 Running 순)만 정리하시겠습니까?`
+      );
+      if (!ok) return;
+      showToast(`✂️ 목표(${tCnt}워커 · ${tGpus}GPU)에 맞춰 초과 워커를 정리합니다...`);
     } else if (action === "trim_excess_pending") {
       showToast("✂️ 목표 워커 수를 초과한 Pending 대기 워커만 정리하여 목표 수량에 맞춥니다...");
     } else if (action === "rolling_restart") {
@@ -2518,12 +2760,17 @@ async function bulkControlWorkers(action, extra = {}) {
     });
     if (res.workerFleet) {
       latestWorkerFleet = res.workerFleet;
-      renderWorkerFleetBoard(latestWorkerFleet);
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+      renderTopAutoStatusBanner({ force: true });
     }
     if (action === "scan_logs") {
       showToast(`✅ 워커 ${res.scannedCount || 0}개의 실시간 로그 스캔 완료!`);
     } else if (action === "rolling_restart") {
       showToast(`🔄 롤링 재시작: 워커 ${res.terminatedCount || 0}개 종료 완료 → 곧 새 워커가 자동 생성됩니다.`);
+    } else if (action === "trim_to_target") {
+      showToast(
+        `✂️ 목표 맞춤 정리 완료: 총 ${res.terminatedCount || 0}개 종료 (Pending ${res.terminatedPendingCount || 0}개 · Running ${res.terminatedRunningCount || 0}개)`
+      );
     } else if (action === "trim_excess_pending") {
       showToast(`✂️ 초과 Pending 워커 ${res.terminatedCount || 0}개 정리 완료!`);
     } else if (action === "stop_pending") {
@@ -3183,7 +3430,10 @@ async function onSelectSpecForJob(specId) {
     const spec = await api(`/api/space/specification/${specId}`);
     if (spec.groupPoolId || spec.poolId) document.getElementById("jobGroupPoolId").value = spec.groupPoolId || spec.poolId;
     if (spec.coreId) document.getElementById("jobCoreId").value = spec.coreId;
-    if (spec.coreNum || spec.coreCount) document.getElementById("jobCoreCount").value = spec.coreNum || spec.coreCount;
+    if (spec.coreNum || spec.coreCount) {
+      document.getElementById("jobCoreCount").value = spec.coreNum || spec.coreCount;
+      if (typeof syncJobFormWorkerGpuInputs === "function") syncJobFormWorkerGpuInputs("coreCount");
+    }
     if (spec.quotaId) document.getElementById("jobQuotaId").value = spec.quotaId;
     if (spec.image || spec.containerImage) document.getElementById("jobContainerImage").value = spec.image || spec.containerImage;
     if (spec.execCommand) document.getElementById("jobExecutionCommand").value = spec.execCommand;
@@ -3343,31 +3593,34 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
         const pendingCnt = jf ? jf.pendingCount : 0;
         const activeCnt = jf ? jf.activeCount : "?";
         const targetCnt = j.minConcurrentRuns || 1;
+        const gpusPerWorker = Math.max(1, Number(j.coreCount || 1));
+        const targetGpus = targetCnt * gpusPerWorker;
         const targetPendingCnt = Math.max(0, Number(j.targetPendingRuns ?? jf?.targetPendingCount ?? 0));
         const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
         const excessCnt = jf ? jf.excessPendingCount || 0 : 0;
+        const excessActiveCnt = jf ? jf.excessActiveCount ?? Math.max(0, Number(activeCnt || 0) - targetCnt) : 0;
         const fleetBadges = jf
           ? `<div style="margin-top:4px; display:flex; gap:5px; flex-wrap:wrap;">
-              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개</span>
+              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개 (${targetGpus}GPU)</span>
               ${
                 targetPendingCnt > 0
-                  ? `<span class="badge warn" style="border:1px solid #fbbf24;">🎯 목표Pending: ${pendingCnt}/${targetPendingCnt}개</span>`
+                  ? `<span class="badge warn" style="border:1px solid #fbbf24;">🎯 설정Pending: ${pendingCnt}/${targetPendingCnt}개</span>`
                   : pendingCnt > 0
                   ? `<span class="badge warn">⏳ Pending 대기: ${pendingCnt}개 (활성 ${activeCnt}개${excessCnt > 0 ? ` · 초과+${excessCnt}` : ""})</span>`
                   : ""
               }
               ${
-                remCnt > 0
+                excessActiveCnt > 0
+                  ? `<span class="badge err" style="border:1px solid #f87171;">⚠️ 목표초과 +${excessActiveCnt}개</span>`
+                  : remCnt > 0
                   ? `<span class="badge warn">🔄 +${remCnt}개 추가생성 예정</span>`
-                  : targetPendingCnt > 0 && pendingCnt >= targetPendingCnt
-                  ? `<span class="badge ok">✅ 목표Pending ${targetPendingCnt}개 유지중</span>`
                   : runningCnt >= targetCnt
-                  ? `<span class="badge ok">✅ 전원 Running</span>`
+                  ? `<span class="badge ok">✅ 목표 충족</span>`
                   : ""
               }
             </div>`
-          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b>${
-              targetPendingCnt > 0 ? ` · 목표Pending: <b>${targetPendingCnt}개</b>` : ""
+          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개 (${targetGpus}GPU)</b>${
+              targetPendingCnt > 0 ? ` · 설정Pending: <b>${targetPendingCnt}개</b>` : ""
             }</div>`;
         const badge = j.enabled
           ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeJsStr(j.id)}', false)" title="클릭하면 자동 추가 생성을 일시정지합니다">🟢 ON (가동중)</button>`
@@ -3410,31 +3663,34 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
         const pendingCnt = jf ? jf.pendingCount : 0;
         const activeCnt = jf ? jf.activeCount : "?";
         const targetCnt = j.minConcurrentRuns || 1;
+        const gpusPerWorker = Math.max(1, Number(j.coreCount || 1));
+        const targetGpus = targetCnt * gpusPerWorker;
         const targetPendingCnt = Math.max(0, Number(j.targetPendingRuns ?? jf?.targetPendingCount ?? 0));
         const remCnt = jf ? jf.remainingToCreate : Math.max(0, targetCnt);
         const excessCnt = jf ? jf.excessPendingCount || 0 : 0;
+        const excessActiveCnt = jf ? jf.excessActiveCount ?? Math.max(0, Number(activeCnt || 0) - targetCnt) : 0;
         const fleetBadges = jf
           ? `<div style="display:flex; gap:5px; flex-wrap:wrap; align-items:center;">
-              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개</span>
+              <span class="badge ok" style="background:rgba(16,185,129,0.2); color:#6ee7b7;">🟢 Running: ${runningCnt} / 목표: ${targetCnt}개 (${targetGpus}GPU)</span>
               ${
                 targetPendingCnt > 0
-                  ? `<span class="badge warn" style="border:1px solid #fbbf24;">🎯 목표Pending: ${pendingCnt}/${targetPendingCnt}개</span>`
+                  ? `<span class="badge warn" style="border:1px solid #fbbf24;">🎯 설정Pending: ${pendingCnt}/${targetPendingCnt}개</span>`
                   : pendingCnt > 0
                   ? `<span class="badge warn">⏳ Pending 대기: ${pendingCnt}개 (활성 ${activeCnt}개${excessCnt > 0 ? ` · 초과+${excessCnt}` : ""})</span>`
                   : ""
               }
               ${
-                remCnt > 0
+                excessActiveCnt > 0
+                  ? `<span class="badge err" style="border:1px solid #f87171;">⚠️ 목표초과 +${excessActiveCnt}개</span>`
+                  : remCnt > 0
                   ? `<span class="badge warn">🔄 +${remCnt}개 추가생성 예정</span>`
-                  : targetPendingCnt > 0 && pendingCnt >= targetPendingCnt
-                  ? `<span class="badge ok">✅ 목표Pending ${targetPendingCnt}개 유지중</span>`
                   : runningCnt >= targetCnt
-                  ? `<span class="badge ok">✅ 전원 Running</span>`
+                  ? `<span class="badge ok">✅ 목표 충족</span>`
                   : ""
               }
             </div>`
-          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개</b>${
-              targetPendingCnt > 0 ? ` · 목표Pending: <b>${targetPendingCnt}개</b>` : ""
+          : `<div class="mono" style="font-size:12px;">목표: <b>${targetCnt}개 (${targetGpus}GPU)</b>${
+              targetPendingCnt > 0 ? ` · 설정Pending: <b>${targetPendingCnt}개</b>` : ""
             }</div>`;
         const badge = j.enabled
           ? `<button class="success sm" style="padding:4px 9px; font-size:11.5px; font-weight:700;" onclick="toggleJobEnabled('${escapeJsStr(j.id)}', false)">🟢 ON (가동중)</button>`
@@ -3467,7 +3723,11 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
 
   if (!window.__initialJobLoaded && jobs[0]) {
     window.__initialJobLoaded = true;
-    const initialJob = jobs.find((j) => j.enabled) || jobs[0];
+    const initialJob =
+      jobs.find((j) => j.enabled && (jobFleetMap.get(j.id)?.activeCount || 0) > 0) ||
+      jobs.find((j) => j.enabled) ||
+      jobs.find((j) => (jobFleetMap.get(j.id)?.activeCount || 0) > 0) ||
+      jobs[0];
     loadJobToForm(initialJob, false, false);
   }
 }
@@ -3496,6 +3756,40 @@ async function toggleJobEnabled(jobId, enabled) {
   }
 }
 
+function syncJobFormWorkerGpuInputs(source = "workers") {
+  const workersEl = document.getElementById("jobMinConcurrent");
+  const gpusEl = document.getElementById("jobTargetGpus");
+  const coreCntEl = document.getElementById("jobCoreCount");
+  const hintEl = document.getElementById("jobTargetGpuCalcHint");
+  if (!workersEl || !coreCntEl) return;
+
+  const coreCount = Math.max(1, Number(coreCntEl.value || 1));
+  let workers = Math.max(1, Number(workersEl.value || 1));
+  let totalGpus = workers * coreCount;
+
+  if (source === "gpus" && gpusEl) {
+    const requestedGpus = Math.max(1, Number(gpusEl.value || coreCount));
+    workers = Math.max(1, Math.ceil(requestedGpus / coreCount));
+    totalGpus = workers * coreCount;
+    workersEl.value = workers;
+    if (hintEl) {
+      const roundText =
+        requestedGpus !== totalGpus
+          ? ` (입력 ${requestedGpus}장 → 워커당 ${coreCount}GPU 단위로 ${totalGpus}장 자동 맞춤)`
+          : "";
+      hintEl.textContent = `워커 ${workers}개 × GPU ${coreCount}장 = 목표 총 GPU ${totalGpus}장${roundText}`;
+    }
+    return;
+  }
+
+  // source === 'workers' or 'coreCount'
+  totalGpus = workers * coreCount;
+  if (gpusEl) gpusEl.value = totalGpus;
+  if (hintEl) {
+    hintEl.textContent = `워커 ${workers}개 × GPU ${coreCount}장 = 목표 총 GPU ${totalGpus}장 (상한 엄격 적용)`;
+  }
+}
+
 function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   if (!j) return;
   if (!asNewMode && j.id) {
@@ -3511,6 +3805,7 @@ function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   document.getElementById("jobGroupPoolId").value = j.groupPoolId || "";
   document.getElementById("jobCoreId").value = j.coreId || "";
   document.getElementById("jobCoreCount").value = j.coreCount || 1;
+  syncJobFormWorkerGpuInputs("workers");
   document.getElementById("jobQuotaId").value = j.quotaId || "";
   document.getElementById("jobContainerImage").value = j.containerImage || "";
   const imgSel = document.getElementById("selectImage");
@@ -3594,19 +3889,25 @@ function resetJobForm() {
 }
 
 function collectJobFormPayload() {
+  if (document.activeElement?.id === "jobTargetGpus") {
+    syncJobFormWorkerGpuInputs("gpus");
+  }
   const isSpot =
     document.getElementById("jobRunType")?.value === "spot" ||
     document.getElementById("jobAllowSpot")?.checked;
+  const coreCount = Math.max(1, Number(document.getElementById("jobCoreCount").value || 1));
+  const minConcurrentRuns = Math.max(1, Number(document.getElementById("jobMinConcurrent").value || 1));
   return {
     id: document.getElementById("jobId").value || "job-" + Date.now(),
     name: (document.getElementById("jobName").value || "group-vol-worker").trim(),
     mode: document.getElementById("jobMode").value,
     useSpecId: document.getElementById("jobUseSpecId").value,
-    minConcurrentRuns: Number(document.getElementById("jobMinConcurrent").value || 1),
+    minConcurrentRuns,
+    targetGpus: minConcurrentRuns * coreCount,
     targetPendingRuns: Math.max(0, Number(document.getElementById("jobTargetPending")?.value || 0)),
     groupPoolId: document.getElementById("jobGroupPoolId").value,
     coreId: document.getElementById("jobCoreId").value,
-    coreCount: Number(document.getElementById("jobCoreCount").value || 1),
+    coreCount,
     quotaId: document.getElementById("jobQuotaId").value,
     containerImage: document.getElementById("jobContainerImage").value,
     experimentId: document.getElementById("jobExperimentId").value,
@@ -3634,9 +3935,18 @@ async function saveAsNewJobRule() {
     }
     document.getElementById("jobId").value = payload.id;
     focusedFleetJobId = payload.id;
-    await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
+    const res = await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
+    if (res?.job) {
+      syncAllQuickTargetInputsDom(res.job.minConcurrentRuns, res.job.coreCount, res.job.id);
+    }
+    if (res?.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+      renderTopAutoStatusBanner({ force: true });
+    }
     updateJobFormModeBanner(false, payload.name);
-    showToast(`➕ 신규 규칙 [${payload.name}]이(가) 규칙 목록에 추가되었습니다!`);
+    const totalGpus = (res?.job?.minConcurrentRuns || payload.minConcurrentRuns) * (res?.job?.coreCount || payload.coreCount);
+    showToast(`➕ 신규 규칙 [${payload.name}] 등록 완료 — 목표 ${res?.job?.minConcurrentRuns || payload.minConcurrentRuns}워커 (총 ${totalGpus}GPU)!`);
     await loadServerState();
   } catch (e) {
     alert("신규 규칙 추가 실패: " + e.message);
@@ -3668,9 +3978,22 @@ async function saveJobRule() {
   try {
     const payload = collectJobFormPayload();
     focusedFleetJobId = payload.id;
-    await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
+    const res = await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
+    if (res?.job) {
+      syncAllQuickTargetInputsDom(res.job.minConcurrentRuns, res.job.coreCount, res.job.id);
+    }
+    if (res?.workerFleet) {
+      latestWorkerFleet = res.workerFleet;
+      renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+      renderTopAutoStatusBanner({ force: true });
+    }
     updateJobFormModeBanner(false, payload.name);
-    showToast(`✅ [${payload.name}] 규칙이 저장되었습니다! (cmd: ${payload.executionCommand})`);
+    const appliedWorkers = res?.job?.minConcurrentRuns || payload.minConcurrentRuns;
+    const appliedCoreCount = res?.job?.coreCount || payload.coreCount;
+    const trimMsg = res?.trimmedPendingCount > 0 ? ` · 초과 Pending ${res.trimmedPendingCount}개 자동 취소` : "";
+    showToast(
+      `✅ [${payload.name}] 규칙 저장 완료 — 목표 워커 ${appliedWorkers}개 · 총 GPU ${appliedWorkers * appliedCoreCount}장!${trimMsg}`
+    );
     await loadServerState();
   } catch (e) {
     alert("규칙 저장 실패: " + e.message);

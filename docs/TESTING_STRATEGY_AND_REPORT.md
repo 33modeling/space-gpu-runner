@@ -1,8 +1,8 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.1.0`
-- **최종 검증일**: `2026-11-13`
+- **문서 버전**: `v2.2.0`
+- **최종 검증일**: `2026-11-16`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/app.js`, 라이브 데몬(`0.0.0.0:4300`)
 - **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test`)
 
@@ -88,7 +88,7 @@ flowchart TB
 # 1. 빠른 정적 구문 검사 (server.mjs + public/app.js)
 npm run check
 
-# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 23개 케이스)
+# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 26개 케이스)
 npm test
 
 # (선택) 커스텀 포트 또는 비밀번호 사용 환경에서 실행 시
@@ -96,13 +96,13 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 ```
 
 > [!NOTE]
-> 로컬 `4300` 포트 데몬이 실행 중이지 않거나 네트워크가 격리된 CI 샌드박스 환경에서 실행할 경우, Suite 1~5(`TC-01`~`TC-18`)는 전수 실행되고 Suite 6(`TC-19`~`TC-23`)은 실패 대신 안전하게 `SKIP` 처리되도록 구성되어 있습니다.
+> 로컬 `4300` 포트 데몬이 실행 중이지 않거나 네트워크가 격리된 CI 샌드박스 환경에서 실행할 경우, Suite 1~5(`TC-01`~`TC-18`, `TC-24`~`TC-25`)는 전수 실행되고 Suite 6(`TC-19`~`TC-23`, `TC-26`)은 실패 대신 안전하게 `SKIP` 처리되도록 구성되어 있습니다.
 
 ---
 
 ## 4. 자동화 테스트 스위트(`tests/run-tests.mjs`) 상세 구성 명세
 
-총 **6개 스위트, 23개 자동화 테스트 케이스(`TC-01` ~ `TC-23`)** 로 구성되어 있습니다.
+총 **6개 스위트, 26개 자동화 테스트 케이스(`TC-01` ~ `TC-26`)** 로 구성되어 있습니다.
 
 | 테스트 ID | 소속 스위트 | 검증 대상 함수 / 엔드포인트 | 테스트 조건 및 검증 내용 (Assertions) | 결과 |
 | :---: | :--- | :--- | :--- | :---: |
@@ -115,8 +115,8 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-07** | Suite 2 (그룹안전) | `doesRunMatchSiteJobs` | `targetJobId` 지정 시 타 내 규칙 런을 제외하고 지정 규칙 런만 정확히 매칭하는지 검증 | ✅ PASS |
 | **TC-08** | Suite 2 (그룹안전) | `/stop` API & 런 테이블 | 백엔드 타 사용자 종료 요청 `403` 차단 가드 및 프론트엔드 `🔒 타유저 보호` 배지 적용 검증 | ✅ PASS |
 | **TC-09** | Suite 3 (스케줄러) | `classifyRunStatus` | `RUNNING`, `PENDING`, `WAIT_APPROVAL`, `CREATING`, `SUCCEEDED`, `FAILED`, `TERMINATED`, `REJECTED` 등 전 상태 분류 정확성 검증 | ✅ PASS |
-| **TC-10** | Suite 3 (스케줄러) | 부족분(Deficit) 수식 | `targetPendingRuns > 0` 모드(Running 무관 대기열 보충)와 `targetPendingRuns === 0` 모드 및 인플라이트 예약 차감 정확성 검증 | ✅ PASS |
-| **TC-11** | Suite 3 (스케줄러) | 슬롯 영구 삭제(`-1`) | Pending 슬롯 삭제 시 `targetPendingRuns`만 `-1` 차감(Running 목표 보존), Running 슬롯 삭제 시 `minConcurrentRuns`만 `-1` 차감 검증 | ✅ PASS |
+| **TC-10** | Suite 3 (스케줄러) | `computeJobTargetMetrics` | 총 목표 워커(`minConcurrentRuns`)·총 GPU(`targetGpuCount`) 상한 안에서만 부족분이 산출되고 인플라이트 예약이 차감되는지 검증 | ✅ PASS |
+| **TC-11** | Suite 3 (스케줄러) | `computeAdjustedTargetsAfterSlotDelete` | 목표 이하 구간에서 슬롯 영구 삭제(`-1`) 시 Running/Pending 목표 차감 검증 | ✅ PASS |
 | **TC-12** | Suite 3 (스케줄러) | `pickNextWorkerSlot` | 사용 중 슬롯(`s1`, `s3`)을 피한 빈 슬롯(`s2`) 할당 및 인플라이트 예약(`reserveWorkerSlot`) 중 다음 슬롯(`s4`) 할당 검증 | ✅ PASS |
 | **TC-13** | Suite 4 (멀티사이트) | `detectSiteIdFromTokenOrText` | Keycloak JWT `iss` 클레임(`n9-local` vs `n6-local`) 및 포털 URL 문자열로부터 `n9` / `n6` 자동 식별 검증 | ✅ PASS |
 | **TC-14** | Suite 4 (멀티사이트) | `selectPreferredGpuCore` | 혼합 코어 풀(CPU, MIG fGPU 슬라이스, 풀카드)에서 N9는 `NVIDIA H100`, N6는 `NVIDIA A100` 풀카드를 최우선 선택하는지 검증 | ✅ PASS |
@@ -129,6 +129,9 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-21** | Suite 6 (라이브API) | `GET /api/state` (`n9`) | 상단 사이트 요약(`sites.n9`)의 Running/Pending/Active 수치가 `workerFleet` 집계와 100% 일치하고 `throttleCount`가 유효 숫자인지 검증 | ✅ PASS |
 | **TC-22** | Suite 6 (라이브API) | `GET /api/state` (`n9`↔`n6`) | `X-Site-Id: n6` 교차 호출 전후로 `n9`의 누적 `totalGpuHours`가 초기화되거나 감소하지 않고 완전 격리되는지 검증 | ✅ PASS |
 | **TC-23** | Suite 6 (라이브API) | `GET /api/telemetry/export` | `siteId=n9`와 `siteId=n6` 내보내기 리포트가 각기 독립된 사이트 데이터를 반환하는지 검증 | ✅ PASS |
+| **TC-24** | Suite 3 (목표GPU상한) | `computeJobTargetMetrics` | `targetPendingRuns > 0` 및 목표 초과 가동(`49 > 30`) 시 `targetCount`/`targetGpuCount`가 부풀려지지 않고 추가 스폰이 `0`으로 차단되는지 검증 | ✅ PASS |
+| **TC-25** | Suite 3 (목표GPU보호) | `computeAdjustedTargetsAfterSlotDelete` | 목표 초과 워커(`49 > 30`) 슬롯 영구 삭제 시 기존 설정 목표치(`30워커·120GPU`)가 훼손되지 않고 그대로 보존되는지 검증 | ✅ PASS |
+| **TC-26** | Suite 6 (라이브API) | `GET /api/state` (`targetCount`) | 라이브 `workerFleet.byJob`의 `targetCount === minConcurrentRuns` 및 `targetGpuCount === minConcurrentRuns * coreCount` 무결성 검증 | ✅ PASS |
 
 ---
 
@@ -137,32 +140,32 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 테스트 및 검증은 **① 전수 정적 코드 감사 ➔ ② 자동화 단위·보안 테스트 구축 및 결함 교정 ➔ ③ 시나리오 기반 통합 검증 ➔ ④ 라이브 데몬 계약 검증 ➔ ⑤ 40시간+ 실전 운영 Soak 로그 대조**의 5단계 절차로 진행했습니다.
 
 ### 5.1 자동화 테스트 스위트 실행 결과
-라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 23개 테스트 전 항목 통과(`23 pass, 0 fail`, 소요 시간 `460.7ms`)** 를 확인했습니다.
+라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 26개 테스트 전 항목 통과(`26 pass, 0 fail`, 소요 시간 `447.5ms`)** 를 확인했습니다.
 
 ```text
 ▶ Suite 1: 정적 구문 및 코드베이스 무결성 검증 (Static & Structural Verification)
-  ✔ TC-01: server.mjs Node.js ESM 구문 검사 통과 (`node --check`) (57.4ms)
-  ✔ TC-02: public/app.js 프론트엔드 스크립트 구문 검사 통과 (`node --check`) (60.2ms)
-  ✔ TC-03: 미선언 상수(`DEFAULT_SITES`) 부재 및 핵심 안전 헬퍼 존재 검증 (1.4ms)
-  ✔ TC-04: index.html 핵심 DOM 컨테이너 ID와 app.js 바인딩 정합성 검증 (2.0ms)
-✔ Suite 1 (127.1ms)
+  ✔ TC-01: server.mjs Node.js ESM 구문 검사 통과 (`node --check`)
+  ✔ TC-02: public/app.js 프론트엔드 스크립트 구문 검사 통과 (`node --check`)
+  ✔ TC-03: 미선언 상수(`DEFAULT_SITES`) 부재 및 핵심 안전 헬퍼 존재 검증
+  ✔ TC-04: index.html 핵심 DOM 컨테이너 ID와 app.js 바인딩 정합성 검증
+✔ Suite 1
 
 ▶ Suite 2: 공유 그룹(SR-Coredata) 타 사용자 보호 및 규칙 매칭 검증
-  ✔ TC-05 ~ TC-08 전 항목 통과 (5.2ms)
+  ✔ TC-05 ~ TC-08 전 항목 통과
 
-▶ Suite 3: 스케줄러 상태 분류, 부족분(Deficit), 슬롯 예약 및 영구 삭제(-1) 수식 검증
-  ✔ TC-09 ~ TC-12 전 항목 통과 (3.3ms)
+▶ Suite 3: 스케줄러 상태 분류, 부족분(Deficit), 슬롯 예약 및 목표 GPU 상한 검증
+  ✔ TC-09 ~ TC-12, TC-24 ~ TC-25 전 항목 통과
 
 ▶ Suite 4: 멀티 사이트(N9 H100 vs N6 A100) 코어 선택 및 토큰/로그 파싱 검증
-  ✔ TC-13 ~ TC-15 전 항목 통과 (4.0ms)
+  ✔ TC-13 ~ TC-15 전 항목 통과
 
 ▶ Suite 5: 프론트엔드 인라인 핸들러 보안 이스케이프 및 슬롯 범위 파서 검증
-  ✔ TC-16 ~ TC-18 전 항목 통과 (10.3ms)
+  ✔ TC-16 ~ TC-18 전 항목 통과
 
-▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀티 사이트 격리 검증
-  ✔ TC-19 ~ TC-23 전 항목 통과 (145.9ms)
+▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 목표 GPU 정합성 검증
+  ✔ TC-19 ~ TC-23, TC-26 전 항목 통과
 
-ℹ tests 23 | suites 6 | pass 23 | fail 0 | duration_ms 460.7ms
+ℹ tests 26 | suites 6 | pass 26 | fail 0 | duration_ms 447.5ms
 ```
 
 ---
@@ -245,7 +248,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
    ```bash
    npm run check && npm test
    ```
-   모든 테스트 케이스(`TC-01` ~ `TC-23`)가 `0 fail`로 통과해야 합니다.
+   모든 테스트 케이스(`TC-01` ~ `TC-26`)가 `0 fail`로 통과해야 합니다.
 2. **신규 인라인 핸들러 추가 시 보안 점검**:
    `public/app.js`에서 HTML 문자열 내 `onclick="..."`에 동적 문자열 인자를 전달할 때는 반드시 `escapeHtml`이 아닌 `escapeJsStr`을 사용하고 `TC-17`을 통과하는지 확인합니다.
 3. **신규 일괄 제어/자동화 루프 추가 시 그룹 안전 점검**:
