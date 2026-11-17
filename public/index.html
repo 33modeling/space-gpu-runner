@@ -14,10 +14,10 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="/style.css?v=4" />
+  <link rel="stylesheet" href="/style.css?v=5" />
 </head>
 <body>
-  <!-- Password Gate Modal: Shown on EVERY page load/visit -->
+  <!-- Password Gate Modal -->
   <div id="lockOverlay" class="lock-overlay">
     <div class="lock-card">
       <h2>SPACE GPU Runner</h2>
@@ -28,167 +28,144 @@
           id="lockPasswordInput"
           placeholder="비밀번호 입력"
           class="mono"
-          style="text-align:center; font-size:15px; padding:10px;"
+          style="text-align:center; font-size:15px; padding:11px;"
           autofocus
         />
         <div id="lockErrorMsg" class="lock-error"></div>
-        <button type="submit" style="width:100%; justify-content:center; margin-top:8px; padding:10px;">
+        <button type="submit" style="width:100%; justify-content:center; margin-top:10px; padding:11px;">
           잠금 해제
         </button>
       </form>
     </div>
   </div>
 
+  <!-- 통합 상단 헤더: 클러스터 전환 · 4개 전용 페이지 내비게이션 · 핵심 상태 -->
   <header>
-    <div class="brand">
-      <span class="brand-mark"></span>
-      <h1>SPACE GPU Runner</h1>
-      <span class="sub">자동 할당 · 자동 승인</span>
+    <div class="header-left">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <h1>SPACE GPU Runner</h1>
+      </div>
+      <div id="multiSiteTabsContainer" style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+        <div class="segmented-group">
+          <button type="button" class="seg-btn active" onclick="selectSpaceSite('n9')">N9 (H100)</button>
+          <button type="button" class="seg-btn" onclick="selectSpaceSite('n6')">N6 (A100)</button>
+        </div>
+      </div>
     </div>
+
+    <nav class="page-nav" aria-label="주요 페이지">
+      <button type="button" id="tabBtnMonitor" class="page-tab active" onclick="switchMainView('monitor')">
+        <span>모니터링</span>
+        <span id="navMonitorBadge" class="tab-count mono">-</span>
+      </button>
+      <button type="button" id="tabBtnWorkloads" class="page-tab" onclick="switchMainView('workloads')">
+        <span>워크로드 · 로그</span>
+        <span id="navWorkloadsBadge" class="tab-count mono">조회</span>
+      </button>
+      <button type="button" id="tabBtnRules" class="page-tab" onclick="switchMainView('rules')">
+        <span>실행 규칙</span>
+        <span id="navSetupBadge" class="tab-count mono">규칙</span>
+      </button>
+      <button type="button" id="tabBtnSettings" class="page-tab" onclick="switchMainView('settings')">
+        <span>시스템 설정</span>
+      </button>
+    </nav>
+
     <div class="status-bar">
-      <span id="jwtBadge" class="badge warn" style="cursor:pointer;" onclick="switchMainView('setup', 'auth')" title="클릭하면 토큰 연동 설정으로 이동합니다">토큰 미설정</span>
-      <span id="groupBadge" class="badge">Group: -</span>
-      <span id="schedBadge" class="badge ok">스케줄러: ON</span>
-      <span id="approvalLoopBadge" class="badge ok">자동승인: ON</span>
-      <span id="loadGuardBadge" class="badge ok">부하보호: 쾌적</span>
-      <button type="button" class="secondary sm" onclick="discoverSpaceResources()">리소스 동기화</button>
-      <button type="button" class="soft-success sm" onclick="triggerSchedulerTick()">즉시 점검</button>
+      <span id="jwtBadge" class="badge warn" style="cursor:pointer;" onclick="switchMainView('settings', 'auth')" title="클릭하면 토큰 연동 설정으로 이동합니다">토큰 확인 중</span>
+      <span id="schedBadge" class="badge ok">스케줄러 ON</span>
       <button type="button" id="themeToggleBtn" class="secondary sm" onclick="toggleUiTheme()" title="다크 / 라이트 테마 전환">☀️ 라이트</button>
       <button type="button" class="secondary sm" onclick="lockDashboard()" title="대시보드 잠금">잠금</button>
     </div>
   </header>
 
   <div class="container">
-    <!-- 클러스터 사이트 전환 & 메인 화면 내비게이션 통합 상단 바 -->
-    <div id="multiSiteSwitcherBar" class="top-bar-card">
-      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;" id="multiSiteTabsContainer">
-        <span style="font-size:12px; font-weight:600; color:var(--muted); margin-right:2px;">클러스터</span>
-        <button type="button" class="seg-btn active" onclick="selectSpaceSite('n9')">
-          SPACE N9 (H100)
-        </button>
-        <button type="button" class="seg-btn" onclick="selectSpaceSite('n6')">
-          SPACE N6 (A100)
-        </button>
-      </div>
-      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-        <span id="activeSiteSummaryBadge" class="badge info mono">
-          현재: SPACE N9 (H100)
-        </span>
-        <button type="button" class="secondary sm" onclick="promptAddCustomSite()">
-          + 사이트 추가
-        </button>
-      </div>
-    </div>
-
-    <!-- 메인 화면 2분할 탭 내비게이션 바 -->
-    <div id="mainViewNavBar" class="top-bar-card" style="padding:8px 12px;">
-      <div class="segmented-group">
-        <button type="button" id="tabBtnMonitor" class="seg-btn active" onclick="switchMainView('monitor')">
-          실시간 모니터링
-          <span id="navMonitorBadge" class="badge ok mono" style="margin-left:4px; padding:1px 7px; font-size:11px;">현황</span>
-        </button>
-        <button type="button" id="tabBtnSetup" class="seg-btn" onclick="switchMainView('setup')">
-          규칙 · 스크립트 · 연동 설정
-          <span id="navSetupBadge" class="badge mono" style="margin-left:4px; padding:1px 7px; font-size:11px;">설정</span>
-        </button>
-      </div>
-
-      <div class="btn-row">
-        <button type="button" class="soft-success sm" onclick="openNewJobRuleInSetup()">
-          + 새 규칙 추가
-        </button>
-        <button type="button" class="secondary sm" onclick="switchMainView('setup', 'auth')">
-          토큰 연동 · 갱신
-        </button>
-      </div>
-    </div>
-
     <!-- ======================================================================================== -->
-    <!-- [화면 1] 실시간 러닝 & 모니터링 화면 -->
+    <!-- [페이지 1] 모니터링 (실시간 현황 관찰 + 즉시 반영할 핵심 예외 컨트롤만 배치) -->
     <!-- ======================================================================================== -->
-    <div id="viewMonitorSection" class="view-stack" style="display:flex;">
-      <!-- 토큰 만료/미설정 알림 바 -->
+    <section id="viewMonitorSection" class="view-stack" style="display:flex;">
+      <!-- 토큰 만료/미설정 시에만 나타나는 안내 바 -->
       <div
         id="monitorTokenAlertBar"
-        style="display:none; padding:10px 15px; border-radius:10px; background:var(--danger-soft); border:1px solid var(--danger-border); color:var(--danger-text); justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;"
+        style="display:none; padding:14px 20px; border-radius:12px; background:var(--danger-soft); border:1px solid var(--danger-border); color:var(--danger-text); justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;"
       >
-        <div id="monitorTokenAlertText" style="font-size:13px; font-weight:600;">
+        <div id="monitorTokenAlertText" style="font-size:13.5px; font-weight:600;">
           SPACE 인증 토큰이 만료되었거나 설정되지 않았습니다.
         </div>
-        <button type="button" class="danger-solid sm" onclick="switchMainView('setup', 'auth')">
-          토큰 갱신하러 이동
+        <button type="button" class="danger-solid sm" onclick="switchMainView('settings', 'auth')">
+          시스템 설정에서 토큰 갱신
         </button>
       </div>
 
-      <!-- 1-A. 실시간 워커 가동 현황 & 목표 제어 보드 -->
+      <!-- 1-A. 실시간 워커 가동 현황 & 즉시 반영 빠른 조정 -->
       <div class="card">
         <div id="workerFleetPanel">
-          <div style="font-weight:600; font-size:13.5px; color:var(--muted);">
-            워커 가동 현황을 불러오는 중입니다...
+          <div style="font-size:14px; color:var(--muted);">
+            실시간 워커 가동 현황을 불러오는 중입니다...
           </div>
         </div>
       </div>
 
-      <!-- 1-B. 등록된 자동 실행 규칙 요약 -->
-      <div class="card" style="padding:15px 18px;">
-        <div class="card-header" style="margin-bottom:10px; padding-bottom:9px;">
-          <div>
-            <h2>등록된 자동 실행 규칙</h2>
-            <div class="hint">규칙별 자동 생성 ON/OFF 전환과 즉시 +1 실행을 바로 제어할 수 있습니다.</div>
-          </div>
+      <!-- 슬롯 클릭 시 열리는 빠른 로그 프리뷰 드로어 (기본 숨김) -->
+      <div id="monitorQuickLogCard" class="card" style="display:none;">
+        <div class="card-header" style="margin-bottom:12px; padding-bottom:10px;">
+          <h2 id="monitorQuickLogTitle">컨테이너 실시간 로그</h2>
           <div class="btn-row">
-            <button type="button" class="soft-success sm" onclick="openNewJobRuleInSetup()">
-              + 새 규칙 작성
-            </button>
-            <button type="button" class="secondary sm" onclick="switchMainView('setup', 'rules')">
-              규칙 상세 설정
-            </button>
+            <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">새로고침</button>
+            <button type="button" class="secondary sm" onclick="switchMainView('workloads', 'runs')">워크로드 페이지에서 크게 보기</button>
+            <button type="button" class="secondary sm" onclick="closeMonitorQuickLog()">닫기</button>
           </div>
         </div>
-        <div style="overflow-x:auto;">
-          <table style="margin:0;">
-            <thead>
-              <tr>
-                <th style="width:120px;">자동 생성</th>
-                <th style="width:160px;">규칙 이름</th>
-                <th style="width:230px;">가동 / 목표 현황</th>
-                <th style="width:170px;">실행 방식 · GPU</th>
-                <th>실행 명령어</th>
-                <th style="width:170px;">최근 상태</th>
-                <th style="width:180px;">빠른 작업</th>
-              </tr>
-            </thead>
-            <tbody id="monitorJobsTableBody">
-              <tr><td colspan="7" class="hint">불러오는 중...</td></tr>
-            </tbody>
-          </table>
-        </div>
+        <div id="monitorQuickLogBox" class="code-box" style="max-height:280px;">로그를 불러오는 중...</div>
       </div>
 
-      <!-- 1-C. 자동 할당 · 자동 승인 엔진 상태 & 타임라인 -->
-      <div id="topAutoStatusBanner" class="card" style="padding:16px 18px;">
+      <!-- 1-B. 자동화 엔진 · 클러스터 상태 요약 (순수 모니터링 전용 · 설정 버튼 없음) -->
+      <div id="topAutoStatusBanner" class="card">
         <div style="font-size:13.5px; color:var(--muted);">
-          자동 할당 및 Admin 승인 엔진 상태를 불러오는 중입니다...
+          자동 할당 및 승인 엔진 상태를 불러오는 중입니다...
         </div>
       </div>
+    </section>
 
-      <!-- 1-D. 실시간 WLM 워크로드 & 컨테이너 로그 | 스케줄러 이력 -->
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header">
-            <h2>SPACE 실시간 워크로드 &amp; 로그</h2>
+    <!-- ======================================================================================== -->
+    <!-- [페이지 2] 워크로드 · 로그 (컨테이너 목록 · 실시간 로그 · 승인 내역 · 스케줄러 이력) -->
+    <!-- ======================================================================================== -->
+    <section id="viewWorkloadsSection" class="view-stack" style="display:none;">
+      <div class="card">
+        <div class="sub-tabs">
+          <button type="button" id="subTabBtnRuns" class="sub-tab active" onclick="switchWorkloadSubTab('runs')">
+            SPACE 컨테이너 목록 · 로그
+          </button>
+          <button type="button" id="subTabBtnApprovals" class="sub-tab" onclick="switchWorkloadSubTab('approvals')">
+            Admin 승인 내역
+          </button>
+          <button type="button" id="subTabBtnHistory" class="sub-tab" onclick="switchWorkloadSubTab('history')">
+            스케줄러 동작 이력
+          </button>
+        </div>
+
+        <!-- 서브탭 1: SPACE 실시간 워크로드 & 컨테이너 로그 -->
+        <div id="workloadPanelRuns">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+            <div>
+              <h2 style="margin:0; font-size:16px;">SPACE 실시간 컨테이너 목록</h2>
+              <div class="hint">행을 클릭하거나 [로그]를 누르면 하단에 실시간 표준 출력이 표시됩니다.</div>
+            </div>
             <div class="btn-row">
-              <button type="button" class="secondary sm" onclick="loadSpaceRuns()">목록 새로고침</button>
+              <button type="button" class="secondary sm" onclick="loadSpaceRuns({ force: true })">목록 새로고침</button>
             </div>
           </div>
-          <div id="runsFilterSummaryBar" class="card-subtle" style="margin-bottom:10px; padding:8px 11px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; font-size:12px;">
+
+          <div id="runsFilterSummaryBar" class="card-subtle" style="margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:12.5px;">
             <span class="hint">워크로드 집계를 불러오는 중...</span>
           </div>
-          <div style="overflow-x:auto; max-height:400px; overflow-y:auto; border:1px solid var(--border); border-radius:8px;">
+
+          <div style="overflow-x:auto; max-height:460px; overflow-y:auto; border:1px solid var(--border); border-radius:10px;">
             <table>
               <thead>
                 <tr>
-                  <th style="width:68px;">순번</th>
+                  <th style="width:76px;">순번</th>
                   <th>Run ID · 계정</th>
                   <th>컨테이너 · 규칙</th>
                   <th>상태</th>
@@ -203,28 +180,75 @@
             </table>
           </div>
 
-          <div style="margin-top:14px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-              <label id="logViewerTitle">컨테이너 실시간 로그</label>
+          <div style="margin-top:24px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <label id="logViewerTitle" style="font-size:13.5px;">컨테이너 실시간 로그</label>
               <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">로그 새로고침</button>
             </div>
-            <div id="runLogBox" class="code-box">워크로드 목록이나 워커 슬롯을 클릭하면 컨테이너 표준 출력(stdout/stderr)이 여기에 표시됩니다.</div>
+            <div id="runLogBox" class="code-box">위 목록에서 컨테이너의 [로그] 버튼을 누르면 표준 출력(stdout/stderr)이 표시됩니다.</div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-header">
-            <h2>스케줄러 동작 이력</h2>
+        <!-- 서브탭 2: Admin 승인 대기열 및 내역 -->
+        <div id="workloadPanelApprovals" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+            <div>
+              <h2 style="margin:0; font-size:16px;">Admin 승인 대기열 및 최근 처리 내역</h2>
+              <div class="hint">워커 생성 시 자동으로 승인 처리되며, 대기 중인 항목을 수동으로 일괄 승인할 수도 있습니다.</div>
+            </div>
             <div class="btn-row">
-              <button type="button" class="secondary sm" onclick="loadServerState()">새로고침</button>
+              <button type="button" class="secondary sm" onclick="loadApprovals()">새로고침</button>
+              <button type="button" class="soft-success sm" onclick="approveAllPending()">대기 건 일괄 승인</button>
             </div>
           </div>
-          <div style="overflow-x:auto; max-height:520px; overflow-y:auto; border:1px solid var(--border); border-radius:8px;">
+
+          <div id="approvalLoopStatusBar" class="card-subtle" style="margin-bottom:16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; font-size:12.5px;">
+            <div>
+              <span class="badge ok">자동 승인 감시 중</span>
+              <span style="margin-left:8px; color:var(--text-secondary);">기본 3초 주기 (생성 직후 고속 감지)</span>
+            </div>
+            <div class="mono txt-muted" style="font-size:12px;">상태 확인 중...</div>
+          </div>
+
+          <div style="overflow-x:auto; max-height:520px; overflow-y:auto; border:1px solid var(--border); border-radius:10px;">
             <table>
               <thead>
                 <tr>
-                  <th style="width:150px;">시각</th>
-                  <th style="width:72px;">구분</th>
+                  <th>구분</th>
+                  <th>워크로드 · Run ID</th>
+                  <th>신청 주체 · 계정</th>
+                  <th>요청 리소스</th>
+                  <th>승인 요청 시각</th>
+                  <th>승인 처리 상태</th>
+                </tr>
+              </thead>
+              <tbody id="approvalsTableBody">
+                <tr><td colspan="6" class="hint">승인 내역을 불러오는 중입니다.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 서브탭 3: 스케줄러 동작 이력 -->
+        <div id="workloadPanelHistory" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+            <div>
+              <h2 style="margin:0; font-size:16px;">스케줄러 동작 이력 및 리포트</h2>
+              <div class="hint">자동 신청, 승인, 장애 감지, 목표 변경 등 최근 이벤트 기록입니다.</div>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="secondary sm" onclick="exportTelemetryReport('csv')">CSV 리포트 다운로드</button>
+              <button type="button" class="secondary sm" onclick="exportTelemetryReport('json')">JSON 리포트</button>
+              <button type="button" class="secondary sm" onclick="loadServerState()">새로고침</button>
+            </div>
+          </div>
+
+          <div style="overflow-x:auto; max-height:560px; overflow-y:auto; border:1px solid var(--border); border-radius:10px;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:165px;">시각</th>
+                  <th style="width:80px;">구분</th>
                   <th>상세 내용</th>
                 </tr>
               </thead>
@@ -235,576 +259,555 @@
           </div>
         </div>
       </div>
-
-      <!-- 1-E. Admin Run-Approval & TaskOrbit 대기열 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>Admin 승인 대기열 및 처리 내역</h2>
-          <div class="btn-row">
-            <button type="button" class="secondary sm" onclick="loadApprovals()">새로고침</button>
-            <button type="button" class="soft-success sm" onclick="approveAllPending()">대기 건 일괄 승인</button>
-          </div>
-        </div>
-        <div id="approvalLoopStatusBar" class="card-subtle" style="margin-bottom:10px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; font-size:12.5px;">
-          <div>
-            <span class="badge ok">자동 승인 감시 중</span>
-            <span style="margin-left:8px; color:var(--text-secondary);">기본 3초 주기 (워커 생성 직후 고속 추적)</span>
-          </div>
-          <div class="mono txt-muted" style="font-size:12px;">
-            루프 상태 확인 중...
-          </div>
-        </div>
-        <div style="overflow-x:auto; max-height:270px; overflow-y:auto; border:1px solid var(--border); border-radius:8px;">
-          <table>
-            <thead>
-              <tr>
-                <th>구분</th>
-                <th>워크로드 · Run ID</th>
-                <th>신청 주체 · 계정</th>
-                <th>요청 리소스</th>
-                <th>승인 요청 시각</th>
-                <th>승인 처리 상태</th>
-              </tr>
-            </thead>
-            <tbody id="approvalsTableBody">
-              <tr><td colspan="6" class="hint">잠금 해제 후 자동으로 승인 내역을 불러옵니다.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+    </section>
 
     <!-- ======================================================================================== -->
-    <!-- [화면 2] 규칙 생성 · 스크립트 · SPACE 연동 설정 화면 -->
+    <!-- [페이지 3] 실행 규칙 (자동 실행 규칙 목록 · 규칙 작성/수정 · 볼륨 스크립트 편집) -->
     <!-- ======================================================================================== -->
-    <div id="viewSetupSection" class="view-stack" style="display:none;">
-      <div class="card-subtle" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-        <div style="font-size:13px; color:var(--text-secondary);">
-          <b>설정 및 규칙 관리</b> — SPACE 토큰 연동, 볼륨 스크립트 편집, 자동 실행 규칙 설정을 마친 뒤 모니터링 화면으로 돌아가세요.
-        </div>
-        <button type="button" class="sm" onclick="switchMainView('monitor')">
-          모니터링 화면으로 돌아가기 →
-        </button>
-      </div>
-
-      <div class="grid-2" id="authConfigCard">
-        <!-- Card 1: SPACE 인증 및 기본 스케줄러 설정 -->
-        <div class="card">
-          <div class="card-header">
-            <h2 id="card1AuthTitle">1. SPACE 토큰 연동 및 스케줄러 설정</h2>
-            <div class="btn-row">
-              <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()">추출 코드 복사</button>
-              <button type="button" class="sm" onclick="saveConfig()">설정 저장</button>
-            </div>
-          </div>
-
-          <div id="tokenTargetSiteBar" class="card-subtle" style="margin-bottom:10px; padding:9px 12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <div style="font-size:12px; color:var(--text-secondary);">
-              대상 클러스터: <b id="tokenTargetSiteName" style="color:var(--text);">SPACE N9 (H100)</b>
-              <span class="txt-muted" style="font-size:11px; margin-left:4px;">(사이트별로 토큰이 독립 저장됩니다)</span>
-            </div>
-            <div style="display:flex; gap:6px; flex-wrap:wrap;" id="tokenSiteQuickButtons">
-              <button type="button" class="secondary sm" onclick="selectSpaceSite('n9')">N9 (H100)</button>
-              <button type="button" class="secondary sm" onclick="selectSpaceSite('n6')">N6 (A100)</button>
-            </div>
-          </div>
-
-          <div id="card1TokenStatusBanner" class="card-subtle" style="margin-bottom:10px; padding:9px 12px; font-size:12.5px; font-weight:600; color:var(--warn-text);">
-            토큰 상태 확인 중...
-          </div>
-
-          <div class="card-subtle" style="margin-bottom:12px;">
-            <div style="font-size:12px; color:var(--text-secondary); line-height:1.6;">
-              <b>간편 토큰 등록 방법</b>
-              <span style="margin-left:8px;">
-                <a id="spaceConsoleQuickLink" href="https://space.n9.sr-cloud.com/console/home" target="_blank">SPACE N9 콘솔 열기 ↗</a>
-                <span class="txt-muted">&nbsp;·&nbsp;</span>
-                <a id="spaceN6ConsoleQuickLink" href="https://space.n6.sr-cloud.com/console/home" target="_blank">SPACE N6 콘솔 열기 ↗</a>
-              </span><br/>
-              1) <code id="authSiteHostLabel">space.n9.sr-cloud.com</code> 탭을 새로고침(<code>F5</code>)하여 로그인 상태를 확인합니다.<br/>
-              2) 브라우저 <code>F12</code> → <b>Console</b> 탭에 아래 추출 코드를 실행하거나 <code>copy(sessionStorage)</code>를 입력합니다.<br/>
-              <span class="txt-muted" style="font-size:11.5px;">※ 콘솔 붙여넣기가 제한된 경우 <code>Application → Session Storage</code>에서 <code>access_token</code> 값(<code>eyJ...</code>)을 복사해도 자동 인식됩니다.</span>
-            </div>
-            <div style="display:flex; gap:6px; margin-top:8px; align-items:center;">
-              <input type="text" id="devtoolsSnippetInput" readonly value='copy(JSON.stringify({accessToken:sessionStorage.access_token||localStorage.access_token,refreshToken:sessionStorage.refresh_token||localStorage.refresh_token,groupId:localStorage.group_id||sessionStorage.group_id}))' class="mono" onclick="this.select(); copyDevtoolsExtractor();" style="flex:1; font-size:11.5px; padding:6px 9px; cursor:pointer;" title="클릭하면 복사됩니다" />
-              <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()" style="flex-shrink:0;">복사</button>
-            </div>
-            <div style="display:flex; gap:6px; margin-top:8px; align-items:stretch;">
-              <textarea id="quickPasteJson" rows="2" placeholder="여기에 복사한 토큰이나 JSON을 붙여넣으세요 (Ctrl+V)" class="mono" oninput="applyQuickPasteJson(this.value, false)" style="flex:1; font-size:12px; padding:7px 9px; resize:vertical;"></textarea>
-              <button type="button" class="success sm" onclick="applyQuickPasteJson(document.getElementById('quickPasteJson').value, true)" style="flex-shrink:0; padding:0 14px;">토큰 적용</button>
-            </div>
-            <div id="tokenPasteResultBox" style="display:none; margin-top:8px; padding:7px 10px; border-radius:7px; font-size:12px; font-weight:600;"></div>
-          </div>
-
-          <div class="form-grid">
-            <div class="form-group">
-              <label>작업 그룹 선택</label>
-              <div style="display:flex; gap:6px;">
-                <input type="text" id="cfgGroupId" placeholder="ID" class="mono" style="width:76px;" />
-                <select id="discoveredGroupsSelect" onchange="onSelectDiscoveredGroup(this.value)">
-                  <option value="">-- 그룹 선택 --</option>
-                </select>
-              </div>
-            </div>
-            <div class="form-group">
-              <label>Admin 자동 승인 범위</label>
-              <select id="cfgAutoApprovalScope">
-                <option value="all_group">그룹 내 모든 승인 대기 런 자동 승인 (권장)</option>
-                <option value="my_runs">내 계정 + 자동 규칙 런만 자동 승인</option>
-                <option value="job_only">이 서버 규칙이 생성한 런만 승인</option>
-                <option value="off">자동 승인 끄기</option>
-              </select>
-            </div>
-
-            <div class="form-group full">
-              <label style="color:var(--text); display:flex; align-items:center; gap:8px; cursor:pointer;">
-                <input type="checkbox" id="cfgSchedulerEnabled" checked />
-                <span>주기적 GPU 할당 스케줄러 및 Admin 자동 승인 가동</span>
-              </label>
-            </div>
-          </div>
-
-          <details class="clean-details" style="margin-top:12px;">
-            <summary>고급 연결 · 주기 · 부하 보호 · 자동화 옵션</summary>
-            <div class="form-grid" style="margin-top:12px;">
-              <div class="form-group">
-                <label>API Gateway 주소</label>
-                <input type="text" id="cfgBaseUrl" value="https://mlp.n9.sr-cloud.com" class="mono" />
-              </div>
-              <div class="form-group">
-                <label>File Manager 주소</label>
-                <input type="text" id="cfgSfmUrl" value="https://sfsm.n9.sr-cloud.com" class="mono" />
-              </div>
-              <div class="form-group full">
-                <label>Access Token 수동 입력</label>
-                <input type="text" id="cfgAccessToken" placeholder="access_token (eyJ...)" class="mono" oninput="onAccessTokenInput(this.value)" />
-              </div>
-              <div class="form-group">
-                <label>Refresh Token</label>
-                <input type="text" id="cfgRefreshToken" placeholder="refresh_token" class="mono" />
-              </div>
-              <div class="form-group">
-                <label>계정명</label>
-                <input type="text" id="cfgUserName" placeholder="자동 감지" class="mono" />
-              </div>
-              <div class="form-group">
-                <label>기본 스케줄러 점검 간격(초)</label>
-                <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
-                  <input type="number" id="cfgIntervalSec" min="1" max="86400" value="15" style="width:72px;" />
-                  <button type="button" class="chip-btn" onclick="document.getElementById('cfgIntervalSec').value=60">1분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('cfgIntervalSec').value=180">3분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('cfgIntervalSec').value=300">5분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('cfgIntervalSec').value=600">10분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('cfgIntervalSec').value=1800">30분</button>
-                </div>
-              </div>
-              <div class="form-group">
-                <label>승인 대기열 스캔 간격(초)</label>
-                <input type="number" id="cfgApprovalIntervalSec" min="1" max="3600" value="5" />
-              </div>
-              <div class="form-group">
-                <label>대시보드 새로고침 간격(초)</label>
-                <input type="number" id="cfgUiRefreshSec" min="1" max="600" value="5" onchange="applyUiRefreshInterval(this.value)" />
-              </div>
-              <div class="form-group">
-                <label>생성 직후 고속 승인 추적(초 × 회)</label>
-                <div style="display:flex; gap:6px; align-items:center;">
-                  <input type="number" id="cfgPostCreateDelaySec" min="1" max="30" value="2" />
-                  <span class="hint">×</span>
-                  <input type="number" id="cfgPostCreateRetries" min="1" max="60" value="8" />
-                </div>
-              </div>
-
-              <div class="form-group full card-subtle">
-                <label style="color:var(--text); display:flex; align-items:center; gap:6px; cursor:pointer; margin-bottom:6px;">
-                  <input type="checkbox" id="cfgSmartLoadGuardEnabled" checked />
-                  <span>스마트 서버 부하 보호 페이싱 사용</span>
-                </label>
-                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:8px;">
-                  <div>
-                    <label style="font-size:11px;">동시 준비(Pending) 상한</label>
-                    <input type="number" id="cfgMaxPendingWorkers" min="1" max="32" value="2" />
-                  </div>
-                  <div>
-                    <label style="font-size:11px;">API 지연 기준(주의 / 위험 ms)</label>
-                    <div style="display:flex; gap:4px; align-items:center;">
-                      <input type="number" id="cfgApiLatencyWarnMs" min="300" max="15000" value="1800" />
-                      <input type="number" id="cfgApiLatencyCriticalMs" min="500" max="30000" value="3500" />
-                    </div>
-                  </div>
-                  <div style="display:flex; align-items:center; padding-top:14px;">
-                    <label style="font-size:11.5px; display:flex; align-items:center; gap:5px; cursor:pointer;">
-                      <input type="checkbox" id="cfgStepByStepRunningCheck" checked /> Running 진입 확인 후 순차 할당
-                    </label>
-                  </div>
-                </div>
-              </div>
-
-              <div class="form-group full card-subtle">
-                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px;">
-                  <div>
-                    <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
-                      <input type="checkbox" id="cfgWatchdogEnabled" checked /> 좀비 워커 자동 교체
-                    </label>
-                    <div style="display:flex; align-items:center; gap:4px; margin-top:4px; font-size:11.5px; color:var(--muted);">
-                      대기 한도(분): <input type="number" id="cfgMaxPendingTimeoutMin" min="3" max="180" value="20" class="mono" style="width:58px; padding:3px 5px;" />
-                    </div>
-                    <label style="font-size:11.5px; display:flex; align-items:center; gap:5px; margin-top:5px; cursor:pointer;">
-                      <input type="checkbox" id="cfgLogErrorAutoRestart" checked /> OOM·NCCL 에러 시 재시작
-                    </label>
-                  </div>
-                  <div>
-                    <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
-                      <input type="checkbox" id="cfgInjectWorkerEnv" /> WORKER_SLOT 환경변수 주입
-                    </label>
-                    <label style="display:flex; align-items:center; gap:5px; margin-top:6px; cursor:pointer;">
-                      <input type="checkbox" id="cfgHybridFallbackEnabled" checked /> Spot ↔ Standard 자동 폴백
-                    </label>
-                  </div>
-                  <div>
-                    <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
-                      <input type="checkbox" id="cfgTimeScaleEnabled" /> 시간대별 목표 자동 조정
-                    </label>
-                    <div style="display:flex; gap:4px; align-items:center; margin-top:4px; font-size:11px; color:var(--muted);">
-                      주간 <input type="number" id="cfgDayTargetWorkers" min="1" max="256" value="20" class="mono" style="width:44px; padding:2px 4px;" />
-                      야간 <input type="number" id="cfgNightTargetWorkers" min="1" max="256" value="48" class="mono" style="width:44px; padding:2px 4px;" />
-                      주말 <input type="number" id="cfgWeekendTargetWorkers" min="1" max="256" value="64" class="mono" style="width:44px; padding:2px 4px;" />
-                    </div>
-                  </div>
-                </div>
-                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:8px; padding-top:8px; border-top:1px solid var(--border); font-size:11.5px;">
-                  <span class="txt-muted">Webhook:</span>
-                  <input type="text" id="cfgWebhookUrl" placeholder="Slack / Discord Webhook URL (선택)" class="mono" style="flex:1; min-width:160px; padding:4px 8px;" />
-                  <label style="display:flex; align-items:center; gap:4px;"><input type="checkbox" id="cfgBrowserNotifyEnabled" checked /> 브라우저 알림</label>
-                  <button type="button" class="secondary sm" onclick="testAlertNotification()">알림 테스트</button>
-                </div>
-                <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:6px; font-size:11.5px;">
-                  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                    <label style="display:flex; align-items:center; gap:4px;"><input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 불량 노드 회피</label>
-                    <span class="txt-muted">쿨다운(초): <input type="number" id="cfgBadNodeCooldownSec" value="25" min="5" max="300" class="mono" style="width:50px; padding:2px 5px;" /></span>
-                    <label style="display:flex; align-items:center; gap:4px;"><input type="checkbox" id="cfgSyncEditedScriptsOnStart" checked /> 에디터 스크립트 자동 동기화</label>
-                  </div>
-                  <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                    <label style="display:flex; align-items:center; gap:4px;"><input type="checkbox" id="cfgAutoStopOnComplete" checked /> 완료 키워드 감지 시 정지</label>
-                    <input type="text" id="cfgAutoStopOnCompleteKeyword" value="ALL_TASKS_COMPLETED,TRAINING_FINISHED,PIPELINE_DONE" class="mono" style="width:170px; padding:3px 6px;" />
-                    <span class="txt-muted">목표 성공 수:</span>
-                    <input type="number" id="cfgMaxTotalSucceededRuns" value="0" min="0" max="9999" class="mono" style="width:52px; padding:3px 6px;" />
-                    <input type="text" id="cfgNextStageCommand" placeholder="후속 단계 실행 명령어 (선택)" class="mono" style="flex:1; min-width:150px; padding:3px 6px;" />
-                  </div>
-                </div>
-              </div>
-            </div>
-          </details>
-        </div>
-
-        <!-- Card 2: GPU Pool & 볼륨 스크립트 탐색/편집 -->
-        <div class="card">
-          <div class="card-header">
-            <h2>2. GPU 리소스 선택 &amp; 볼륨 스크립트 탐색기</h2>
-            <div class="btn-row">
-              <button type="button" class="secondary sm" onclick="discoverSpaceResources()">GPU · 이미지 새로고침</button>
-            </div>
-          </div>
-
-          <div style="margin-bottom:12px;">
-            <label>사용 가능한 GPU 풀 (클릭 시 아래 규칙에 바로 반영)</label>
-            <div id="poolsSummaryBox" class="pill-list" style="margin-top:6px;">
-              <span class="hint">조회된 GPU Pool 정보가 없습니다. 상단 [리소스 동기화]를 눌러주세요.</span>
-            </div>
-          </div>
-
-          <div style="display:none;" id="specsSummaryWrapper">
-            <div id="specsSummaryBox" class="pill-list"></div>
-          </div>
-
-          <div>
-            <label>볼륨 폴더 탐색 (파일 클릭 시 실행 명령어 자동 입력)</label>
-            <div style="display:flex; gap:6px; margin-top:6px; flex-wrap:wrap;">
-              <input type="text" id="sfmBrowsePath" value="/group-volume" placeholder="/group-volume" class="mono" style="flex:1; min-width:180px;" />
-              <button type="button" class="secondary sm" onclick="browseSfmFiles()">폴더 열기</button>
-              <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/group-volume'; browseSfmFiles()">/group-volume</button>
-              <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/user-volume'; browseSfmFiles()">/user-volume</button>
-            </div>
-            <div id="sfmFilesList" class="pill-list" style="margin-top:8px; max-height:130px; overflow-y:auto;"></div>
-          </div>
-
-          <details id="sfmScriptEditorPanel" class="clean-details" style="margin-top:12px;">
-            <summary style="display:flex; justify-content:space-between; align-items:center;">
-              <span>스크립트 웹 에디터 (직접 편집 및 롤링 배포)</span>
-              <span id="sfmEditorStatusBadge" class="badge info" style="font-size:10.5px;">대기 중</span>
-            </summary>
-            <div style="margin-top:10px;">
-              <div style="display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap;">
-                <input type="text" id="sfmEditorFilePath" value="/group-volume/run.sh" placeholder="/group-volume/run.sh" class="mono" style="flex:1; min-width:180px; padding:5px 8px; font-size:12px;" />
-                <button type="button" class="secondary sm" onclick="openSfmScriptEditor()">불러오기</button>
-                <button type="button" class="soft-success sm" onclick="saveSfmScriptFile(false)">저장</button>
-                <button type="button" class="sm" onclick="saveSfmScriptFile(true)">저장 후 롤링 배포</button>
-              </div>
-              <textarea id="sfmEditorTextarea" rows="5" class="mono" placeholder="#!/usr/bin/env bash&#10;bash /group-volume/run.sh" style="width:100%; font-size:12px; line-height:1.5; resize:vertical;"></textarea>
-            </div>
-          </details>
-        </div>
-      </div>
-
-      <!-- Card 3: 규칙 목록 & 규칙 작성/수정 폼 -->
+    <section id="viewRulesSection" class="view-stack" style="display:none;">
+      <!-- 3-A. 등록된 자동 실행 규칙 목록 -->
       <div class="card" id="rulesConfigCard">
         <div class="card-header">
           <div>
-            <h2>3. 자동 실행 규칙 생성 및 관리</h2>
-            <div class="hint">여러 규칙을 등록해 두고 개별적으로 켜거나 목표 GPU 수량을 조정할 수 있습니다.</div>
+            <h2>등록된 자동 실행 규칙</h2>
+            <div class="hint">규칙을 클릭하면 아래 편집 폼에 불러오며, 개별 자동 생성 ON/OFF를 전환할 수 있습니다.</div>
           </div>
           <div class="btn-row">
-            <button type="button" class="success sm" onclick="startNewJobRule()">
-              + 새 규칙 작성 폼 열기
-            </button>
-            <button type="button" class="secondary sm" onclick="saveCurrentJobAsPreset()">
-              현재 폼 프리셋 저장
-            </button>
+            <button type="button" class="success sm" onclick="startNewJobRule()">+ 새 규칙 작성</button>
+            <button type="button" class="secondary sm" onclick="saveCurrentJobAsPreset()">현재 폼을 프리셋으로 저장</button>
           </div>
         </div>
 
-        <div class="card-subtle" style="margin-bottom:14px;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
-            <div style="font-size:13px; font-weight:600; color:var(--text);">
-              등록된 규칙 목록
-            </div>
-            <button type="button" class="soft-success sm" onclick="startNewJobRule()">
-              + 새 규칙 추가
-            </button>
-          </div>
-          <div style="overflow-x:auto;">
-            <table>
-              <thead>
-                <tr>
-                  <th style="width:120px;">자동 생성</th>
-                  <th style="width:160px;">규칙 이름</th>
-                  <th style="width:230px;">가동 / 목표 현황</th>
-                  <th style="width:180px;">실행 방식 · GPU</th>
-                  <th>실행 명령어</th>
-                  <th style="width:170px;">최근 상태</th>
-                  <th style="width:220px;">관리</th>
-                </tr>
-              </thead>
-              <tbody id="jobsTableBody">
-                <tr><td colspan="7" class="hint">불러오는 중...</td></tr>
-              </tbody>
-            </table>
-          </div>
+        <div style="overflow-x:auto; border:1px solid var(--border); border-radius:10px; margin-bottom:16px;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:110px;">자동 생성</th>
+                <th style="width:160px;">규칙 이름</th>
+                <th style="width:230px;">가동 / 목표 현황</th>
+                <th style="width:170px;">실행 방식 · GPU</th>
+                <th>실행 명령어</th>
+                <th style="width:160px;">최근 상태</th>
+                <th style="width:210px;">관리</th>
+              </tr>
+            </thead>
+            <tbody id="jobsTableBody">
+              <tr><td colspan="7" class="hint">불러오는 중...</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <!-- 실험 프리셋 바 -->
-        <div id="presetsBarPanel" class="card-subtle" style="margin-bottom:14px; padding:9px 12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-          <div style="font-size:12px; color:var(--muted);">프리셋 불러오는 중...</div>
-        </div>
-
-        <!-- 규칙 추가 / 수정 폼 -->
-        <div id="jobRuleFormBox" class="card-subtle" style="padding:16px 18px;">
-          <div id="jobFormModeBanner" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:14px; padding:9px 13px; border-radius:8px; background:var(--accent-soft); border:1px solid var(--accent-border);">
-            <div id="jobFormModeText" style="font-size:13px; font-weight:600; color:var(--accent-text);">
-              선택된 규칙 수정 중 — 새 규칙을 만들려면 우측 [빈 신규 규칙 폼]을 누르세요.
-            </div>
-            <div>
-              <button type="button" class="secondary sm" onclick="startNewJobRule()">
-                + 빈 신규 규칙 폼
-              </button>
-            </div>
-          </div>
-
-          <input type="hidden" id="jobId" value="job-default-1" />
-
-          <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:14px;">
-            <!-- 1. 규칙 이름 -->
-            <div class="form-group">
-              <label>1. 규칙 이름 (컨테이너 접두어)</label>
-              <input type="text" id="jobName" value="group-vol-worker" class="mono" placeholder="예: v8, qwen-train" style="font-weight:600;" />
-            </div>
-
-            <!-- 2. 목표 동시 워커 수 & 목표 총 GPU -->
-            <div class="form-group">
-              <label>2. 유지할 목표 워커 &amp; 총 GPU 상한</label>
-              <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
-                <span style="font-size:11.5px; color:var(--muted); min-width:38px;">워커</span>
-                <input type="number" id="jobMinConcurrent" min="1" max="9999" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('workers')" style="width:70px; font-weight:700;" />
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobMinConcurrent').value=1; syncJobFormWorkerGpuInputs('workers')">1</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobMinConcurrent').value=8; syncJobFormWorkerGpuInputs('workers')">8</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobMinConcurrent').value=16; syncJobFormWorkerGpuInputs('workers')">16</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobMinConcurrent').value=30; syncJobFormWorkerGpuInputs('workers')">30</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobMinConcurrent').value=48; syncJobFormWorkerGpuInputs('workers')">48</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobMinConcurrent').value=60; syncJobFormWorkerGpuInputs('workers')">60</button>
-              </div>
-              <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap; margin-top:6px;">
-                <span style="font-size:11.5px; color:var(--muted); min-width:38px;">총 GPU</span>
-                <input type="number" id="jobTargetGpus" min="1" max="99999" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('gpus')" style="width:74px; font-weight:700;" title="목표 총 GPU 장수를 입력하면 워커당 GPU 수에 맞춰 워커 수가 자동 계산됩니다" />
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetGpus').value=32; syncJobFormWorkerGpuInputs('gpus')">32장</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetGpus').value=64; syncJobFormWorkerGpuInputs('gpus')">64장</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetGpus').value=120; syncJobFormWorkerGpuInputs('gpus')">120장</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetGpus').value=160; syncJobFormWorkerGpuInputs('gpus')">160장</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetGpus').value=240; syncJobFormWorkerGpuInputs('gpus')">240장</button>
-              </div>
-              <div id="jobTargetGpuCalcHint" class="hint" style="font-size:11px;">워커 1개 × GPU 1장 = 목표 총 GPU 1장</div>
-            </div>
-
-            <!-- 2-2. 목표 Pending 대기 개수 -->
-            <div class="form-group">
-              <label>목표 Pending 대기 유지 (선택 · 0이면 해제)</label>
-              <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
-                <input type="number" id="jobTargetPending" min="0" max="9999" value="0" class="mono" style="width:72px; font-weight:700;" />
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetPending').value=0">0(해제)</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetPending').value=2">2</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetPending').value=3">3</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetPending').value=5">5</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetPending').value=8">8</button>
-                <button type="button" class="chip-btn" onclick="document.getElementById('jobTargetPending').value=10">10</button>
-              </div>
-              <div class="hint" style="font-size:11px;">총 목표 워커(GPU) 상한 범위 내에서 대기열 개수를 유지합니다.</div>
-            </div>
-
-            <!-- 3. 실행 방식 & GPU 종류 -->
-            <div class="form-group" style="grid-column: span 2;">
-              <label>3. 실행 방식 및 GPU 선택</label>
-              <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-                <button type="button" id="btnRunTypeStandard" class="secondary sm" onclick="onChangeRunType('standard')">Standard (정규 풀)</button>
-                <button type="button" id="btnRunTypeSpot" class="secondary sm" onclick="onChangeRunType('spot')">Spot (스팟 인스턴스)</button>
-                <select id="selectCoreId" onchange="onSelectCoreIdChange(this.value)" style="flex:1; min-width:190px;">
-                  <option value="">-- GPU 종류 선택 --</option>
-                </select>
-                <div style="display:flex; align-items:center; gap:5px; font-size:12px; color:var(--text-secondary);">
-                  <span>워커당 GPU</span>
-                  <input type="number" id="jobCoreCount" min="1" max="64" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('coreCount')" style="width:58px;" />
-                  <span>장</span>
-                </div>
-              </div>
-              <div id="coresQuickPills" class="pill-list" style="margin-top:6px;"></div>
-              <div id="runTypeHint" class="hint" style="font-size:11.5px;"></div>
-            </div>
-
-            <!-- 4. 컨테이너 이미지 -->
-            <div class="form-group full">
-              <label>4. 컨테이너 이미지</label>
-              <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                <select id="selectImage" style="flex:1; min-width:240px;" onchange="if(this.value) document.getElementById('jobContainerImage').value=this.value">
-                  <option value="">-- SPACE 이미지 목록에서 선택 --</option>
-                </select>
-                <input type="text" id="jobContainerImage" placeholder="예: harbor.../pytorch:2.1-cuda12.1" class="mono" style="flex:1.2; min-width:240px;" />
-              </div>
-              <div id="imagesSummaryBox" class="pill-list" style="margin-top:6px;"></div>
-            </div>
-
-            <!-- 5. 실행 명령어 -->
-            <div class="form-group full">
-              <label>5. 실행할 Bash 명령어 (2번 카드에서 스크립트 클릭 시 자동 입력)</label>
-              <textarea id="jobExecutionCommand" rows="2" class="mono" style="font-size:13px; line-height:1.5;" placeholder="예: cd /group-volume/work && bash train.sh">bash /group-volume/run.sh</textarea>
-            </div>
-          </div>
-
-          <!-- 저장 / 추가 액션 바 -->
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-top:14px; padding-top:14px; border-top:1px solid var(--border);">
-            <div class="btn-row">
-              <button type="button" class="success" onclick="saveAsNewJobRule()">
-                + 새 규칙으로 추가 등록
-              </button>
-              <button type="button" id="btnUpdateExistingJob" onclick="saveJobRule()">
-                선택된 규칙 수정 저장
-              </button>
-            </div>
-            <div class="btn-row">
-              <button type="button" class="soft-success" onclick="triggerJobNow()">
-                저장 후 즉시 +1 실행
-              </button>
-            </div>
-          </div>
-
-          <!-- 세부 고급 설정 -->
-          <details class="clean-details" style="margin-top:12px;">
-            <summary>세부 고급 옵션 (동작 모드 · Pool / Quota 수동 지정 · 생성 간격 · 재시작 정책)</summary>
-            <div class="form-grid" style="margin-top:12px;">
-              <div class="form-group">
-                <label>동작 모드</label>
-                <select id="jobMode">
-                  <option value="ensure_running">항상 목표 수량 유지 (종료 시 재할당)</option>
-                  <option value="when_gpu_free">유휴 GPU 감시</option>
-                  <option value="once_until_success">성공할 때까지 실행</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label>실행 유형</label>
-                <select id="jobRunType" onchange="onChangeRunType(this.value)">
-                  <option value="standard">Standard (정규 그룹 풀)</option>
-                  <option value="spot">Spot Instance (스팟)</option>
-                </select>
-              </div>
-              <div class="form-group" id="groupPoolFormGroup">
-                <label>Group Pool</label>
-                <div style="display:flex; gap:6px;">
-                  <input type="text" id="jobGroupPoolId" placeholder="자동" class="mono" style="width:74px;" />
-                  <select id="selectGroupPool" onchange="document.getElementById('jobGroupPoolId').value=this.value; populateCoresForPool(this.value)">
-                    <option value="">-- Pool 자동 --</option>
-                  </select>
-                </div>
-              </div>
-              <div class="form-group" id="quotaFormGroup">
-                <label>Priority / Quota</label>
-                <div style="display:flex; gap:6px;">
-                  <input type="text" id="jobQuotaId" placeholder="자동" class="mono" style="width:74px;" />
-                  <select id="selectQuotaId" onchange="document.getElementById('jobQuotaId').value=this.value">
-                    <option value="">-- Priority 자동 --</option>
-                  </select>
-                </div>
-              </div>
-              <div class="form-group">
-                <label>Core ID 수동 지정</label>
-                <input type="text" id="jobCoreId" placeholder="자동 매핑" class="mono" />
-              </div>
-              <div class="form-group">
-                <label>Experiment ID</label>
-                <div style="display:flex; gap:6px;">
-                  <input type="text" id="jobExperimentId" placeholder="자동" class="mono" style="width:74px;" />
-                  <select id="selectExperiment" onchange="document.getElementById('jobExperimentId').value=this.value">
-                    <option value="">-- 자동 --</option>
-                  </select>
-                </div>
-              </div>
-              <div class="form-group">
-                <label>저장된 Spec 불러오기</label>
-                <select id="jobUseSpecId" onchange="onSelectSpecForJob(this.value)">
-                  <option value="">-- 선택 안함 --</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label>예상 실행 시간</label>
-                <input type="text" id="jobExpectedRunTime" value="8h" class="mono" />
-              </div>
-              <div class="form-group" style="grid-column: span 2;">
-                <label>워커 자동 생성 간격(초)</label>
-                <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap;">
-                  <input type="number" id="jobCooldownSec" min="1" max="86400" value="15" class="mono" style="width:78px;" />
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=15">15초</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=30">30초</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=60">1분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=120">2분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=180">3분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=300">5분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=600">10분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=900">15분</button>
-                  <button type="button" class="chip-btn" onclick="document.getElementById('jobCooldownSec').value=1800">30분</button>
-                </div>
-              </div>
-            </div>
-            <div class="checkbox-row" style="margin-top:10px;">
-              <label><input type="checkbox" id="jobEnabled" checked /> 주기적 자동 실행 활성화</label>
-              <label><input type="checkbox" id="jobAutoApprove" checked /> Admin 즉시 자동 승인</label>
-              <label><input type="checkbox" id="jobRestartOnSuccess" checked /> 정상 종료 후 반복 실행</label>
-              <label><input type="checkbox" id="jobRestartOnFail" checked /> 실패 시 자동 재실행</label>
-              <label><input type="checkbox" id="jobAllowSpot" onchange="onChangeRunType(this.checked ? 'spot' : 'standard')" /> Spot 인스턴스 사용</label>
-              <label><input type="checkbox" id="jobEnableWebConsole" checked /> Web Console 활성화</label>
-            </div>
-          </details>
+        <!-- 실험 프리셋 북마크 바 -->
+        <div id="presetsBarPanel" class="card-subtle" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+          <div style="font-size:12.5px; color:var(--muted);">프리셋을 불러오는 중...</div>
         </div>
       </div>
-    </div>
+
+      <!-- 3-B. 규칙 작성 / 수정 폼 (깔끔한 입력 위주, 과도한 프리셋 버튼 제거) -->
+      <div class="card" id="jobRuleFormBox">
+        <div id="jobFormModeBanner" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:20px; padding:12px 16px; border-radius:10px; background:var(--accent-soft); border:1px solid var(--accent-border);">
+          <div id="jobFormModeText" style="font-size:13px; font-weight:600; color:var(--accent-text);">
+            규칙 편집 중 — 새 규칙을 추가하려면 우측 [빈 신규 폼 열기]를 누르세요.
+          </div>
+          <button type="button" class="secondary sm" onclick="startNewJobRule()">+ 빈 신규 폼 열기</button>
+        </div>
+
+        <input type="hidden" id="jobId" value="job-default-1" />
+
+        <div class="form-grid">
+          <div class="form-group">
+            <label>규칙 이름 (컨테이너 접두어)</label>
+            <input type="text" id="jobName" value="group-vol-worker" class="mono" placeholder="예: v8, qwen-train" style="font-weight:600;" />
+          </div>
+
+          <div class="form-group">
+            <label>목표 동시 워커 수</label>
+            <input type="number" id="jobMinConcurrent" min="1" max="9999" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('workers')" style="font-weight:600;" />
+            <div id="jobTargetGpuCalcHint" class="hint">워커 1개 × GPU 1장 = 목표 총 GPU 1장</div>
+          </div>
+
+          <div class="form-group">
+            <label>목표 총 GPU 수 (워커 수 자동 환산)</label>
+            <input type="number" id="jobTargetGpus" min="1" max="99999" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('gpus')" style="font-weight:600;" />
+            <div class="hint">총 GPU 장수를 입력하면 워커당 GPU 단위로 자동 계산됩니다.</div>
+          </div>
+
+          <div class="form-group">
+            <label>목표 Pending 대기 유지 수 (선택)</label>
+            <input type="number" id="jobTargetPending" min="0" max="9999" value="0" class="mono" />
+            <div class="hint">0이면 해제(자동), 1 이상이면 총 목표 상한 내에서 대기 수를 유지합니다.</div>
+          </div>
+
+          <div class="form-group">
+            <label>실행 방식 (Standard / Spot)</label>
+            <div class="segmented-group" style="width:fit-content;">
+              <button type="button" id="btnRunTypeStandard" class="seg-btn active" onclick="onChangeRunType('standard')">Standard (정규 풀)</button>
+              <button type="button" id="btnRunTypeSpot" class="seg-btn" onclick="onChangeRunType('spot')">Spot (스팟)</button>
+            </div>
+            <div id="runTypeHint" class="hint"></div>
+          </div>
+
+          <div class="form-group">
+            <label>GPU 종류 및 워커당 할당 장수</label>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <select id="selectCoreId" onchange="onSelectCoreIdChange(this.value)" style="flex:1;">
+                <option value="">-- GPU 종류 선택 --</option>
+              </select>
+              <input type="number" id="jobCoreCount" min="1" max="64" value="1" class="mono" oninput="syncJobFormWorkerGpuInputs('coreCount')" style="width:76px;" title="워커 1개당 GPU 장수" />
+              <span class="txt-muted" style="font-size:12.5px; white-space:nowrap;">GPU/워커</span>
+            </div>
+            <div id="coresQuickPills" class="pill-list" style="margin-top:4px;"></div>
+          </div>
+
+          <div class="form-group">
+            <label>워커 자동 생성 간격</label>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <select onchange="if(this.value) document.getElementById('jobCooldownSec').value=this.value" style="flex:1;">
+                <option value="">빠른 주기 선택...</option>
+                <option value="15">15초</option>
+                <option value="30">30초</option>
+                <option value="60">1분 (60초)</option>
+                <option value="180">3분 (180초)</option>
+                <option value="300">5분 (300초)</option>
+                <option value="600">10분 (600초)</option>
+                <option value="900">15분 (900초)</option>
+                <option value="1800">30분 (1800초)</option>
+              </select>
+              <input type="number" id="jobCooldownSec" min="1" max="86400" value="15" class="mono" style="width:95px;" />
+              <span class="txt-muted" style="font-size:12.5px;">초</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>예상 실행 시간</label>
+            <input type="text" id="jobExpectedRunTime" value="8h" class="mono" placeholder="예: 8h, 24h" />
+          </div>
+
+          <div class="form-group full">
+            <label>컨테이너 이미지</label>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+              <select id="selectImage" style="flex:1; min-width:240px;" onchange="if(this.value) document.getElementById('jobContainerImage').value=this.value">
+                <option value="">-- SPACE 이미지 목록에서 선택 --</option>
+              </select>
+              <input type="text" id="jobContainerImage" placeholder="예: harbor.../pytorch:2.1-cuda12.1" class="mono" style="flex:1.3; min-width:260px;" />
+            </div>
+            <div id="imagesSummaryBox" class="pill-list" style="margin-top:6px;"></div>
+          </div>
+
+          <div class="form-group full">
+            <label>실행할 Bash 명령어</label>
+            <textarea id="jobExecutionCommand" rows="2" class="mono" style="font-size:13px; line-height:1.55;" placeholder="예: cd /group-volume/work && bash train.sh">bash /group-volume/run.sh</textarea>
+          </div>
+        </div>
+
+        <!-- 세부 고급 옵션 (평소에는 접어둠) -->
+        <details class="clean-details" style="margin-top:18px;">
+          <summary>고급 리소스 지정 및 재시작 정책 (Pool · Quota · Experiment · 재실행 옵션)</summary>
+          <div class="form-grid" style="margin-top:16px;">
+            <div class="form-group">
+              <label>동작 모드</label>
+              <select id="jobMode">
+                <option value="ensure_running">항상 목표 수량 유지 (종료 시 재할당)</option>
+                <option value="when_gpu_free">유휴 GPU 감시</option>
+                <option value="once_until_success">성공할 때까지 실행</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>실행 유형 동기화</label>
+              <select id="jobRunType" onchange="onChangeRunType(this.value)">
+                <option value="standard">Standard (정규 그룹 풀)</option>
+                <option value="spot">Spot Instance (스팟)</option>
+              </select>
+            </div>
+            <div class="form-group" id="groupPoolFormGroup">
+              <label>Group Pool</label>
+              <div style="display:flex; gap:6px;">
+                <input type="text" id="jobGroupPoolId" placeholder="자동" class="mono" style="width:80px;" />
+                <select id="selectGroupPool" onchange="document.getElementById('jobGroupPoolId').value=this.value; populateCoresForPool(this.value)">
+                  <option value="">-- Pool 자동 --</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group" id="quotaFormGroup">
+              <label>Priority / Quota</label>
+              <div style="display:flex; gap:6px;">
+                <input type="text" id="jobQuotaId" placeholder="자동" class="mono" style="width:80px;" />
+                <select id="selectQuotaId" onchange="document.getElementById('jobQuotaId').value=this.value">
+                  <option value="">-- Priority 자동 --</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Core ID 수동 지정</label>
+              <input type="text" id="jobCoreId" placeholder="자동 매핑" class="mono" />
+            </div>
+            <div class="form-group">
+              <label>Experiment ID</label>
+              <div style="display:flex; gap:6px;">
+                <input type="text" id="jobExperimentId" placeholder="자동" class="mono" style="width:80px;" />
+                <select id="selectExperiment" onchange="document.getElementById('jobExperimentId').value=this.value">
+                  <option value="">-- 자동 --</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>저장된 Spec 불러오기</label>
+              <select id="jobUseSpecId" onchange="onSelectSpecForJob(this.value)">
+                <option value="">-- 선택 안함 --</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="checkbox-row" style="margin-top:14px;">
+            <label><input type="checkbox" id="jobEnabled" checked /> 주기적 자동 실행 활성화</label>
+            <label><input type="checkbox" id="jobAutoApprove" checked /> Admin 즉시 자동 승인</label>
+            <label><input type="checkbox" id="jobRestartOnSuccess" checked /> 정상 종료 후 반복 실행</label>
+            <label><input type="checkbox" id="jobRestartOnFail" checked /> 실패 시 자동 재실행</label>
+            <label><input type="checkbox" id="jobAllowSpot" onchange="onChangeRunType(this.checked ? 'spot' : 'standard')" /> Spot 인스턴스 사용</label>
+            <label><input type="checkbox" id="jobEnableWebConsole" checked /> Web Console 활성화</label>
+          </div>
+        </details>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-top:20px; padding-top:18px; border-top:1px solid var(--border);">
+          <div class="btn-row">
+            <button type="button" class="success" onclick="saveAsNewJobRule()">신규 규칙으로 추가</button>
+            <button type="button" id="btnUpdateExistingJob" onclick="saveJobRule()">선택된 규칙 저장</button>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="soft-success" onclick="triggerJobNow()">저장 후 +1 즉시 실행</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3-C. 볼륨 파일 탐색기 & 스크립트 웹 에디터 -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>볼륨 스크립트 탐색 및 웹 에디터</h2>
+            <div class="hint">볼륨 내 `.sh` / `.py` 파일을 클릭하면 위 규칙의 실행 명령어에 자동 입력되며, 아래 에디터에서 바로 수정할 수 있습니다.</div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="secondary sm" onclick="discoverSpaceResources()">GPU · 이미지 리소스 새로고침</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom:18px;">
+          <label>사용 가능한 클러스터 GPU 풀 (클릭 시 규칙 폼에 반영)</label>
+          <div id="poolsSummaryBox" class="pill-list" style="margin-top:8px;">
+            <span class="hint">조회된 GPU Pool 정보가 없습니다. [GPU · 이미지 리소스 새로고침]을 눌러주세요.</span>
+          </div>
+          <div style="display:none;"><div id="specsSummaryBox" class="pill-list"></div></div>
+        </div>
+
+        <div style="margin-bottom:18px;">
+          <label>볼륨 폴더 탐색</label>
+          <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+            <input type="text" id="sfmBrowsePath" value="/group-volume" placeholder="/group-volume" class="mono" style="flex:1; min-width:220px;" />
+            <button type="button" class="secondary sm" onclick="browseSfmFiles()">폴더 열기</button>
+            <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/group-volume'; browseSfmFiles()">/group-volume</button>
+            <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/user-volume'; browseSfmFiles()">/user-volume</button>
+          </div>
+          <div id="sfmFilesList" class="pill-list" style="margin-top:10px; max-height:150px; overflow-y:auto;"></div>
+        </div>
+
+        <div id="sfmScriptEditorPanel" class="card-subtle">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <label style="margin:0; color:var(--text);">스크립트 직접 편집</label>
+              <span id="sfmEditorStatusBadge" class="badge info">대기 중</span>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="secondary sm" onclick="openSfmScriptEditor()">불러오기</button>
+              <button type="button" class="soft-success sm" onclick="saveSfmScriptFile(false)">저장</button>
+              <button type="button" class="sm" onclick="saveSfmScriptFile(true)">저장 후 롤링 배포</button>
+            </div>
+          </div>
+          <input type="text" id="sfmEditorFilePath" value="/group-volume/run.sh" placeholder="/group-volume/run.sh" class="mono" style="margin-bottom:10px;" />
+          <textarea id="sfmEditorTextarea" rows="6" class="mono" placeholder="#!/usr/bin/env bash&#10;bash /group-volume/run.sh" style="width:100%; font-size:12.5px; line-height:1.55; resize:vertical;"></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================================================================================== -->
+    <!-- [페이지 4] 시스템 설정 (토큰 연동 · 클러스터 사이트 · 스케줄러 · 고급 자동화 정책) -->
+    <!-- ======================================================================================== -->
+    <section id="viewSettingsSection" class="view-stack" style="display:none;">
+      <!-- 4-A. SPACE 토큰 연동 및 클러스터 관리 -->
+      <div class="card" id="authConfigCard">
+        <div class="card-header">
+          <div>
+            <h2 id="card1AuthTitle">SPACE 클러스터 토큰 연동</h2>
+            <div class="hint">클러스터(N9 · N6 등)별로 인증 토큰과 그룹 설정이 각각 독립적으로 저장됩니다.</div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="secondary sm" onclick="promptAddCustomSite()">+ 신규 사이트 추가</button>
+            <button type="button" class="secondary sm" onclick="discoverSpaceResources()">리소스 동기화</button>
+          </div>
+        </div>
+
+        <div id="tokenTargetSiteBar" class="card-subtle" style="margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <div style="font-size:13px; color:var(--text-secondary);">
+            현재 설정 대상 클러스터: <b id="tokenTargetSiteName" style="color:var(--text);">SPACE N9 (H100)</b>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;" id="tokenSiteQuickButtons">
+            <button type="button" class="chip-btn active" onclick="selectSpaceSite('n9')">N9 (H100)</button>
+            <button type="button" class="chip-btn" onclick="selectSpaceSite('n6')">N6 (A100)</button>
+          </div>
+        </div>
+
+        <div id="card1TokenStatusBanner" class="card-subtle" style="margin-bottom:16px; font-size:13px; font-weight:600; color:var(--warn-text);">
+          토큰 상태 확인 중...
+        </div>
+
+        <div class="card-subtle" style="margin-bottom:20px;">
+          <div style="font-size:12.5px; color:var(--text-secondary); line-height:1.7;">
+            <b>간편 토큰 등록 안내</b>
+            <span style="margin-left:10px;">
+              <a id="spaceConsoleQuickLink" href="https://space.n9.sr-cloud.com/console/home" target="_blank">SPACE N9 콘솔 열기 ↗</a>
+              <span class="txt-muted">&nbsp;·&nbsp;</span>
+              <a id="spaceN6ConsoleQuickLink" href="https://space.n6.sr-cloud.com/console/home" target="_blank">SPACE N6 콘솔 열기 ↗</a>
+            </span><br/>
+            1) <code id="authSiteHostLabel">space.n9.sr-cloud.com</code> 탭을 새로고침(<code>F5</code>)하여 로그인 상태를 확인합니다.<br/>
+            2) 브라우저 개발자 도구(<code>F12</code> → Console)에 아래 추출 코드를 복사해 실행하거나, <code>Session Storage</code>의 <code>access_token</code> 값을 복사합니다.
+          </div>
+
+          <div style="display:flex; gap:8px; margin-top:12px; align-items:center;">
+            <input type="text" id="devtoolsSnippetInput" readonly value='copy(JSON.stringify({accessToken:sessionStorage.access_token||localStorage.access_token,refreshToken:sessionStorage.refresh_token||localStorage.refresh_token,groupId:localStorage.group_id||sessionStorage.group_id}))' class="mono" onclick="this.select(); copyDevtoolsExtractor();" style="flex:1; font-size:12px; cursor:pointer;" title="클릭하면 복사됩니다" />
+            <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()" style="flex-shrink:0;">추출 코드 복사</button>
+          </div>
+
+          <div style="display:flex; gap:8px; margin-top:10px; align-items:stretch;">
+            <textarea id="quickPasteJson" rows="2" placeholder="여기에 복사한 토큰이나 JSON을 붙여넣으세요 (Ctrl+V 시 자동 인식)" class="mono" oninput="applyQuickPasteJson(this.value, false)" style="flex:1; font-size:12.5px; resize:vertical;"></textarea>
+            <button type="button" class="success" onclick="applyQuickPasteJson(document.getElementById('quickPasteJson').value, true)" style="flex-shrink:0;">토큰 적용</button>
+          </div>
+          <div id="tokenPasteResultBox" style="display:none; margin-top:10px; padding:10px 14px; border-radius:8px; font-size:12.5px; font-weight:600;"></div>
+        </div>
+
+        <div class="form-grid">
+          <div class="form-group">
+            <label>작업 그룹 (Group)</label>
+            <div style="display:flex; gap:8px;">
+              <input type="text" id="cfgGroupId" placeholder="ID" class="mono" style="width:84px;" />
+              <select id="discoveredGroupsSelect" onchange="onSelectDiscoveredGroup(this.value)">
+                <option value="">-- 그룹 선택 --</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>계정명</label>
+            <input type="text" id="cfgUserName" placeholder="토큰에서 자동 감지" class="mono" />
+          </div>
+        </div>
+
+        <details class="clean-details" style="margin-top:16px;">
+          <summary>엔드포인트 및 토큰 원문 수동 확인</summary>
+          <div class="form-grid" style="margin-top:14px;">
+            <div class="form-group">
+              <label>API Gateway 주소</label>
+              <input type="text" id="cfgBaseUrl" value="https://mlp.n9.sr-cloud.com" class="mono" />
+            </div>
+            <div class="form-group">
+              <label>File Manager 주소</label>
+              <input type="text" id="cfgSfmUrl" value="https://sfsm.n9.sr-cloud.com" class="mono" />
+            </div>
+            <div class="form-group full">
+              <label>Access Token</label>
+              <input type="text" id="cfgAccessToken" placeholder="access_token (eyJ...)" class="mono" oninput="onAccessTokenInput(this.value)" />
+            </div>
+            <div class="form-group full">
+              <label>Refresh Token</label>
+              <input type="text" id="cfgRefreshToken" placeholder="refresh_token" class="mono" />
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 4-B. 스케줄러 · 자동 승인 · 무인 운영 정책 설정 -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>스케줄러 · 자동 승인 · 무인 운영 정책</h2>
+            <div class="hint">전역 감시 주기, 서버 부하 보호, 장애 워커 교체(Watchdog), 알림 등 시스템 동작 방식을 설정합니다.</div>
+          </div>
+          <div class="btn-row">
+            <span id="groupBadge" class="badge">Group: -</span>
+            <span id="approvalLoopBadge" class="badge ok">자동승인</span>
+            <span id="loadGuardBadge" class="badge ok">부하보호</span>
+            <button type="button" onclick="saveConfig()">정책 설정 저장</button>
+          </div>
+        </div>
+
+        <div class="form-grid" style="margin-bottom:20px;">
+          <div class="form-group">
+            <label>전역 스케줄러 가동</label>
+            <label style="color:var(--text); display:flex; align-items:center; gap:8px; cursor:pointer; padding-top:6px;">
+              <input type="checkbox" id="cfgSchedulerEnabled" checked />
+              <span>주기적 GPU 할당 스케줄러 활성화</span>
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label>Admin 자동 승인 범위</label>
+            <select id="cfgAutoApprovalScope">
+              <option value="all_group">그룹 내 모든 승인 대기 런 자동 승인 (권장)</option>
+              <option value="my_runs">내 계정 + 자동 규칙 런만 자동 승인</option>
+              <option value="job_only">이 서버 규칙이 생성한 런만 승인</option>
+              <option value="off">자동 승인 끄기</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label>스케줄러 기본 점검 주기(초)</label>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <select onchange="if(this.value) document.getElementById('cfgIntervalSec').value=this.value" style="flex:1;">
+                <option value="">주기 선택...</option>
+                <option value="15">15초</option>
+                <option value="60">1분 (60초)</option>
+                <option value="180">3분 (180초)</option>
+                <option value="300">5분 (300초)</option>
+                <option value="600">10분 (600초)</option>
+                <option value="1800">30분 (1800초)</option>
+              </select>
+              <input type="number" id="cfgIntervalSec" min="1" max="86400" value="15" class="mono" style="width:90px;" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>승인 대기열 스캔 주기(초)</label>
+            <input type="number" id="cfgApprovalIntervalSec" min="1" max="3600" value="5" class="mono" />
+          </div>
+
+          <div class="form-group">
+            <label>화면 자동 새로고침 주기(초)</label>
+            <input type="number" id="cfgUiRefreshSec" min="1" max="600" value="5" class="mono" onchange="applyUiRefreshInterval(this.value)" />
+          </div>
+
+          <div class="form-group">
+            <label>생성 직후 고속 승인 추적 (간격 초 × 횟수)</label>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <input type="number" id="cfgPostCreateDelaySec" min="1" max="30" value="2" class="mono" />
+              <span class="txt-muted">×</span>
+              <input type="number" id="cfgPostCreateRetries" min="1" max="60" value="8" class="mono" />
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:20px;">
+          <!-- 부하 보호 정책 -->
+          <div class="card-subtle">
+            <label style="color:var(--text); display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:14px; font-size:13.5px;">
+              <input type="checkbox" id="cfgSmartLoadGuardEnabled" checked />
+              <span>스마트 서버 부하 보호 페이싱</span>
+            </label>
+            <div class="form-grid" style="grid-template-columns:1fr 1fr; gap:14px;">
+              <div class="form-group">
+                <label>동시 준비(Pending) 상한</label>
+                <input type="number" id="cfgMaxPendingWorkers" min="1" max="32" value="2" class="mono" />
+              </div>
+              <div class="form-group">
+                <label>API 지연 기준 (주의 / 위험 ms)</label>
+                <div style="display:flex; gap:6px;">
+                  <input type="number" id="cfgApiLatencyWarnMs" min="300" max="15000" value="1800" class="mono" />
+                  <input type="number" id="cfgApiLatencyCriticalMs" min="500" max="30000" value="3500" class="mono" />
+                </div>
+              </div>
+            </div>
+            <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin-top:12px; font-size:12.5px; color:var(--text-secondary);">
+              <input type="checkbox" id="cfgStepByStepRunningCheck" checked /> 이전 워커 Running 진입 확인 후 순차 할당
+            </label>
+          </div>
+
+          <!-- 무인 장애 대응 (Watchdog · 폴백 · 슬롯 환경변수) -->
+          <div class="card-subtle">
+            <div style="font-size:13.5px; font-weight:600; color:var(--text); margin-bottom:14px;">무인 장애 대응 및 자동 복구</div>
+            <div style="display:flex; flex-direction:column; gap:10px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                  <input type="checkbox" id="cfgWatchdogEnabled" checked /> 장기 대기(좀비) 워커 자동 교체
+                </label>
+                <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
+                  <span>대기 한도(분)</span>
+                  <input type="number" id="cfgMaxPendingTimeoutMin" min="3" max="180" value="20" class="mono" style="width:68px;" />
+                </div>
+              </div>
+              <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="cfgLogErrorAutoRestart" checked /> OOM · CUDA · NCCL 오류 로그 감지 시 자동 재시작
+              </label>
+              <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="cfgHybridFallbackEnabled" checked /> Spot 할당 지연 시 Standard 풀 자동 폴백
+              </label>
+              <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="cfgInjectWorkerEnv" /> 컨테이너에 <code>WORKER_SLOT</code> 환경변수 주입
+              </label>
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                  <input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 즉시 실패(불량 노드) 쿨다운 보호
+                </label>
+                <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
+                  <span>쿨다운(초)</span>
+                  <input type="number" id="cfgBadNodeCooldownSec" value="25" min="5" max="300" class="mono" style="width:68px;" />
+                </div>
+              </div>
+              <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="cfgSyncEditedScriptsOnStart" checked /> 웹 에디터 저장 스크립트 시작 시 자동 동기화
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- 추가 자동화 옵션 (시간대 스케일링 · 파이프라인 종료 · 알림) -->
+        <details class="clean-details">
+          <summary>시간대별 목표 자동 조정 · 완료 키워드 정지 · 알림 웹훅 설정</summary>
+          <div class="form-grid" style="margin-top:16px;">
+            <div class="form-group full">
+              <label style="display:flex; align-items:center; gap:7px; cursor:pointer; color:var(--text);">
+                <input type="checkbox" id="cfgTimeScaleEnabled" /> 시간대별(주간 · 야간 · 주말) 목표 워커 수 자동 전환 사용
+              </label>
+              <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; align-items:center; font-size:12.5px; color:var(--muted);">
+                <span>주간 목표 <input type="number" id="cfgDayTargetWorkers" min="1" max="256" value="20" class="mono" style="width:72px; margin-left:4px;" /></span>
+                <span>야간 목표 <input type="number" id="cfgNightTargetWorkers" min="1" max="256" value="48" class="mono" style="width:72px; margin-left:4px;" /></span>
+                <span>주말 목표 <input type="number" id="cfgWeekendTargetWorkers" min="1" max="256" value="64" class="mono" style="width:72px; margin-left:4px;" /></span>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label style="display:flex; align-items:center; gap:7px; cursor:pointer;">
+                <input type="checkbox" id="cfgAutoStopOnComplete" checked /> 완료 키워드 감지 시 자동 정지
+              </label>
+              <input type="text" id="cfgAutoStopOnCompleteKeyword" value="ALL_TASKS_COMPLETED,TRAINING_FINISHED,PIPELINE_DONE" class="mono" />
+            </div>
+
+            <div class="form-group">
+              <label>목표 누적 성공 횟수 (0 = 무제한)</label>
+              <input type="number" id="cfgMaxTotalSucceededRuns" value="0" min="0" max="9999" class="mono" />
+            </div>
+
+            <div class="form-group full">
+              <label>완료 후 후속 단계 실행 명령어 (선택)</label>
+              <input type="text" id="cfgNextStageCommand" placeholder="예: bash /group-volume/eval.sh" class="mono" />
+            </div>
+
+            <div class="form-group full">
+              <label>알림 설정 (브라우저 알림 및 Slack / Discord Webhook)</label>
+              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <input type="text" id="cfgWebhookUrl" placeholder="https://hooks.slack.com/... (선택)" class="mono" style="flex:1; min-width:220px;" />
+                <label style="display:flex; align-items:center; gap:6px; margin:0; white-space:nowrap;">
+                  <input type="checkbox" id="cfgBrowserNotifyEnabled" checked /> 브라우저 데스크톱 알림
+                </label>
+                <button type="button" class="secondary sm" onclick="testAlertNotification()">알림 테스트</button>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div style="display:flex; justify-content:flex-end; margin-top:20px; padding-top:16px; border-top:1px solid var(--border);">
+          <button type="button" onclick="saveConfig()">시스템 정책 설정 저장</button>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=21"></script>
+  <script src="/app.js?v=22"></script>
 </body>
 </html>

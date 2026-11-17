@@ -302,13 +302,12 @@ function renderMultiSiteSwitcherBar(sites = sitesList, activeId = currentSiteId)
       .map((s) => `${s.id}:${s.id === activeId}:${s.tokenValid}:${s.hasAccessToken}:${s.activeRunsCount}:${s.runningRunsCount}:${s.enabledJobCount}:${s.totalTargetWorkers}`)
       .join("|");
     const html =
-      `<span style="font-size:12px; font-weight:600; color:var(--muted); margin-right:2px;">클러스터</span>` +
       `<div class="segmented-group">` +
       sites
         .map((s) => {
           const isCurrent = s.id === activeId;
           const dotColor = s.tokenValid ? "var(--success)" : s.hasAccessToken ? "var(--danger)" : "var(--muted)";
-          const stText = s.tokenValid ? "" : s.hasAccessToken ? " 만료" : " 미연동";
+          const stText = s.tokenValid ? "" : s.hasAccessToken ? "만료" : "미연동";
           const workerInfo =
             s.activeRunsCount > 0 || s.enabledJobCount > 0
               ? `${s.runningRunsCount || 0}/${s.totalTargetWorkers || 0}`
@@ -319,10 +318,10 @@ function renderMultiSiteSwitcherBar(sites = sitesList, activeId = currentSiteId)
             onclick="selectSpaceSite('${escapeHtml(s.id)}')"
           >
             <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:${dotColor};"></span>
-            <span>SPACE ${escapeHtml(s.id.toUpperCase())} (${escapeHtml(s.gpuModel)})</span>
+            <span>${escapeHtml(s.id.toUpperCase())} (${escapeHtml(s.gpuModel)})</span>
             ${
               workerInfo || stText
-                ? `<span class="mono" style="margin-left:3px; font-size:11px; padding:1px 6px; border-radius:999px; background:var(--panel); border:1px solid var(--border); color:${
+                ? `<span class="mono" style="margin-left:2px; font-size:11px; padding:1px 6px; border-radius:999px; background:var(--panel); border:1px solid var(--border); color:${
                     s.tokenValid ? "var(--success-text)" : s.hasAccessToken ? "var(--danger-text)" : "var(--muted)"
                   };">${escapeHtml((workerInfo || stText).trim())}</span>`
                 : ""
@@ -526,23 +525,71 @@ async function loadServerState(options = {}) {
 
 let focusedFleetJobId = "";
 let currentMainView = "monitor";
+let currentWorkloadSubTab = "runs";
+
+function switchWorkloadSubTab(sub = "runs") {
+  const validSubs = ["runs", "approvals", "history"];
+  currentWorkloadSubTab = validSubs.includes(sub) ? sub : "runs";
+
+  const panelRuns = document.getElementById("workloadPanelRuns");
+  const panelApprovals = document.getElementById("workloadPanelApprovals");
+  const panelHistory = document.getElementById("workloadPanelHistory");
+
+  if (panelRuns) panelRuns.style.display = currentWorkloadSubTab === "runs" ? "block" : "none";
+  if (panelApprovals) panelApprovals.style.display = currentWorkloadSubTab === "approvals" ? "block" : "none";
+  if (panelHistory) panelHistory.style.display = currentWorkloadSubTab === "history" ? "block" : "none";
+
+  const btnRuns = document.getElementById("subTabBtnRuns");
+  const btnApprovals = document.getElementById("subTabBtnApprovals");
+  const btnHistory = document.getElementById("subTabBtnHistory");
+  if (btnRuns) btnRuns.classList.toggle("active", currentWorkloadSubTab === "runs");
+  if (btnApprovals) btnApprovals.classList.toggle("active", currentWorkloadSubTab === "approvals");
+  if (btnHistory) btnHistory.classList.toggle("active", currentWorkloadSubTab === "history");
+
+  if (currentWorkloadSubTab === "runs") {
+    loadSpaceRuns({ background: true });
+  } else if (currentWorkloadSubTab === "approvals") {
+    loadApprovals();
+  }
+}
 
 function switchMainView(view = "monitor", targetSection = "") {
-  currentMainView = view === "setup" ? "setup" : "monitor";
-  const monEl = document.getElementById("viewMonitorSection");
-  const setEl = document.getElementById("viewSetupSection");
-  const btnMon = document.getElementById("tabBtnMonitor");
-  const btnSet = document.getElementById("tabBtnSetup");
+  let resolvedView = view;
+  if (view === "setup") {
+    resolvedView = targetSection === "rules" || targetSection === "form" ? "rules" : "settings";
+  }
+  if (!["monitor", "workloads", "rules", "settings"].includes(resolvedView)) {
+    resolvedView = "monitor";
+  }
+  currentMainView = resolvedView;
 
-  if (monEl) monEl.style.display = currentMainView === "monitor" ? "flex" : "none";
-  if (setEl) setEl.style.display = currentMainView === "setup" ? "flex" : "none";
+  const sections = {
+    monitor: document.getElementById("viewMonitorSection"),
+    workloads: document.getElementById("viewWorkloadsSection"),
+    rules: document.getElementById("viewRulesSection"),
+    settings: document.getElementById("viewSettingsSection"),
+  };
+  const buttons = {
+    monitor: document.getElementById("tabBtnMonitor"),
+    workloads: document.getElementById("tabBtnWorkloads"),
+    rules: document.getElementById("tabBtnRules"),
+    settings: document.getElementById("tabBtnSettings"),
+  };
 
-  if (btnMon && btnSet) {
-    btnMon.classList.toggle("active", currentMainView === "monitor");
-    btnSet.classList.toggle("active", currentMainView === "setup");
+  for (const [k, el] of Object.entries(sections)) {
+    if (el) el.style.display = k === currentMainView ? "flex" : "none";
+  }
+  for (const [k, btn] of Object.entries(buttons)) {
+    if (btn) btn.classList.toggle("active", k === currentMainView);
   }
 
-  if (currentMainView === "setup" && targetSection) {
+  if (currentMainView === "workloads") {
+    if (targetSection && ["runs", "approvals", "history"].includes(targetSection)) {
+      switchWorkloadSubTab(targetSection);
+    } else {
+      switchWorkloadSubTab(currentWorkloadSubTab);
+    }
+  } else if ((currentMainView === "rules" || currentMainView === "settings") && targetSection) {
     setTimeout(() => {
       if (targetSection === "auth") {
         const el = document.getElementById("authConfigCard");
@@ -561,12 +608,12 @@ function switchMainView(view = "monitor", targetSection = "") {
 }
 
 function openNewJobRuleInSetup() {
-  switchMainView("setup", "form");
+  switchMainView("rules", "form");
   startNewJobRule();
 }
 
 function editJobRuleInSetup(jobId) {
-  switchMainView("setup", "form");
+  switchMainView("rules", "form");
   selectAndEditJobRule(jobId, true);
 }
 
@@ -799,7 +846,8 @@ function renderTopAutoStatusBanner(options = {}) {
   const totalAutoApproved = Math.max(appStats.totalApprovedCount || 0, timeline.filter((x) => x.approvedAt).length);
 
   const prevDetailsEl = document.getElementById("topTimelineDetails");
-  const isTimelineOpen = prevDetailsEl ? prevDetailsEl.open : true;
+  const isTimelineOpen = prevDetailsEl ? prevDetailsEl.open : false;
+  const tel = fleet.telemetry || {};
 
   const timelineRowsHtml = timeline
     .slice(0, 12)
@@ -841,102 +889,78 @@ function renderTopAutoStatusBanner(options = {}) {
     .join("");
 
   const bannerHtml = `
-    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; padding-bottom:11px; border-bottom:1px solid var(--border);">
-      <div style="display:flex; align-items:center; gap:9px; flex-wrap:wrap;">
+    <div class="card-header" style="margin-bottom:18px; padding-bottom:14px;">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
         <span class="badge ${isSchedOn && isApprovalOn ? "ok" : "warn"}">
-          ${isSchedOn && isApprovalOn ? "엔진 정상 가동 중" : "일부 루프 일시정지"}
+          ${isSchedOn && isApprovalOn ? "자동화 엔진 정상" : "일부 루프 일시정지"}
         </span>
-        <span style="font-size:13.5px; font-weight:600; color:var(--text);">
-          자동 할당 · Admin 자동 승인 · 부하 보호 현황
-        </span>
-        <span class="txt-muted" style="font-size:12px;">
-          (목표 ${targetCnt}워커 · ${targetGpus}GPU 상한 기준)
+        <h2>자동화 엔진 및 클러스터 상태 요약</h2>
+        <span class="txt-muted" style="font-size:12.5px;">
+          누적 가동 <b class="mono" style="color:var(--text-secondary);">${tel.totalGpuHours ?? 0} GPU-h</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)
         </span>
       </div>
-      <div class="btn-row">
-        <button type="button" class="soft-success sm" onclick="triggerSchedulerTick()">지금 즉시 점검</button>
+      <div style="font-size:12.5px;">
+        <a href="javascript:void(0)" onclick="switchMainView('settings')" style="color:var(--muted);">정책 설정으로 이동 →</a>
       </div>
     </div>
 
-    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; margin-top:12px;">
-      <!-- 1. 자동 할당 엔진 -->
-      <div class="card-subtle" style="display:flex; flex-direction:column; gap:6px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-          <span style="font-size:12.5px; font-weight:600; color:var(--text);">1. 워커 자동 할당 엔진</span>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(290px, 1fr)); gap:18px;">
+      <!-- 1. 자동 할당 엔진 (읽기 전용 모니터링) -->
+      <div class="card-subtle" style="display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span style="font-size:13px; font-weight:600; color:var(--text);">워커 자동 할당 스케줄러</span>
           <span class="badge ${isSchedOn ? "ok" : "err"}">${isSchedOn ? `ON (${allocIntervalSec}초 간격)` : "OFF"}</span>
         </div>
-        <div class="mono" style="font-size:12px; color:var(--text-secondary); line-height:1.55;">
-          <div>마지막 신청: <b style="color:var(--text);">${escapeHtml(formatPreciseTime(lastAllocReqTime, true))}</b> <span class="txt-muted">(${escapeHtml(formatRelativeAgo(lastAllocReqTime))})</span></div>
-          <div id="topNextAllocCountdown" class="txt-accent" style="margin-top:2px;">다음 점검 시간 계산 중...</div>
-          <div class="txt-muted" style="font-size:11px; margin-top:3px;">
-            누적 자동 신청 <b style="color:var(--text-secondary);">${autoAllocTotal}건</b> · 수동 신청 <b style="color:var(--text-secondary);">${manualAllocTotal}건</b>
+        <div class="mono" style="font-size:12px; color:var(--text-secondary); line-height:1.65;">
+          <div>최근 신청: <b style="color:var(--text);">${escapeHtml(formatPreciseTime(lastAllocReqTime, true))}</b> <span class="txt-muted">(${escapeHtml(formatRelativeAgo(lastAllocReqTime))})</span></div>
+          <div id="topNextAllocCountdown" class="txt-accent">다음 점검 시간 계산 중...</div>
+          <div class="txt-muted" style="font-size:11.5px; margin-top:2px;">
+            누적 자동 <b style="color:var(--text-secondary);">${autoAllocTotal}건</b> · 수동 <b style="color:var(--text-secondary);">${manualAllocTotal}건</b>
           </div>
         </div>
       </div>
 
-      <!-- 2. Admin 자동 승인 엔진 -->
-      <div class="card-subtle" style="display:flex; flex-direction:column; gap:6px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-          <span style="font-size:12.5px; font-weight:600; color:var(--text);">2. Admin 자동 승인 엔진</span>
+      <!-- 2. Admin 자동 승인 엔진 (읽기 전용 모니터링) -->
+      <div class="card-subtle" style="display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span style="font-size:13px; font-weight:600; color:var(--text);">Admin 자동 승인 감시</span>
           <span class="badge ${isApprovalOn ? "ok" : "err"}">${isApprovalOn ? `상시 감시 (${approvalIntervalSec}초)` : "OFF"}</span>
         </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <div style="background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:6px 9px;">
-            <div style="font-size:11px; color:var(--muted);">최근 승인 요청</div>
-            <div class="mono txt-warn" style="font-size:14px; font-weight:700;">${escapeHtml(formatPreciseTime(lastApprovalReqTime, false))}</div>
-          </div>
-          <div style="background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:6px 9px;">
-            <div style="font-size:11px; color:var(--muted);">최근 승인 완료</div>
-            <div class="mono txt-ok" style="font-size:14px; font-weight:700;">${escapeHtml(formatPreciseTime(lastApprovedDoneTime, false))}</div>
-          </div>
-        </div>
-        <div class="mono" style="font-size:11.5px; color:var(--text-secondary); line-height:1.5;">
-          <div>스캔: <span id="topQueueScanTimeSpan">${escapeHtml(formatPreciseTime(appStats.lastCheckedAt, true))}</span> <span id="topQueueScanTickSpan" class="txt-muted">(#${appStats.tickCount || 0}회)</span></div>
+        <div class="mono" style="font-size:12px; color:var(--text-secondary); line-height:1.65;">
+          <div>최근 승인: <b class="txt-ok">${escapeHtml(formatPreciseTime(lastApprovedDoneTime, false))}</b> <span class="txt-muted">(Run #${escapeHtml(String(lastApprovedRunId))} · ${lastElapsedSec}초)</span></div>
           <div id="topNextApprovalCountdown" class="txt-ok">다음 스캔 계산 중...</div>
-          <div class="txt-muted" style="font-size:11px;">누적 승인 <b style="color:var(--text-secondary);">${totalAutoApproved}건</b> · 대기 <b>${appStats.pendingCount || 0}건</b> · 최근 Run #${escapeHtml(String(lastApprovedRunId))} (${lastElapsedSec}초, <code>${escapeHtml(lastApprovedRunName)}</code>)</div>
+          <div class="txt-muted" style="font-size:11.5px; margin-top:2px;">
+            누적 승인 <b style="color:var(--text-secondary);">${totalAutoApproved}건</b> · 대기 <b>${appStats.pendingCount || 0}건</b> · 스캔 <span id="topQueueScanTimeSpan">${escapeHtml(formatPreciseTime(appStats.lastCheckedAt, false))}</span> <span id="topQueueScanTickSpan">(#${appStats.tickCount || 0})</span>
+          </div>
         </div>
       </div>
 
-      <!-- 3. 클러스터 & 서버 부하 가드 -->
-      <div class="card-subtle" style="display:flex; flex-direction:column; gap:7px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
-          <span style="font-size:12.5px; font-weight:600; color:var(--text);">3. 서버 · 클러스터 부하 보호</span>
+      <!-- 3. 클러스터 응답성 & 서버 부하 (읽기 전용 모니터링) -->
+      <div class="card-subtle" style="display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <span style="font-size:13px; font-weight:600; color:var(--text);">클러스터 응답성 · 부하 보호</span>
           <span class="badge ${loadLevel === "GREEN" ? "ok" : loadLevel === "RED" ? "err" : "warn"}">
-            ${escapeHtml(lm.loadBadgeText || (isLoadGuardOn ? "쾌적" : "OFF"))}
+            ${escapeHtml(lm.loadBadgeText || (isLoadGuardOn ? "쾌적" : "보호 OFF"))}
           </span>
         </div>
-        <div id="topLoadSummaryTextSpan" class="${loadTextClass}" style="font-size:11.5px;">
+        <div id="topLoadSummaryTextSpan" class="${loadTextClass}" style="font-size:12px;">
           ${escapeHtml(lm.summaryText || "실시간 API 응답 속도 및 대기 워커 수 감시 중")}
         </div>
-        <div style="display:flex; gap:4px; flex-wrap:wrap;">
-          <button type="button" class="chip-btn ${isLoadGuardOn ? "active" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: ${!isLoadGuardOn} })">
-            ${isLoadGuardOn ? "부하보호 ON" : "부하보호 OFF"}
-          </button>
-          <button type="button" class="chip-btn ${maxPendingCap === 1 ? "active" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: true, maxPendingWorkers: 1 })" title="한 번에 1개씩 Running 확인 후 할당">
-            순차 1개
-          </button>
-          <button type="button" class="chip-btn ${maxPendingCap === 2 ? "active" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: true, maxPendingWorkers: 2 })">
-            동시 2개(권장)
-          </button>
-          <button type="button" class="chip-btn ${maxPendingCap === 4 ? "active" : ""}" onclick="quickUpdateLoadGuard({ smartLoadGuardEnabled: true, maxPendingWorkers: 4 })">
-            동시 4개
-          </button>
-        </div>
-        <div class="mono" style="font-size:11px; color:var(--muted); display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; padding-top:4px; border-top:1px solid var(--border);">
-          <div id="topInFlightGuardSpan">준비 대기: <b style="color:var(--text-secondary);">${inFlightPending}/${maxPendingCap}개</b>${lm.oldestPendingWaitSec > 0 ? ` (${lm.oldestPendingWaitSec}s)` : ""}</div>
+        <div class="mono" style="font-size:11.5px; color:var(--muted); display:grid; grid-template-columns:1fr 1fr; gap:5px 12px; padding-top:6px; border-top:1px solid var(--border);">
+          <div id="topInFlightGuardSpan">동시 준비: <b style="color:var(--text-secondary);">${inFlightPending}/${maxPendingCap}개</b></div>
           <div id="topApiLatencySpan">API 지연: <b style="color:var(--text-secondary);">${lmApi.avgLatencyMs || 0}ms</b> (P95 ${lmApi.p95LatencyMs || 0}ms)</div>
           <div id="topApiRpmSpan">호출: ${lmApi.requestsPerMinute || 0}/분 (캐시 ${lmApi.cacheHitsPerMinute || 0})</div>
-          <div id="topHostCpuSpan">서버: CPU ${lmHost.cpuLoadPct ?? 0}% · ${lmHost.rssMb ?? 0}MB · ${(lm.pacingMultiplier || 1).toFixed(1)}x</div>
+          <div id="topHostCpuSpan">서버: CPU ${lmHost.cpuLoadPct ?? 0}% · ${lmHost.rssMb ?? 0}MB</div>
         </div>
       </div>
     </div>
 
-    <details id="topTimelineDetails" class="clean-details" style="margin-top:12px;" ${isTimelineOpen ? "open" : ""}>
+    <details id="topTimelineDetails" class="clean-details" style="margin-top:18px;" ${isTimelineOpen ? "open" : ""}>
       <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-        <span>최근 워커 할당 · 자동 승인 타임라인 (${Math.min(12, timeline.length)}건)</span>
-        <span class="txt-muted" style="font-size:11.5px; font-weight:400;">워커 생성 시 약 0.5~1.8초 내에 자동으로 Admin 승인이 처리됩니다</span>
+        <span>최근 할당 · 자동 승인 타임라인 (${Math.min(12, timeline.length)}건 펼쳐보기)</span>
+        <span class="txt-muted" style="font-size:12px; font-weight:400;">생성 직후 약 0.5~1.8초 내 자동 승인</span>
       </summary>
-      <div id="topTimelineTableScrollWrap" style="overflow-x:auto; max-height:230px; overflow-y:auto; margin-top:8px; border:1px solid var(--border); border-radius:7px;">
+      <div id="topTimelineTableScrollWrap" style="overflow-x:auto; max-height:250px; overflow-y:auto; margin-top:12px; border:1px solid var(--border); border-radius:10px;">
         <table style="margin:0;">
           <thead>
             <tr>
@@ -1024,6 +1048,18 @@ function renderTopAutoStatusBanner(options = {}) {
   }
 }
 
+let isSlotManageOpen = false;
+
+function toggleSlotManageMode() {
+  isSlotManageOpen = !isSlotManageOpen;
+  if (!isSlotManageOpen && selectedWorkerRunIds.size > 0) {
+    selectedWorkerRunIds.clear();
+  }
+  if (latestWorkerFleet) {
+    renderWorkerFleetBoard(latestWorkerFleet, { force: true });
+  }
+}
+
 function renderWorkerFleetBoard(fleet, options = {}) {
   const panel = document.getElementById("workerFleetPanel");
   if (!panel) return;
@@ -1041,8 +1077,11 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   if (!fleet || !Array.isArray(fleet.jobs) || fleet.jobs.length === 0) {
     panel.removeAttribute("data-wf-skeleton");
     panel.innerHTML = `
-      <div style="font-size:13px; color:var(--muted);">
-        등록된 자동 실행 규칙이 없습니다. [설정 · 규칙 · 실행] 탭에서 규칙을 추가하면 실시간 워커 현황이 표시됩니다.
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+        <div style="font-size:14px; color:var(--muted);">
+          등록된 자동 실행 규칙이 없습니다. 먼저 실행 규칙을 추가하면 실시간 워커 가동 현황이 표시됩니다.
+        </div>
+        <button type="button" class="sm" onclick="openNewJobRuleInSetup()">+ 실행 규칙 만들기</button>
       </div>
     `;
     return;
@@ -1078,105 +1117,43 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   const intervalSec = jf.scaleUpIntervalSec || 15;
   const recon = fleet.spaceReconciliation || null;
 
-  // Build concise SPACE Cluster Reconciliation Strip
+  // Unmatched active runs notice (shown only if there are extra runs outside the focused rule)
   let reconciliationBarHtml = "";
   if (recon) {
     const myUnmatched = Array.isArray(recon.myUnmatchedActiveRuns) ? recon.myUnmatchedActiveRuns : [];
     const otherUsers = Array.isArray(recon.otherUserActiveRuns) ? recon.otherUserActiveRuns : [];
-    const myUnmatchedBadges = myUnmatched
-      .map(
-        (u) =>
-          `<span class="badge info mono" style="gap:5px; font-weight:500;" title="현재 규칙과 다른 내 계정 워크로드">
-            <span style="cursor:pointer;" onclick="viewRunLog('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}')">내 기타 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount})</span>
-            <button type="button" class="slot-btn" onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(String(u.id))}', false, '')">종료</button>
-          </span>`
-      )
-      .join(" ");
-    const otherUserBadges = otherUsers
-      .map(
-        (u) =>
-          `<span class="badge purple mono" style="font-weight:500;" title="그룹 내 다른 사용자 워크로드 (보호됨 · 클릭 시 로그만 조회)">
-            <span style="cursor:pointer;" onclick="viewRunLog('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}')">타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)})</span>
-          </span>`
-      )
-      .join(" ");
-
-    reconciliationBarHtml = `
-      <div class="card-subtle" style="margin-bottom:12px; padding:9px 13px; display:flex; flex-direction:column; gap:6px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; color:var(--text-secondary);">
-            <span style="font-weight:600; color:var(--muted);">클러스터 현황 비교</span>
-            <span class="badge">
-              규칙 <b>${escapeHtml(jf.jobName)}</b> · <span class="txt-ok">Running ${runningCnt}</span>(${runningGpus}G) · <span class="txt-warn">Pending ${pendingCnt}${targetPendingCnt > 0 ? `/${targetPendingCnt}` : ""}</span> · 목표 ${targetCnt}(${targetGpus}G)
-            </span>
-            <span class="badge">
-              내 계정(${escapeHtml(recon.currentUserName || "me")}) · Running ${recon.mySpaceRunningWorkers}(${recon.mySpaceRunningGpus}G) · Pending ${recon.mySpacePendingWorkers} · 총 ${recon.mySpaceActiveWorkers}
-            </span>
-            <span class="badge">
-              그룹(${escapeHtml(recon.groupId || "Group")}) · Running ${recon.spaceTotalRunningWorkers}(${recon.spaceTotalRunningGpus}G) · Pending ${recon.spaceTotalPendingWorkers} · 총 ${recon.spaceTotalActiveWorkers}
-            </span>
-          </div>
-          <div style="display:flex; gap:6px; flex-wrap:wrap;">
-            ${
-              excessPendingCnt > 0
-                ? `<button type="button" class="warn sm" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">초과 Pending +${excessPendingCnt} 취소</button>`
-                : ""
-            }
-            ${
-              excessActiveCnt > 0
-                ? `<button type="button" class="danger sm" onclick="bulkControlWorkers('trim_to_target', { jobId: '${escapeHtml(jf.jobId)}' })">목표 맞춤 초과 +${excessActiveCnt} 정리</button>`
-                : ""
-            }
-          </div>
+    if (myUnmatched.length > 0 || otherUsers.length > 0) {
+      const myUnmatchedBadges = myUnmatched
+        .map(
+          (u) =>
+            `<span class="badge info mono" style="cursor:pointer;" onclick="viewRunLog('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}')" title="클릭하여 로그 조회">
+              내 기타 런: ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))} · ${escapeHtml(u.status)})
+            </span>`
+        )
+        .join(" ");
+      const otherUserBadges = otherUsers
+        .map(
+          (u) =>
+            `<span class="badge purple mono" style="cursor:pointer;" onclick="viewRunLog('${escapeJsStr(String(u.id))}', '${escapeJsStr(u.name)}')" title="그룹 내 다른 사용자 워크로드 (보호됨)">
+              타유저(${escapeHtml(u.userName)}): ${escapeHtml(u.name)} (#${escapeHtml(String(u.id))})
+            </span>`
+        )
+        .join(" ");
+      reconciliationBarHtml = `
+        <div class="card-subtle" style="margin-bottom:16px; padding:12px 16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; color:var(--muted);">
+          <span style="font-weight:600;">현재 규칙 외 활성 워크로드:</span>
+          ${myUnmatchedBadges}
+          ${otherUserBadges}
         </div>
-        ${
-          myUnmatched.length > 0 || otherUsers.length > 0
-            ? `<div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px; color:var(--muted);">
-                <span>규칙 외 활성 런:</span>
-                ${myUnmatchedBadges}
-                ${otherUserBadges}
-              </div>`
-            : ""
-        }
-      </div>
-    `;
+      `;
+    }
   }
 
-  const multiRuleTabsHtml =
-    fleet.jobs.length > 1
-      ? `
-      <div class="card-subtle" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px; padding:8px 12px;">
-        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-          <span style="font-size:12px; font-weight:600; color:var(--muted);">규칙 선택</span>
-          ${fleet.jobs
-            .map((item) => {
-              const isFocused = String(item.jobId) === String(jf.jobId);
-              return `
-                <button type="button" class="chip-btn ${isFocused ? "active" : ""}"
-                  onclick="selectFleetJobTab('${escapeHtml(item.jobId)}')">
-                  ${item.enabled ? "●" : "○"} ${escapeHtml(item.jobName)} (${item.runningCount ?? 0}${item.pendingCount ? `+${item.pendingCount}` : ""}/${item.targetCount})
-                </button>
-              `;
-            })
-            .join("")}
-        </div>
-        <div class="mono" style="font-size:11.5px; color:var(--text-secondary);">
-          전체 합계: <span class="txt-ok">Running ${fleet.totalRunningWorkers}</span> · Pending ${fleet.totalPendingWorkers} · <b>${fleet.totalActiveWorkers}/${fleet.totalTargetWorkers} 워커</b> (${fleet.totalRunningGpus} GPU)
-        </div>
-      </div>
-    `
-      : "";
-
-  // Build slot cards (up to 256 visual slots so UI stays clean and fast)
+  // Build slot cards (up to 256 visual slots; action buttons hidden until hover or manage mode)
   const maxVisualSlots = Math.min(Math.max(targetCnt, activeCnt), 256);
   const slotPills = [];
   const activeWorkers = jf.activeWorkers || [];
   const wd = fleet.watchdog || {};
-  const ts = fleet.timeScale || {};
-  const hf = fleet.hybridFallback || {};
-  const shardingOn = Boolean(fleet.sharding?.injectWorkerEnv ?? serverState?.config?.injectWorkerEnv);
-  const bng = fleet.badNodeGuard || {};
-  const pipe = fleet.pipeline || {};
   const tel = fleet.telemetry || {};
 
   // Clean up any stale selected IDs that are no longer active anywhere
@@ -1231,7 +1208,6 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         : isExcess
         ? `초과대기 #${seqNum}`
         : `대기 #${stateIdx}`;
-      const reqTimeShort = w.autoApprovalRequestedAt ? formatPreciseTime(w.autoApprovalRequestedAt, false).slice(0, 8) : "";
       const doneTimeShort = w.approvedAt ? formatPreciseTime(w.approvedAt, false).slice(0, 8) : "";
       const logLineShort = w.lastLogLine ? String(w.lastLogLine).slice(0, 44) : "";
 
@@ -1245,7 +1221,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       }
       const progBadgeHtml =
         progParts.length > 0
-          ? `<span style="font-size:10px; color:${isStraggler ? "var(--warn-text)" : "var(--accent-text)"}; font-weight:600;">${escapeHtml(progParts.join(" · "))}${isStraggler ? ` (지연 < ${prog.medianSpeed})` : ""}</span>`
+          ? `<span style="font-size:10.5px; color:${isStraggler ? "var(--warn-text)" : "var(--accent-text)"}; font-weight:600;">${escapeHtml(progParts.join(" · "))}</span>`
           : "";
 
       const slotSig = [
@@ -1256,7 +1232,6 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         isExcess ? 1 : 0,
         hasErr ? 1 : 0,
         isStraggler ? 1 : 0,
-        reqTimeShort,
         doneTimeShort,
         logLineShort,
         progParts.join(","),
@@ -1267,33 +1242,29 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         sig: slotSig,
         html: `
         <div class="slot-card mono ${stClass} ${isSelected ? "is-selected" : ""}" onclick="viewRunLog('${escapeJsStr(wIdStr)}', '${escapeJsStr(w.name)}')"
-          title="클릭하여 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(wIdStr)}) · 상태: ${escapeHtml(w.status)} · 신청: ${srcTag} · 승인요청: ${escapeHtml(formatPreciseTime(w.autoApprovalRequestedAt, true))} · 승인완료: ${escapeHtml(formatPreciseTime(w.approvedAt, true))}${w.lastLogLine ? ` · 최근로그: ${escapeHtml(w.lastLogLine)}` : ""}">
-          <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
-            <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0; font-weight:600; color:var(--text);">
-              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(wIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:var(--accent); cursor:pointer;" />
+          title="클릭하여 실시간 로그 보기: ${escapeHtml(w.name)} (#${escapeHtml(wIdStr)}) · 상태: ${escapeHtml(w.status)}">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; margin:0; font-weight:600; color:var(--text);">
+              <input type="checkbox" class="slot-check" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(wIdStr)}', this.checked)" />
               <span style="color:${statusDotColor};">●</span>
               <span>${pillHeaderLabel} <span style="color:var(--muted); font-weight:500;">#${escapeHtml(wIdStr)}</span></span>
             </label>
-            <div style="display:inline-flex; align-items:center; gap:3px;" onclick="event.stopPropagation();">
+            <div class="slot-actions" onclick="event.stopPropagation();">
               <button type="button" class="slot-btn"
                 onclick="killSingleWorkerSlot('${escapeJsStr(wIdStr)}', '${escapeJsStr(w.name)}', '${escapeJsStr(pillHeaderLabel)}', false, '${escapeJsStr(jf.jobId)}')"
-                title="이 슬롯(#${escapeHtml(wIdStr)})을 종료합니다 (목표 수 유지)">종료</button>
+                title="이 슬롯(#${escapeHtml(wIdStr)})만 종료합니다 (목표 수 유지)">종료</button>
               <button type="button" class="slot-btn"
                 onclick="killSingleWorkerSlot('${escapeJsStr(wIdStr)}', '${escapeJsStr(w.name)}', '${escapeJsStr(pillHeaderLabel)}', true, '${escapeJsStr(jf.jobId)}')"
-                title="이 슬롯(#${escapeHtml(wIdStr)})을 종료하고 목표 워커 수를 -1 줄입니다">-1 삭제</button>
+                title="이 슬롯(#${escapeHtml(wIdStr)})을 종료하고 목표 워커 수를 -1 줄입니다">-1</button>
             </div>
           </div>
-          ${
-            reqTimeShort
-              ? `<span style="font-size:10px; color:var(--muted);">승인 ${escapeHtml(reqTimeShort)} → ${escapeHtml(doneTimeShort)} (${srcTag})</span>`
-              : `<span style="font-size:10px; color:var(--muted);">${escapeHtml(w.status)} · ${srcTag} · ${escapeHtml(w.name.slice(0, 14))}</span>`
-          }
+          <span style="font-size:10.5px; color:var(--muted);">${isRun ? "Running" : escapeHtml(w.status)} · ${srcTag}${doneTimeShort ? ` · ${escapeHtml(doneTimeShort)}` : ""}</span>
           ${progBadgeHtml}
           ${
             hasErr
-              ? `<span style="font-size:10px; color:var(--danger-text);">오류 감지: ${escapeHtml(w.logErrorKeyword || "Error")}</span>`
+              ? `<span style="font-size:10.5px; color:var(--danger-text);">오류 감지: ${escapeHtml(w.logErrorKeyword || "Error")}</span>`
               : logLineShort
-              ? `<span style="font-size:9.5px; color:var(--text-secondary); max-width:210px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(logLineShort)}</span>`
+              ? `<span style="font-size:10px; color:var(--text-secondary); max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(logLineShort)}</span>`
               : ""
           }
         </div>
@@ -1308,17 +1279,22 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         html: `
         <div class="slot-card mono ${isNext ? "st-next" : "st-wait"}"
           title="${isNext ? "다음 차례에 자동 생성될 워커 슬롯입니다" : "순차적으로 자동 생성 예정인 대기 슬롯입니다"}">
-          <span>워커 #${nextSlotNum} <span style="font-size:10.5px; opacity:0.85;">${isNext ? "(다음 생성)" : "(대기)"}</span></span>
-          <button type="button" class="slot-btn"
-            onclick="quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', { delta: -1 })"
-            title="대기 슬롯 1개를 줄여 목표 워커 수를 -1 차감합니다">-1</button>
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <span>워커 #${nextSlotNum}</span>
+            <div class="slot-actions" onclick="event.stopPropagation();">
+              <button type="button" class="slot-btn"
+                onclick="quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', { delta: -1 })"
+                title="목표 워커 수를 -1 줄입니다">-1</button>
+            </div>
+          </div>
+          <span style="font-size:10.5px; opacity:0.85;">${isNext ? "다음 생성 예정" : "순차 생성 대기"}</span>
         </div>
       `,
       });
     }
   }
 
-  // Also append unmatched active SPACE runs so all SPACE active runs are visible
+  // Append unmatched active SPACE runs so all SPACE active runs remain visible
   if (recon && Array.isArray(recon.unmatchedActiveRuns) && recon.unmatchedActiveRuns.length > 0) {
     for (const u of recon.unmatchedActiveRuns) {
       const uIdStr = String(u.id);
@@ -1329,40 +1305,42 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         sig: `${uIdStr}|${u.status}|${isSelected ? 1 : 0}|${isMine ? 1 : 0}|${u.coreCount}`,
         html: `
         <div class="slot-card mono st-other ${isSelected ? "is-selected" : ""}" onclick="viewRunLog('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}')"
-          title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(uIdStr)}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}">
-          <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
+          title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(uIdStr)}) · 계정: ${escapeHtml(u.userName)}">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
             ${
               isMine
-                ? `<label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0; color:var(--text);">
-                    <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(uIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:var(--accent); cursor:pointer;" />
-                    <span>기타(내 런) <b>${escapeHtml(u.name)}</b> <span style="color:var(--muted);">#${escapeHtml(uIdStr)}</span></span>
+                ? `<label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; margin:0; color:var(--text);">
+                    <input type="checkbox" class="slot-check" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(uIdStr)}', this.checked)" />
+                    <span>기타 <b>${escapeHtml(u.name)}</b> <span style="color:var(--muted);">#${escapeHtml(uIdStr)}</span></span>
                   </label>
-                  <button type="button" class="slot-btn"
-                    onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(uIdStr)}', false, '')"
-                    title="이 워크로드(#${escapeHtml(uIdStr)})를 종료합니다">종료</button>`
+                  <div class="slot-actions" onclick="event.stopPropagation();">
+                    <button type="button" class="slot-btn"
+                      onclick="killSingleWorkerSlot('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(uIdStr)}', false, '')"
+                      title="이 워크로드(#${escapeHtml(uIdStr)})를 종료합니다">종료</button>
+                  </div>`
                 : `<span>타유저(${escapeHtml(u.userName)}) <b>${escapeHtml(u.name)}</b> <span style="color:var(--muted);">#${escapeHtml(uIdStr)}</span></span>
-                  <span class="badge purple" style="font-size:10px; padding:1px 5px;">🔒보호</span>`
+                  <span class="badge purple" style="font-size:10px; padding:1px 6px;">🔒보호</span>`
             }
           </div>
-          <span style="font-size:10px; color:var(--muted);">${u.isRunning ? "Running" : escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
+          <span style="font-size:10.5px; color:var(--muted);">${u.isRunning ? "Running" : escapeHtml(u.status)} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
         </div>
       `,
       });
     }
   }
 
-  // Live 1-line Log & Progress Summary Rows for active workers that have scanned logs
+  // Live 1-line Log & Progress Summary Rows (collapsible, pure read-only)
   const workersWithLogs = activeWorkers.filter((w) => w.lastLogLine);
   const stragglerCount = activeWorkers.filter((w) => w.progress?.isStraggler).length;
   const liveLogSummaryHtml =
     workersWithLogs.length > 0
       ? `
-      <div class="card-subtle" style="margin-top:10px; padding:9px 12px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:6px;">
-          <span style="font-size:12px; font-weight:600; color:var(--text-secondary);">가동 워커 진행률 및 로그 요약 (${workersWithLogs.length}/${activeWorkers.length} 스캔${stragglerCount > 0 ? ` · 지연 ${stragglerCount}개` : ""})</span>
-          <span class="mono" style="font-size:11px; color:var(--muted);">Watchdog 교체: ${wd.zombieTerminatedCount || 0}건 · 로그 오류: ${wd.logErrorDetectedCount || 0}건</span>
-        </div>
-        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:6px; max-height:125px; overflow-y:auto;">
+      <details class="clean-details" style="margin-top:18px;">
+        <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <span>가동 워커 진행률 및 최근 로그 요약 (${workersWithLogs.length}/${activeWorkers.length} 스캔${stragglerCount > 0 ? ` · 지연 ${stragglerCount}개` : ""})</span>
+          <span class="mono txt-muted" style="font-size:11.5px; font-weight:400;">Watchdog 교체 ${wd.zombieTerminatedCount || 0}건 · 오류 감지 ${wd.logErrorDetectedCount || 0}건</span>
+        </summary>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:8px; max-height:150px; overflow-y:auto; margin-top:12px;">
           ${workersWithLogs
             .slice(0, 16)
             .map((w) => {
@@ -1380,66 +1358,30 @@ function renderWorkerFleetBoard(fleet, options = {}) {
                 : "";
               return `
             <div class="mono" onclick="viewRunLog('${escapeJsStr(String(w.id))}', '${escapeJsStr(w.name)}')"
-              style="cursor:pointer; font-size:11px; padding:4px 8px; border-radius:6px; background:${
+              style="cursor:pointer; font-size:11.5px; padding:6px 10px; border-radius:8px; background:${
                 w.hasLogError
                   ? "var(--danger-soft)"
                   : p?.isStraggler
                   ? "var(--warn-soft)"
-                  : "var(--panel)"
+                  : "var(--panel-subtle)"
               }; border:1px solid ${
                 w.hasLogError
                   ? "var(--danger-border)"
                   : p?.isStraggler
                   ? "var(--warn-border)"
                   : "var(--border)"
-              }; display:flex; align-items:center; gap:6px; overflow:hidden;">
+              }; display:flex; align-items:center; gap:8px; overflow:hidden;">
               <span style="color:${w.hasLogError ? "var(--danger-text)" : p?.isStraggler ? "var(--warn-text)" : "var(--success-text)"}; font-weight:600; flex-shrink:0;">슬롯#${w.assignedSlot || w.slotIndex} (#${escapeHtml(String(w.id))})</span>
-              ${pSummary ? `<span class="badge info" style="padding:1px 5px; font-size:10px; flex-shrink:0;">${escapeHtml(pSummary)}</span>` : ""}
+              ${pSummary ? `<span class="badge info" style="padding:1px 6px; font-size:10.5px; flex-shrink:0;">${escapeHtml(pSummary)}</span>` : ""}
               <span style="color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(w.lastLogLine)}</span>
             </div>
           `;
             })
             .join("")}
         </div>
-      </div>
+      </details>
     `
       : "";
-
-  // Cumulative GPU-Hours Telemetry & Time-Series Mini Bar Chart Board
-  const tsSeries = Array.isArray(tel.timeSeries) ? tel.timeSeries.slice(-24) : [];
-  const maxSeriesGpu = Math.max(1, targetGpus, ...tsSeries.map((pt) => Number(pt.runningGpus || 0)));
-  const miniBarsHtml =
-    tsSeries.length > 0
-      ? tsSeries
-          .map((pt) => {
-            const hPct = Math.max(10, Math.min(100, Math.round(((pt.runningGpus || 0) / maxSeriesGpu) * 100)));
-            return `<div title="${escapeHtml(pt.time || "")} — 가동 GPU: ${pt.runningGpus || 0}/${pt.targetGpus || targetGpus}장 (Running ${pt.runningWorkers || 0}개 · API ${pt.avgApiMs || 0}ms)" style="flex:1; min-width:5px; max-width:14px; height:${hPct}%; background:var(--accent); opacity:0.85; border-radius:2px 2px 0 0;"></div>`;
-          })
-          .join("")
-      : `<span class="hint" style="font-size:11px;">시계열 샘플 수집 중...</span>`;
-
-  const telemetryBoardHtml = `
-    <div class="card-subtle" style="margin-top:10px; padding:9px 12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-      <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
-        <div>
-          <div style="font-size:11px; color:var(--muted);">누적 GPU-Hours 가동 통계</div>
-          <div class="mono" style="font-size:14.5px; font-weight:700; color:var(--text);">
-            총 ${tel.totalGpuHours ?? 0} GPU-h <span style="font-size:11.5px; color:var(--muted); font-weight:500;">(오늘 ${tel.todayDate || ""}: ${tel.todayGpuHours ?? 0} GPU-h)</span>
-          </div>
-        </div>
-        <div style="display:flex; flex-direction:column; gap:2px;">
-          <span style="font-size:10.5px; color:var(--muted);">시간대별 가동 GPU 추이 (최근 ${tsSeries.length}샘플)</span>
-          <div style="display:flex; align-items:flex-end; gap:2px; height:26px; width:180px; padding:2px 4px; background:var(--code-bg); border-radius:4px; border:1px solid var(--border);">
-            ${miniBarsHtml}
-          </div>
-        </div>
-      </div>
-      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-        <button type="button" class="secondary sm" onclick="exportTelemetryReport('csv')">CSV 리포트</button>
-        <button type="button" class="secondary sm" onclick="exportTelemetryReport('json')">JSON 리포트</button>
-      </div>
-    </div>
-  `;
 
   let statusHeadline = "";
   let statusBadgeClass = "ok";
@@ -1447,223 +1389,205 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   if (excessActiveCnt > 0) {
     statusBadgeClass = "warn";
     statusBadgeLabel = `목표 초과 (${activeCnt}/${targetCnt})`;
-    statusHeadline = `현재 활성 <b>${activeCnt}개</b>(${activeGpus} GPU)가 목표 <b>${targetCnt}개</b>(${targetGpus} GPU)보다 <span class="txt-err"><b>+${excessActiveCnt}개</b></span> 초과 중입니다. 신규 생성은 일시 중단됩니다.`;
+    statusHeadline = `현재 활성 <b>${activeCnt}개</b>(${activeGpus} GPU)가 목표 <b>${targetCnt}개</b>(${targetGpus} GPU)보다 <span class="txt-err"><b>+${excessActiveCnt}개</b></span> 초과 중입니다.`;
   } else if (remainingCnt > 0) {
     statusBadgeClass = isAutoOn ? "info" : "warn";
-    statusBadgeLabel = isAutoOn ? `스케일업 진행 중 (${activeCnt}/${targetCnt})` : `자동 생성 일시정지 (${activeCnt}/${targetCnt})`;
+    statusBadgeLabel = isAutoOn ? `스케일업 진행 중` : `자동 생성 일시정지`;
     if (isAutoOn) {
-      statusHeadline = `현재 Running <b>${runningCnt}개</b> · 대기 ${pendingCnt}개 → 목표 <b>${targetCnt}개</b>(${targetGpus} GPU)까지 <span class="txt-accent"><b>+${remainingCnt}개</b></span>(+${remainingGpus} GPU) 순차 생성 예정`;
+      statusHeadline = `목표 <b>${targetCnt}개</b>(${targetGpus} GPU)까지 <span class="txt-accent"><b>+${remainingCnt}개</b></span>(+${remainingGpus} GPU) 순차 생성 예정`;
     } else {
-      statusHeadline = `현재 Running <b>${runningCnt}개</b> · 대기 ${pendingCnt}개 (미달 +${remainingCnt}개) — 자동 생성이 일시정지(OFF) 상태입니다.`;
+      statusHeadline = `현재 Running <b>${runningCnt}개</b> · 대기 ${pendingCnt}개 (미달 +${remainingCnt}개) — 자동 생성 OFF 상태`;
     }
   } else if (runningCnt < targetCnt) {
     statusBadgeClass = "warn";
-    statusBadgeLabel = `노드 배정 대기 (${runningCnt}/${targetCnt} Running)`;
-    statusHeadline = `실제 가동 <b>${runningCnt}개</b>(${runningGpus} GPU) · 클러스터 대기 <span class="txt-warn"><b>${pendingCnt}개</b></span>(${pendingGpus} GPU) — 목표 <b>${targetCnt}개</b>(${targetGpus} GPU) 범위 내 운영 중`;
+    statusBadgeLabel = `노드 배정 대기`;
+    statusHeadline = `실제 가동 <b>${runningCnt}개</b>(${runningGpus} GPU) · 클러스터 대기 <span class="txt-warn"><b>${pendingCnt}개</b></span>(${pendingGpus} GPU)`;
   } else {
     statusBadgeClass = "ok";
-    statusBadgeLabel = `목표 달성 (${runningCnt}/${targetCnt} Running)`;
-    statusHeadline = `목표 워커 <b>${targetCnt}개</b>(${targetGpus} GPU)가 정상 가동 중입니다${pendingCnt > 0 ? ` (대기 ${pendingCnt}개)` : ""}. 종료 시 목표 범위 내에서 자동 보충됩니다.`;
+    statusBadgeLabel = `정상 가동 중`;
+    statusHeadline = `목표 워커 <b>${targetCnt}개</b>(${targetGpus} GPU) 가동 중${pendingCnt > 0 ? ` (대기 ${pendingCnt}개)` : ""} · 종료 시 자동 보충`;
   }
 
-  // Ensure persistent skeleton inside #workerFleetPanel so we never destroy scroll positions, hover states, or <details>
-  if (panel.getAttribute("data-wf-skeleton") !== "1") {
-    panel.setAttribute("data-wf-skeleton", "1");
+  // Persistent skeleton inside #workerFleetPanel
+  if (panel.getAttribute("data-wf-skeleton") !== "2") {
+    panel.setAttribute("data-wf-skeleton", "2");
     panel.innerHTML = `
-      <div id="wfMultiRuleTabs"></div>
-      <div id="wfReconciliationBar"></div>
       <div id="wfHeadlineSection"></div>
       <div id="wfMetricCardsSection"></div>
-      <div id="wfProgressBarSection"></div>
+      <div id="wfReconciliationBar"></div>
+      <div id="wfSlotHeaderBar"></div>
       <div id="wfSlotSelectionBar"></div>
       <div id="wfSlotPillsGrid"
+        class="slot-grid"
         onmouseenter="setSlotGridHover(true)"
-        onmouseleave="setSlotGridHover(false)"
-        style="display:flex; flex-wrap:wrap; gap:6px; max-height:240px; overflow-y:auto; padding-top:4px;"></div>
-      <details id="wfAdvancedDetails" class="clean-details" style="margin-top:12px;">
-        <summary>
-          무인 운영 보조 도구 및 통계 (Watchdog · 슬롯 샤딩 · 폴백 · 야간 부스트 · 로그 스캔 · GPU-Hours)
-        </summary>
-        <div id="wfAutomationToggles"></div>
-        <div id="wfLiveLogSummary"></div>
-        <div id="wfTelemetryBoard"></div>
-      </details>
+        onmouseleave="setSlotGridHover(false)"></div>
+      <div id="wfLiveLogSummary"></div>
     `;
   }
 
-  // 1. Multi-rule tabs (only update when job counts/focus change)
-  const multiTabsSig = fleet.jobs
-    .map((it) => `${it.jobId}:${it.enabled}:${it.runningCount}:${it.pendingCount}:${it.targetCount}:${String(it.jobId) === String(jf.jobId)}`)
-    .join(";");
-  updateHtmlIfSigChanged(document.getElementById("wfMultiRuleTabs"), multiTabsSig, multiRuleTabsHtml);
+  // 1. Headline section (Rule Switcher + Status + Essential Instant Actions ONLY)
+  const ruleSelectorHtml =
+    fleet.jobs.length > 1
+      ? `<select onchange="selectFleetJobTab(this.value)" style="width:auto; min-width:160px; font-weight:600; padding:6px 10px;">
+          ${fleet.jobs
+            .map(
+              (item) =>
+                `<option value="${escapeHtml(item.jobId)}" ${String(item.jobId) === String(jf.jobId) ? "selected" : ""}>
+                  ${item.enabled ? "●" : "○"} ${escapeHtml(item.jobName)} (${item.runningCount ?? 0}/${item.targetCount})
+                </option>`
+            )
+            .join("")}
+        </select>`
+      : `<span class="badge mono" style="font-size:12.5px; padding:5px 11px;">규칙: <b>${escapeHtml(jf.jobName || "기본")}</b></span>`;
 
-  // 2. SPACE Reconciliation Bar (only update when counts or unmatched run IDs/statuses change)
-  const reconSig = recon
-    ? [
-        jf.jobName,
-        runningCnt,
-        pendingCnt,
-        activeCnt,
-        targetCnt,
-        targetGpus,
-        excessActiveCnt,
-        excessPendingCnt,
-        recon.mySpaceRunningWorkers,
-        recon.mySpacePendingWorkers,
-        recon.mySpaceActiveWorkers,
-        recon.spaceTotalRunningWorkers,
-        recon.spaceTotalPendingWorkers,
-        recon.spaceTotalActiveWorkers,
-        (recon.myUnmatchedActiveRuns || []).map((u) => `${u.id}:${u.status}`).join(","),
-        (recon.otherUserActiveRuns || []).map((u) => `${u.id}:${u.status}`).join(","),
-      ].join("|")
-    : "none";
-  updateHtmlIfSigChanged(document.getElementById("wfReconciliationBar"), reconSig, reconciliationBarHtml);
-
-  // 3. Headline section
-  const headlineSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${isAutoOn}|${intervalSec}`;
+  const headlineSig = `${jf.jobId}|${jf.enabled}|${fleet.jobs.length}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${remainingCnt}|${excessActiveCnt}|${isAutoOn}|${intervalSec}`;
   const headlineHtml = `
-    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:16px; margin-bottom:22px; padding-bottom:18px; border-bottom:1px solid var(--border);">
       <div>
-        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-          <span class="badge ${statusBadgeClass}" style="font-size:12px; padding:4px 10px;">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          ${ruleSelectorHtml}
+          <span class="badge ${statusBadgeClass}" style="font-size:12px; padding:5px 11px;">
             ${statusBadgeLabel}
           </span>
-          <span style="font-size:13.5px; color:var(--text);">${statusHeadline}</span>
+          <span style="font-size:14px; color:var(--text);">${statusHeadline}</span>
         </div>
-        <div id="workerFleetCountdownBadge" class="mono" style="margin-top:6px; font-size:12px; color:var(--muted);"></div>
+        <div id="workerFleetCountdownBadge" class="mono" style="margin-top:8px; font-size:12.5px; color:var(--muted);"></div>
       </div>
       <div class="btn-row">
-        <button type="button" class="soft-success sm" onclick="spawnExtraWorkers('${escapeHtml(jf.jobId)}', 1)">+1 생성</button>
-        <button type="button" class="soft-success sm" onclick="spawnExtraWorkers('${escapeHtml(jf.jobId)}', 4)">+4 생성</button>
-        ${
-          excessPendingCnt > 0
-            ? `<button type="button" class="warn sm" onclick="bulkControlWorkers('trim_excess_pending', { jobId: '${escapeHtml(jf.jobId)}' })">초과 Pending(+${excessPendingCnt}) 정리</button>`
-            : ""
-        }
+        <button type="button" class="${jf.enabled !== false ? "soft-success" : "secondary"} sm"
+          onclick="toggleJobEnabled('${escapeJsStr(jf.jobId)}', ${jf.enabled === false ? "true" : "false"})"
+          title="이 규칙의 주기적 자동 생성을 즉시 켜거나 일시정지합니다">
+          ${jf.enabled !== false ? "● 자동 생성 ON" : "○ 자동 생성 일시정지"}
+        </button>
+        <button type="button" class="sm" onclick="spawnExtraWorkers('${escapeJsStr(jf.jobId)}', 1)">+1 즉시 생성</button>
         ${
           excessActiveCnt > 0
-            ? `<button type="button" class="danger sm" onclick="bulkControlWorkers('trim_to_target', { jobId: '${escapeHtml(jf.jobId)}' })">초과분(+${excessActiveCnt}) 정리</button>`
+            ? `<button type="button" class="danger sm" onclick="bulkControlWorkers('trim_to_target', { jobId: '${escapeJsStr(jf.jobId)}' })">초과분(+${excessActiveCnt}) 정리</button>`
             : ""
         }
-        <button type="button" class="secondary sm" onclick="bulkControlWorkers('stop_pending')">Pending(${pendingCnt}) 취소</button>
-        <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all')">전체 종료</button>
       </div>
     </div>
   `;
   updateHtmlIfSigChanged(document.getElementById("wfHeadlineSection"), headlineSig, headlineHtml);
 
-  // 4. Metric & Quick Control Cards section
-  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${targetPendingCnt}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}`;
+  // 2. 4 Spacious KPI & Instant-Override Cards (Zero preset chip clutter)
+  const presetIntervals = [15, 30, 60, 120, 180, 300, 600, 900, 1800];
+  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${targetPendingCnt}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}|${runningPct}|${pendingPct}|${recon?.mySpaceActiveWorkers ?? ""}|${recon?.spaceTotalActiveWorkers ?? ""}`;
   const metricHtml = `
     <div class="kpi-grid">
+      <!-- Card 1: Running Workers / Target + Progress Bar -->
       <div class="kpi-card">
         <div class="kpi-label">
-          <span>실제 가동 (Running) / 목표</span>
-          <span class="badge ok">${runningGpus} / ${targetGpus} GPU</span>
+          <span>가동 워커 / 목표</span>
+          <span class="badge ok mono">${runningGpus} / ${targetGpus} GPU</span>
         </div>
         <div class="kpi-value mono">
-          <span class="txt-ok">${runningCnt}</span> <span style="font-size:14px; font-weight:500; color:var(--muted);">/ ${targetCnt} 워커</span>
+          <span class="txt-ok">${runningCnt}</span>
+          <span style="font-size:15px; font-weight:500; color:var(--muted);">/ ${targetCnt} 워커 (${runningPct}%)</span>
+        </div>
+        <div class="progress-track" style="margin:2px 0;">
+          <div class="progress-fill-run" style="width:${runningPct}%;" title="Running: ${runningCnt}개"></div>
+          <div class="progress-fill-pend" style="width:${pendingPct}%;" title="Pending: ${pendingCnt}개"></div>
         </div>
         <div class="kpi-sub">
-          대기(Pending): <b class="txt-warn">${pendingCnt}개${targetPendingCnt > 0 ? `/${targetPendingCnt}` : ""}</b> (${pendingGpus} GPU) · 전체 활성 <b>${activeCnt}개</b> (${activeGpus} GPU)
+          전체 활성 <b>${activeCnt}개</b> (${activeGpus} GPU) · 워커당 ${gpusPerWorker} GPU
         </div>
       </div>
 
+      <!-- Card 2: Queue & Cluster Reconciliation Summary -->
       <div class="kpi-card">
         <div class="kpi-label">
-          <span>${
-            excessActiveCnt > 0
-              ? "목표 초과 상태"
-              : targetPendingCnt > 0
-              ? `Pending 목표 유지 (${targetPendingCnt}개)`
-              : remainingCnt > 0
-              ? "자동 생성 예정"
-              : "대기열 상태"
-          }</span>
+          <span>대기열 · 클러스터 현황</span>
+          ${
+            recon
+              ? `<span class="badge mono">그룹 총 ${recon.spaceTotalActiveWorkers}개</span>`
+              : `<span class="badge mono">대기 ${pendingCnt}개</span>`
+          }
         </div>
         <div class="kpi-value mono ${
           excessActiveCnt > 0 ? "txt-err" : remainingCnt > 0 ? "txt-accent" : pendingCnt > 0 ? "txt-warn" : "txt-ok"
         }">
           ${
             excessActiveCnt > 0
-              ? `+${excessActiveCnt} 초과 <span style="font-size:12.5px; font-weight:500; color:var(--muted);">(${excessActiveGpus} GPU)</span>`
+              ? `+${excessActiveCnt} 초과 <span style="font-size:13px; font-weight:500; color:var(--muted);">(${excessActiveGpus}G)</span>`
               : remainingCnt > 0
-              ? `+${remainingCnt} 예정 <span style="font-size:12.5px; font-weight:500; color:var(--muted);">(${remainingGpus} GPU)</span>`
+              ? `+${remainingCnt} 생성 예정 <span style="font-size:13px; font-weight:500; color:var(--muted);">(${remainingGpus}G)</span>`
               : pendingCnt > 0
-              ? `대기 ${pendingCnt}개 <span style="font-size:12.5px; font-weight:500; color:var(--muted);">(${
-                  excessPendingCnt > 0 ? `초과 +${excessPendingCnt}` : "노드 배정 대기"
-                })</span>`
-              : `목표 충족 <span style="font-size:12.5px; font-weight:500; color:var(--muted);">(${targetCnt}개 · ${targetGpus} GPU)</span>`
+              ? `대기 ${pendingCnt}개 <span style="font-size:13px; font-weight:500; color:var(--muted);">(${pendingGpus}G)</span>`
+              : `대기 없음 <span style="font-size:13px; font-weight:500; color:var(--muted);">(목표 충족)</span>`
           }
         </div>
         <div class="kpi-sub">
           ${
-            excessActiveCnt > 0
-              ? `목표 상한(${targetCnt}개·${targetGpus}G) 도달로 추가 생성 일시 중지`
-              : remainingCnt > 0
-              ? `${
-                  intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분` : `${intervalSec}초`
-                } 간격으로 순차 신청 · 약 ${Math.max(1, Math.ceil((remainingCnt * intervalSec) / 60))}분 소요`
-              : pendingCnt > 0
-              ? `신청 완료 · 클러스터 유휴 GPU 배정 시 Running 전환`
-              : `추가 대기 없음 · 워커 종료 시 자동 보충`
+            recon
+              ? `내 계정(${escapeHtml(recon.currentUserName || "me")}) <b>${recon.mySpaceRunningWorkers}</b> 가동 · <b>${recon.mySpacePendingWorkers}</b> 대기<br/>클러스터 그룹 전체 <b>${recon.spaceTotalRunningWorkers}</b> 가동 (${recon.spaceTotalRunningGpus} GPU)`
+              : `신청 완료 워크로드는 유휴 노드 확보 시 자동으로 Running 전환됩니다.`
           }
         </div>
       </div>
 
-      <div class="kpi-card">
+      <!-- Card 3: Instant Target Override (Workers / Total GPUs) -->
+      <div class="kpi-card quick-edit">
         <div class="kpi-label">
-          <span>목표 워커 / 총 GPU 빠른 설정</span>
-          <span class="mono" style="font-size:11px; color:var(--muted);">워커당 ${gpusPerWorker}G</span>
+          <span>목표 수량 즉시 조정</span>
+          <span class="mono" style="font-size:11.5px; color:var(--muted);">즉시 반영</span>
         </div>
-        <div style="display:flex; align-items:center; gap:4px; flex-wrap:wrap;">
-          <span class="mono" style="font-size:14px; font-weight:700; color:var(--text); min-width:52px;">${targetCnt}워커</span>
-          <button type="button" class="chip-btn" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: -4 })">-4</button>
-          <button type="button" class="chip-btn" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', { delta: 4 })">+4</button>
-          <button type="button" class="chip-btn ${targetCnt === 30 ? "active" : ""}" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 30)">30</button>
-          <button type="button" class="chip-btn ${targetCnt === 48 ? "active" : ""}" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 48)">48</button>
-          <button type="button" class="chip-btn ${targetCnt === 60 ? "active" : ""}" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', 60)">60</button>
-          <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', Number(this.value || 1)); }" style="width:58px; padding:3px 6px; font-size:12px;" />
-          <button type="button" class="sm" style="padding:3px 8px;" onclick="quickUpdateTargetWorkers('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetInput').value || 1))">적용</button>
+        <div class="quick-row">
+          <span class="quick-row-label">목표 워커 수</span>
+          <div class="quick-row-controls">
+            <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}"
+              onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', Number(this.value || 1)); }"
+              style="width:82px; padding:6px 9px; font-size:13px;" />
+            <button type="button" class="sm" onclick="quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetInput').value || 1))">적용</button>
+          </div>
         </div>
-        <div style="display:flex; align-items:center; gap:4px; padding-top:5px; border-top:1px solid var(--border); flex-wrap:wrap;">
-          <span class="mono txt-ok" style="font-size:14px; font-weight:700; min-width:52px;">${targetGpus}G</span>
-          <button type="button" class="chip-btn" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', { delta: -${gpusPerWorker * 4} })">-${gpusPerWorker * 4}</button>
-          <button type="button" class="chip-btn" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', { delta: ${gpusPerWorker * 4} })">+${gpusPerWorker * 4}</button>
-          <button type="button" class="chip-btn ${targetGpus === 120 ? "active" : ""}" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', 120)">120G</button>
-          <button type="button" class="chip-btn ${targetGpus === 160 ? "active" : ""}" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', 160)">160G</button>
-          <button type="button" class="chip-btn ${targetGpus === 240 ? "active" : ""}" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', 240)">240G</button>
-          <input type="number" id="quickTargetGpusInput" class="mono" min="1" max="99999" value="${targetGpus}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', Number(this.value || 1)); }" style="width:62px; padding:3px 6px; font-size:12px;" />
-          <button type="button" class="soft-success sm" style="padding:3px 8px;" onclick="quickUpdateTargetGpus('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetGpusInput').value || 1))">적용</button>
+        <div class="quick-row" style="padding-top:10px; border-top:1px solid var(--border);">
+          <span class="quick-row-label">목표 총 GPU</span>
+          <div class="quick-row-controls">
+            <input type="number" id="quickTargetGpusInput" class="mono" min="1" max="99999" value="${targetGpus}"
+              onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetGpus('${escapeJsStr(jf.jobId)}', Number(this.value || 1)); }"
+              style="width:82px; padding:6px 9px; font-size:13px;" />
+            <button type="button" class="soft-success sm" onclick="quickUpdateTargetGpus('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetGpusInput').value || 1))">적용</button>
+          </div>
         </div>
       </div>
 
-      <div class="kpi-card">
+      <!-- Card 4: Instant Spawn Interval & Pending Maintenance Override -->
+      <div class="kpi-card quick-edit">
         <div class="kpi-label">
-          <span>생성 간격 · Pending 대기 수</span>
-          <span class="mono" style="font-size:11px; color:var(--accent-text);">${
+          <span>생성 주기 · 대기 유지</span>
+          <span class="mono" style="font-size:11.5px; color:var(--accent-text);">${
             intervalSec >= 60 && intervalSec % 60 === 0 ? `${intervalSec / 60}분` : `${intervalSec}초`
           } 주기</span>
         </div>
-        <div style="display:flex; align-items:center; gap:4px; flex-wrap:wrap;">
-          <button type="button" class="chip-btn ${intervalSec === 15 ? "active" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 15)">15초</button>
-          <button type="button" class="chip-btn ${intervalSec === 60 ? "active" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 60)">1분</button>
-          <button type="button" class="chip-btn ${intervalSec === 180 ? "active" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 180)">3분</button>
-          <button type="button" class="chip-btn ${intervalSec === 300 ? "active" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 300)">5분</button>
-          <button type="button" class="chip-btn ${intervalSec === 600 ? "active" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 600)">10분</button>
-          <button type="button" class="chip-btn ${intervalSec === 1800 ? "active" : ""}" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', 1800)">30분</button>
-          <input type="number" id="quickIntervalInput" class="mono" min="1" max="86400" value="${intervalSec}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', Number(this.value || 15)); }" style="width:56px; padding:3px 6px; font-size:12px;" title="초 단위 직접 입력" />
-          <button type="button" class="secondary sm" style="padding:3px 7px;" onclick="quickUpdateSpawnInterval('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickIntervalInput').value || 15))">주기</button>
+        <div class="quick-row">
+          <span class="quick-row-label">생성 간격</span>
+          <div class="quick-row-controls">
+            <select onchange="if(this.value) quickUpdateSpawnInterval('${escapeJsStr(jf.jobId)}', Number(this.value))" style="width:92px; padding:6px 8px; font-size:12.5px;">
+              ${!presetIntervals.includes(intervalSec) ? `<option value="${intervalSec}" selected>${intervalSec}초</option>` : ""}
+              <option value="15" ${intervalSec === 15 ? "selected" : ""}>15초</option>
+              <option value="30" ${intervalSec === 30 ? "selected" : ""}>30초</option>
+              <option value="60" ${intervalSec === 60 ? "selected" : ""}>1분</option>
+              <option value="120" ${intervalSec === 120 ? "selected" : ""}>2분</option>
+              <option value="180" ${intervalSec === 180 ? "selected" : ""}>3분</option>
+              <option value="300" ${intervalSec === 300 ? "selected" : ""}>5분</option>
+              <option value="600" ${intervalSec === 600 ? "selected" : ""}>10분</option>
+              <option value="900" ${intervalSec === 900 ? "selected" : ""}>15분</option>
+              <option value="1800" ${intervalSec === 1800 ? "selected" : ""}>30분</option>
+            </select>
+            <input type="number" id="quickIntervalInput" class="mono" min="1" max="86400" value="${intervalSec}"
+              onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateSpawnInterval('${escapeJsStr(jf.jobId)}', Number(this.value || 15)); }"
+              style="width:68px; padding:6px 8px; font-size:12.5px;" title="초 단위 직접 입력 후 Enter" />
+          </div>
         </div>
-        <div style="display:flex; align-items:center; gap:4px; padding-top:5px; border-top:1px solid var(--border); flex-wrap:wrap;">
-          <span style="font-size:11.5px; color:var(--muted); margin-right:2px;">Pending유지</span>
-          <button type="button" class="chip-btn ${targetPendingCnt === 0 ? "active" : ""}" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 0)" title="0=해제 (총 목표 수 기준 운영)">자동(0)</button>
-          <button type="button" class="chip-btn ${targetPendingCnt === 2 ? "active" : ""}" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 2)">2</button>
-          <button type="button" class="chip-btn ${targetPendingCnt === 5 ? "active" : ""}" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 5)">5</button>
-          <button type="button" class="chip-btn ${targetPendingCnt === 10 ? "active" : ""}" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', 10)">10</button>
-          <input type="number" id="quickTargetPendingInput" class="mono" min="0" max="9999" value="${targetPendingCnt}" onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetPending('${escapeHtml(jf.jobId)}', Number(this.value || 0)); }" style="width:50px; padding:3px 6px; font-size:12px;" title="유지할 목표 Pending 대기 개수 (0=해제)" />
-          <button type="button" class="secondary sm" style="padding:3px 7px;" onclick="quickUpdateTargetPending('${escapeHtml(jf.jobId)}', Number(document.getElementById('quickTargetPendingInput').value || 0))">적용</button>
+        <div class="quick-row" style="padding-top:10px; border-top:1px solid var(--border);">
+          <span class="quick-row-label" title="0이면 자동 해제, 1 이상이면 전체 목표 상한 내에서 지정한 대기 수를 유지합니다">Pending 유지</span>
+          <div class="quick-row-controls">
+            <input type="number" id="quickTargetPendingInput" class="mono" min="0" max="9999" value="${targetPendingCnt}"
+              onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetPending('${escapeJsStr(jf.jobId)}', Number(this.value || 0)); }"
+              style="width:82px; padding:6px 9px; font-size:13px;" title="0=해제, 1 이상=유지할 Pending 대기 수" />
+            <button type="button" class="secondary sm" onclick="quickUpdateTargetPending('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetPendingInput').value || 0))">적용</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1679,30 +1603,42 @@ function renderWorkerFleetBoard(fleet, options = {}) {
     if (qIntEl && document.activeElement !== qIntEl) qIntEl.value = intervalSec;
   }
 
-  // 5. Dual Progress Bar (only update when percentages or load badge change)
-  const progSig = `${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${runningPct}|${pendingPct}|${fleet.loadMonitor?.loadBadgeText || ""}`;
-  const progHtml = `
-    <div style="margin-bottom:10px;">
-      <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:5px; flex-wrap:wrap; gap:6px;">
-        <span>가동 달성률: <b class="txt-ok">${runningCnt} / ${targetCnt} 워커 (${runningPct}%)</b> · 대기 <b class="txt-warn">${pendingCnt}개</b> (활성 ${activeCnt}/${targetCnt})</span>
-        <span>부하 보호: <b style="color:var(--text-secondary);">${escapeHtml(fleet.loadMonitor?.loadBadgeText || "쾌적")}</b> <span id="wfAvgApiSpan">(API ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms)</span></span>
-        <span id="wfGpuHoursSpan">누적 가동: <b style="color:var(--text-secondary);">${tel.totalGpuHours ?? 0} GPU-h</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)</span>
+  // 3. Unmatched runs bar (empty unless extra runs exist)
+  const reconSig = recon
+    ? [
+        (recon.myUnmatchedActiveRuns || []).map((u) => `${u.id}:${u.status}`).join(","),
+        (recon.otherUserActiveRuns || []).map((u) => `${u.id}:${u.status}`).join(","),
+      ].join("|")
+    : "none";
+  updateHtmlIfSigChanged(document.getElementById("wfReconciliationBar"), reconSig, reconciliationBarHtml);
+
+  // 4. Calm Slot Grid Header + Optional Bulk Manage Toolbar
+  const isManageVisible = isSlotManageOpen || selectedWorkerRunIds.size > 0;
+  const freezeBadgeStyle =
+    isSlotBoardFrozen || (autoFreezeOnSlotHover && isMouseOverSlotGrid) ? "display:inline-flex;" : "display:none;";
+  const freezeBadgeText = isSlotBoardFrozen ? "화면 수동 고정 중" : "마우스 오버 — 일시 고정됨";
+
+  const slotHeaderSig = `${activeWorkers.length}|${targetCnt}|${isManageVisible ? 1 : 0}|${selectedWorkerRunIds.size}|${isSlotBoardFrozen ? 1 : 0}`;
+  const slotHeaderHtml = `
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin:6px 0 12px;">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <span style="font-size:14px; font-weight:600; color:var(--text);">워커 슬롯 (${activeWorkers.length} / ${targetCnt})</span>
+        <span class="hint" style="margin:0;">클릭하면 아래에 실시간 로그가 열리며, 마우스를 올리면 개별 제어가 표시됩니다.</span>
+        <span id="wfSlotFreezeStatusBadge" class="badge warn mono" style="${freezeBadgeStyle} font-size:11px;">
+          ${freezeBadgeText}
+        </span>
       </div>
-      <div class="progress-track">
-        <div class="progress-fill-run" style="width:${runningPct}%;" title="실제 Running: ${runningCnt}개"></div>
-        <div class="progress-fill-pend" style="width:${pendingPct}%;" title="Pending 대기: ${pendingCnt}개"></div>
+      <div class="btn-row">
+        <button type="button" class="${isManageVisible ? "soft-success" : "secondary"} sm" onclick="toggleSlotManageMode()">
+          ${isManageVisible ? `슬롯 선택 닫기${selectedWorkerRunIds.size > 0 ? ` (${selectedWorkerRunIds.size})` : ""}` : "슬롯 선택 · 일괄 정리"}
+        </button>
       </div>
     </div>
   `;
-  if (!updateHtmlIfSigChanged(document.getElementById("wfProgressBarSection"), progSig, progHtml)) {
-    const apiEl = document.getElementById("wfAvgApiSpan");
-    if (apiEl) apiEl.textContent = `(API ${fleet.loadMonitor?.api?.avgLatencyMs ?? 0}ms)`;
-    const gpuEl = document.getElementById("wfGpuHoursSpan");
-    if (gpuEl) gpuEl.innerHTML = `누적 가동: <b style="color:var(--text-secondary);">${tel.totalGpuHours ?? 0} GPU-h</b> (오늘 ${tel.todayGpuHours ?? 0} GPU-h)`;
-  }
+  updateHtmlIfSigChanged(document.getElementById("wfSlotHeaderBar"), slotHeaderSig, slotHeaderHtml);
 
-  // 6. Slot Selection & Freeze Control Bar
   const slotBarSig = [
+    isManageVisible ? 1 : 0,
     jf.jobId,
     activeWorkers.length,
     runningCnt,
@@ -1710,121 +1646,58 @@ function renderWorkerFleetBoard(fleet, options = {}) {
     excessPendingCnt,
     selectedWorkerRunIds.size,
     instantKillWithoutConfirm ? 1 : 0,
-    autoFreezeOnSlotHover ? 1 : 0,
     isSlotBoardFrozen ? 1 : 0,
   ].join("|");
-  const freezeBadgeStyle =
-    isSlotBoardFrozen || (autoFreezeOnSlotHover && isMouseOverSlotGrid) ? "display:inline-flex;" : "display:none;";
-  const freezeBadgeText = isSlotBoardFrozen
-    ? "슬롯 수동 고정 중"
-    : "마우스 오버 — 일시 고정됨";
-  const slotBarHtml = `
-    <div class="slot-toolbar">
-      <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap; font-size:11.5px;">
-        <span style="font-weight:600; color:var(--muted);">슬롯 선택</span>
-        <button type="button" class="chip-btn" onclick="selectWorkerGroup('all', '${escapeHtml(jf.jobId)}')">전체(${activeWorkers.length})</button>
-        <button type="button" class="chip-btn" onclick="selectWorkerGroup('running', '${escapeHtml(jf.jobId)}')">Running(${runningCnt})</button>
-        <button type="button" class="chip-btn" onclick="selectWorkerGroup('pending', '${escapeHtml(jf.jobId)}')">Pending(${pendingCnt})</button>
-        ${
-          excessPendingCnt > 0
-            ? `<button type="button" class="chip-btn active" onclick="selectWorkerGroup('excess', '${escapeHtml(jf.jobId)}')">초과Pending(+${excessPendingCnt})</button>`
-            : ""
-        }
-        <button type="button" class="chip-btn" onclick="selectWorkerGroup('problem', '${escapeHtml(jf.jobId)}')">오류·지연</button>
-        <button type="button" class="chip-btn" onclick="selectWorkerGroup('none', '${escapeHtml(jf.jobId)}')">해제</button>
-
-        <div style="display:inline-flex; align-items:center; gap:4px; margin-left:3px;">
-          <input type="text" id="slotRangeKillInput" class="mono"
-            placeholder="슬롯번호 (예: 1, 5, 58-62, #353028)"
-            value="${escapeHtml(slotSpecDraftText)}"
-            oninput="slotSpecDraftText = this.value"
-            onkeydown="if(event.key==='Enter'){ event.preventDefault(); applySlotSpecSelection('${escapeHtml(jf.jobId)}'); }"
-            style="width:190px; padding:3px 7px; font-size:11.5px;" />
-          <button type="button" class="chip-btn"
-            onclick="applySlotSpecSelection('${escapeHtml(jf.jobId)}')"
-            title="입력한 슬롯 번호(예: 1, 5, 58-62) 또는 #RunID를 선택합니다">번호 선택</button>
-        </div>
-
-        <span id="wfSlotFreezeStatusBadge" class="badge warn mono" style="${freezeBadgeStyle} font-size:10.5px;">
-          ${freezeBadgeText}
-        </span>
+  const slotBarHtml = isManageVisible
+    ? `
+    <div class="slot-toolbar" style="margin-bottom:14px;">
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:12px;">
+        <button type="button" class="chip-btn" onclick="selectWorkerGroup('all', '${escapeJsStr(jf.jobId)}')">전체(${activeWorkers.length})</button>
+        <button type="button" class="chip-btn" onclick="selectWorkerGroup('running', '${escapeJsStr(jf.jobId)}')">Running(${runningCnt})</button>
+        <button type="button" class="chip-btn" onclick="selectWorkerGroup('pending', '${escapeJsStr(jf.jobId)}')">Pending(${pendingCnt})</button>
+        <button type="button" class="chip-btn" onclick="selectWorkerGroup('none', '${escapeJsStr(jf.jobId)}')">선택 해제</button>
+        <input type="text" id="slotRangeKillInput" class="mono"
+          placeholder="슬롯번호 (예: 1, 5, 10-15, #RunID)"
+          value="${escapeHtml(slotSpecDraftText)}"
+          oninput="slotSpecDraftText = this.value"
+          onkeydown="if(event.key==='Enter'){ event.preventDefault(); applySlotSpecSelection('${escapeJsStr(jf.jobId)}'); }"
+          style="width:195px; padding:4px 8px; font-size:12px;" />
+        <button type="button" class="chip-btn" onclick="applySlotSpecSelection('${escapeJsStr(jf.jobId)}')">번호 선택</button>
       </div>
 
-      <div style="display:flex; align-items:center; gap:7px; flex-wrap:wrap;">
-        <label style="display:inline-flex; align-items:center; gap:4px; font-size:11.5px; color:var(--muted); cursor:pointer; margin:0;" title="슬롯 영역에 마우스를 올리면 새로고침 중에도 위치가 움직이지 않도록 자동 고정합니다">
-          <input type="checkbox" ${autoFreezeOnSlotHover ? "checked" : ""} onchange="toggleAutoFreezeOnSlotHover(this.checked)" style="width:13px; height:13px; margin:0; accent-color:var(--accent);" />
-          마우스 오버 고정
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <label style="display:inline-flex; align-items:center; gap:5px; font-size:12px; color:var(--muted); cursor:pointer; margin:0;">
+          <input type="checkbox" ${instantKillWithoutConfirm ? "checked" : ""} onchange="toggleInstantKillMode(this.checked)" style="width:14px; height:14px; margin:0; accent-color:var(--danger);" />
+          확인 없이 종료
         </label>
-        <button type="button" class="chip-btn ${isSlotBoardFrozen ? "active" : ""}"
-          onclick="toggleSlotBoardFreeze()" title="슬롯 화면을 수동으로 일시 고정합니다">
-          ${isSlotBoardFrozen ? "고정 해제" : "화면 고정"}
-        </button>
-        <label style="display:inline-flex; align-items:center; gap:4px; font-size:11.5px; color:var(--muted); cursor:pointer; margin:0;" title="체크 시 각 슬롯의 종료 클릭 시 확인 창 없이 바로 종료합니다">
-          <input type="checkbox" ${instantKillWithoutConfirm ? "checked" : ""} onchange="toggleInstantKillMode(this.checked)" style="width:13px; height:13px; margin:0; accent-color:var(--danger);" />
-          확인 없이 즉시 종료
-        </label>
-        <button type="button" class="danger sm"
-          onclick="executeSelectedWorkersKill(false, '${escapeHtml(jf.jobId)}')"
-          title="선택한 슬롯을 종료합니다 (목표 워커 수 유지)">
+        <button type="button" class="danger sm" onclick="executeSelectedWorkersKill(false, '${escapeJsStr(jf.jobId)}')">
           선택 종료 (${selectedWorkerRunIds.size})
         </button>
-        <button type="button" class="secondary sm"
-          onclick="executeSelectedWorkersKill(true, '${escapeHtml(jf.jobId)}')"
-          title="선택한 슬롯을 종료하고 종료한 수만큼 목표 워커 수도 함께 줄입니다">
+        <button type="button" class="secondary sm" onclick="executeSelectedWorkersKill(true, '${escapeJsStr(jf.jobId)}')">
           선택 삭제 · 목표 차감 (${selectedWorkerRunIds.size})
         </button>
+        ${
+          pendingCnt > 0
+            ? `<button type="button" class="secondary sm" onclick="bulkControlWorkers('stop_pending')">Pending 전체 취소</button>`
+            : ""
+        }
+        <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all')">전체 워커 종료</button>
       </div>
     </div>
-  `;
+  `
+    : "";
   updateHtmlIfSigChanged(document.getElementById("wfSlotSelectionBar"), slotBarSig, slotBarHtml);
 
-  // 7. Keyed Per-Slot DOM Patching (Unchanged slots are NEVER redrawn; paused while hovering or frozen)
+  // 5. Keyed Per-Slot DOM Patching
   const slotGridEl = document.getElementById("wfSlotPillsGrid");
+  if (slotGridEl) {
+    slotGridEl.classList.toggle("slot-manage-open", isManageVisible);
+  }
   patchSlotPillsGrid(slotGridEl, slotPills, Boolean(options.force));
 
-  // 8. Advanced details sub-sections (preserves <details> open/closed state!)
-  const autoTogglesSig = `${wd.enabled}|${wd.zombieTerminatedCount || 0}|${shardingOn}|${hf.enabled}|${ts.enabled}|${bng.enabled}|${pipe.autoStopOnComplete}`;
-  const autoTogglesHtml = `
-    <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11.5px;">
-        <button type="button" class="chip-btn ${wd.enabled !== false ? "active" : ""}"
-          onclick="quickUpdateAutomation({ watchdogEnabled: ${wd.enabled === false ? "true" : "false"} })">
-          Watchdog: ${wd.enabled !== false ? `ON (교체 ${wd.zombieTerminatedCount || 0})` : "OFF"}
-        </button>
-        <button type="button" class="chip-btn ${shardingOn ? "active" : ""}"
-          onclick="quickUpdateAutomation({ injectWorkerEnv: ${shardingOn ? "false" : "true"} })">
-          WORKER_SLOT: ${shardingOn ? "ON" : "OFF"}
-        </button>
-        <button type="button" class="chip-btn ${hf.enabled !== false ? "active" : ""}"
-          onclick="quickUpdateAutomation({ hybridFallbackEnabled: ${hf.enabled === false ? "true" : "false"} })">
-          Spot↔Std 폴백: ${hf.enabled !== false ? "ON" : "OFF"}
-        </button>
-        <button type="button" class="chip-btn ${ts.enabled ? "active" : ""}"
-          onclick="quickUpdateAutomation({ timeScaleEnabled: ${ts.enabled ? "false" : "true"} })">
-          야간·주말 부스트: ${ts.enabled ? "ON" : "OFF"}
-        </button>
-        <button type="button" class="chip-btn ${bng.enabled !== false ? "active" : ""}"
-          onclick="quickUpdateAutomation({ badNodeGuardEnabled: ${bng.enabled === false ? "true" : "false"} })">
-          불량노드 가드: ${bng.enabled !== false ? "ON" : "OFF"}
-        </button>
-        <button type="button" class="chip-btn ${pipe.autoStopOnComplete !== false ? "active" : ""}"
-          onclick="quickUpdateAutomation({ autoStopOnComplete: ${pipe.autoStopOnComplete === false ? "true" : "false"} })">
-          완료 자동정지: ${pipe.autoStopOnComplete !== false ? "ON" : "OFF"}
-        </button>
-      </div>
-      <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
-        <button type="button" class="secondary sm" onclick="bulkControlWorkers('scan_logs')">전체 로그 스캔</button>
-        <button type="button" class="secondary sm" onclick="bulkControlWorkers('rolling_restart', { batchSize: 1 })">1개씩 롤링 재시작</button>
-      </div>
-    </div>
-  `;
-  updateHtmlIfSigChanged(document.getElementById("wfAutomationToggles"), autoTogglesSig, autoTogglesHtml);
-
+  // 6. Optional Live Log Progress Summary
   const liveLogSig = workersWithLogs.map((w) => `${w.id}:${w.hasLogError}:${w.lastLogLine}`).join("||");
   updateHtmlIfSigChanged(document.getElementById("wfLiveLogSummary"), liveLogSig, liveLogSummaryHtml);
-
-  const telSig = `${tel.totalGpuHours ?? 0}|${tel.todayGpuHours ?? 0}|${tsSeries.length}|${tsSeries[tsSeries.length - 1]?.time || ""}`;
-  updateHtmlIfSigChanged(document.getElementById("wfTelemetryBoard"), telSig, telemetryBoardHtml);
 
   updateWorkerCountdownBadge();
   if (!workerCountdownTimerId) {
@@ -2323,7 +2196,7 @@ function renderConfig(cfg, loopStats = null) {
     const userLabel = cfg.userName || cfg.resolvedUserName || cfg.jwtInfo.sub || "User";
     if (rem !== null && rem > 0) {
       jwtBadge.className = "badge ok";
-      jwtBadge.textContent = `[${siteLabel}] 인증됨 · ${userLabel} (${mins}분 남음)`;
+      jwtBadge.textContent = `인증됨 (${mins}m)`;
       if (monTokenBar) monTokenBar.style.display = "none";
       if (card1Banner) {
         card1Banner.style.background = "var(--success-soft)";
@@ -2334,7 +2207,7 @@ function renderConfig(cfg, loopStats = null) {
     } else {
       const expiredMins = mins !== null ? Math.abs(mins) : "?";
       jwtBadge.className = "badge err";
-      jwtBadge.textContent = `[${siteLabel}] 토큰 만료 (${expiredMins}분 전)`;
+      jwtBadge.textContent = `토큰 만료 (${expiredMins}m 전)`;
       if (monTokenBar && monTokenText) {
         monTokenBar.style.display = "flex";
         monTokenText.innerHTML = `<b>[${escapeHtml(siteLabel)}] 저장된 SPACE 인증 토큰이 만료되었습니다 (${expiredMins}분 전)</b> — 우측 버튼을 눌러 <code>${escapeHtml(siteHost)}</code> 새 토큰을 등록해 주세요.`;
@@ -2348,11 +2221,11 @@ function renderConfig(cfg, loopStats = null) {
     }
   } else if (cfg.hasAccessToken) {
     jwtBadge.className = "badge ok";
-    jwtBadge.textContent = `[${siteLabel}] Access Token 설정됨`;
+    jwtBadge.textContent = "토큰 설정됨";
     if (monTokenBar) monTokenBar.style.display = "none";
   } else {
     jwtBadge.className = "badge warn";
-    jwtBadge.textContent = `[${siteLabel}] 토큰 미설정`;
+    jwtBadge.textContent = "토큰 미설정";
     if (monTokenBar && monTokenText) {
       monTokenBar.style.display = "flex";
       monTokenText.innerHTML = `<b>[${escapeHtml(siteLabel)}] SPACE 토큰이 설정되지 않았습니다.</b> 우측 버튼을 눌러 설정 화면에서 <code>${escapeHtml(siteHost)}</code> 토큰을 등록해 주세요.`;
@@ -2365,15 +2238,15 @@ function renderConfig(cfg, loopStats = null) {
     }
   }
 
-  document.getElementById("groupBadge").textContent = `${activeProf.id.toUpperCase()} Group ID: ${cfg.groupId || "미설정"}`;
+  document.getElementById("groupBadge").textContent = `${activeProf.id.toUpperCase()} Group: ${cfg.groupId || "미설정"}`;
 
   const schedBadge = document.getElementById("schedBadge");
   if (cfg.schedulerEnabled) {
     schedBadge.className = "badge ok";
-    schedBadge.textContent = `스케줄러: ON (${cfg.checkIntervalSec || 15}초 주기)`;
+    schedBadge.textContent = "스케줄러 ON";
   } else {
     schedBadge.className = "badge err";
-    schedBadge.textContent = "스케줄러: 일시정지";
+    schedBadge.textContent = "스케줄러 OFF";
   }
 
   const approvalBadge = document.getElementById("approvalLoopBadge");
@@ -3324,10 +3197,10 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
     const rCnt = fleet.totalRunningWorkers ?? 0;
     const pCnt = fleet.totalPendingWorkers ?? 0;
     const tCnt = fleet.totalTargetWorkers ?? 0;
-    navMonBadge.textContent = `Running ${rCnt}/${tCnt}${pCnt > 0 ? ` (+${pCnt})` : ""}`;
+    navMonBadge.textContent = `${rCnt}/${tCnt}${pCnt > 0 ? `+${pCnt}` : ""}`;
   }
   if (navSetBadge) {
-    navSetBadge.textContent = `규칙 ${jobs.length}`;
+    navSetBadge.textContent = `${jobs.length}`;
   }
 
   if (!jobs.length) {
@@ -4477,6 +4350,10 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
   };
   const myActiveRuns = orderedActiveRuns.filter(isMyRun);
   const terminatedRuns = allRuns.filter((r) => classifyUiRunStatus(r.status ?? r.state ?? r.phase) !== "ACTIVE");
+  const navWorkloadsBadge = document.getElementById("navWorkloadsBadge");
+  if (navWorkloadsBadge) {
+    navWorkloadsBadge.textContent = `${orderedActiveRuns.length}`;
+  }
 
   if (filterBar) {
     const mkBtn = (mode, label) => {
@@ -4669,17 +4546,45 @@ async function loadSpaceRuns(options = {}) {
   }
 }
 
+function closeMonitorQuickLog() {
+  const quickCard = document.getElementById("monitorQuickLogCard");
+  if (quickCard) quickCard.style.display = "none";
+}
+
 async function viewRunLog(runId, name) {
   currentLogRunId = runId;
-  document.getElementById("logViewerTitle").textContent = `📜 컨테이너 실시간 로그 — #${runId} (${name || ""})`;
+  const titleText = `컨테이너 실시간 로그 — #${runId}${name ? ` (${name})` : ""}`;
+  const titleEl = document.getElementById("logViewerTitle");
+  if (titleEl) titleEl.textContent = titleText;
   const box = document.getElementById("runLogBox");
-  box.textContent = "로그 불러오는 중...";
+  if (box) box.textContent = "로그 불러오는 중...";
+
+  const quickCard = document.getElementById("monitorQuickLogCard");
+  const quickTitle = document.getElementById("monitorQuickLogTitle");
+  const quickBox = document.getElementById("monitorQuickLogBox");
+  if (currentMainView === "monitor" && quickCard && quickBox) {
+    quickCard.style.display = "block";
+    if (quickTitle) quickTitle.textContent = titleText;
+    quickBox.textContent = "로그 불러오는 중...";
+  }
+
   try {
     const res = await api(`/api/space/runs/${encodeURIComponent(runId)}/log`);
-    box.textContent = res.log || "(출력된 로그가 없습니다)";
-    box.scrollTop = box.scrollHeight;
+    const logContent = res.log || "(출력된 로그가 없습니다)";
+    if (box) {
+      box.textContent = logContent;
+      box.scrollTop = box.scrollHeight;
+    }
+    if (quickBox && quickCard?.style.display !== "none") {
+      quickBox.textContent = logContent;
+      quickBox.scrollTop = quickBox.scrollHeight;
+    }
   } catch (e) {
-    box.textContent = `로그 조회 실패: ${e.message}`;
+    const errMsg = `로그 조회 실패: ${e.message}`;
+    if (box) box.textContent = errMsg;
+    if (quickBox && quickCard?.style.display !== "none") {
+      quickBox.textContent = errMsg;
+    }
   }
 }
 
