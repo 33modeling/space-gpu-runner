@@ -5273,13 +5273,33 @@ function readJsonBody(req) {
 }
 
 function sendJson(res, status, obj) {
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Password, X-Site-Id",
-  });
+  if (res.writableEnded || res.destroyed) return;
+  if (!res.headersSent) {
+    res.writeHead(status, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Password, X-Site-Id",
+    });
+  }
   res.end(JSON.stringify(obj));
+}
+
+function parseIncomingRequestUrl(rawUrl) {
+  const input = typeof rawUrl === "string" && rawUrl.length > 0 ? rawUrl : "/";
+  if (input.includes("\0")) return null;
+  let normalized = input;
+  if (normalized.startsWith("//")) {
+    // Prevent scheme-relative URL parsing error (`new URL('//', base)` -> ERR_INVALID_URL)
+    normalized = "/" + normalized.replace(/^\/+/, "");
+  } else if (!normalized.startsWith("/") && !/^https?:\/\//i.test(normalized)) {
+    return null;
+  }
+  try {
+    return new URL(normalized, "http://localhost");
+  } catch {
+    return null;
+  }
 }
 
 function buildSitesSummaryPayload() {
@@ -5344,18 +5364,22 @@ function buildSitesSummaryPayload() {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") {
-    return sendJson(res, 200, { ok: true });
-  }
-
-  const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  const pathname = parsedUrl.pathname;
-  const reqSiteId = normalizeSiteId(
-    req.headers["x-site-id"] || parsedUrl.searchParams.get("siteId") || rawState.activeSiteId || "n9"
-  );
-
-  return siteContextStorage.run(reqSiteId, async () => {
   try {
+    if (req.method === "OPTIONS") {
+      return sendJson(res, 200, { ok: true });
+    }
+
+    const parsedUrl = parseIncomingRequestUrl(req.url);
+    if (!parsedUrl) {
+      return sendJson(res, 400, { error: "Invalid request URL" });
+    }
+    const pathname = parsedUrl.pathname;
+    const reqSiteId = normalizeSiteId(
+      req.headers["x-site-id"] || parsedUrl.searchParams.get("siteId") || rawState.activeSiteId || "n9"
+    );
+
+    return await siteContextStorage.run(reqSiteId, async () => {
+    try {
     // Password verification endpoint (`POST /api/auth/verify`)
     if (pathname === "/api/auth/verify" && req.method === "POST") {
       const body = await readJsonBody(req);
@@ -7211,8 +7235,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Serve Static Frontend
-    let filePath = pathname === "/" ? path.join(PUBLIC_DIR, "index.html") : path.join(PUBLIC_DIR, pathname);
-    if (!filePath.startsWith(PUBLIC_DIR)) {
+    let safeRelPath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+    try {
+      safeRelPath = decodeURIComponent(safeRelPath);
+    } catch {
+      return sendJson(res, 400, { error: "Malformed URI" });
+    }
+    if (safeRelPath.includes("\0")) {
+      return sendJson(res, 400, { error: "Invalid path" });
+    }
+    const filePath = path.resolve(PUBLIC_DIR, safeRelPath);
+    if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + path.sep)) {
       res.writeHead(403);
       return res.end("Forbidden");
     }
@@ -7230,15 +7263,42 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": mime,
         "Cache-Control": "no-store, no-cache, must-revalidate",
       });
-      return fs.createReadStream(filePath).pipe(res);
+      const stream = fs.createReadStream(filePath);
+      stream.on("error", (streamErr) => {
+        console.error("[Static Stream Error]", streamErr);
+        if (!res.headersSent) sendJson(res, 500, { error: "Static file read error" });
+        else res.destroy();
+      });
+      return stream.pipe(res);
     }
 
     sendJson(res, 404, { error: "Not Found" });
-  } catch (err) {
-    console.error("[API Error]", err);
-    sendJson(res, 500, { error: err.message });
+    } catch (err) {
+      console.error("[API Error]", err);
+      sendJson(res, 500, { error: err?.message || "Internal Server Error" });
+    }
+    });
+  } catch (outerErr) {
+    console.error("[HTTP Handler Error]", outerErr);
+    sendJson(res, 400, { error: "Bad Request" });
   }
-  });
+});
+
+server.on("clientError", (err, socket) => {
+  if (err?.code === "ECONNRESET" || !socket.writable || socket.destroyed) return;
+  socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+});
+
+process.on("uncaughtException", (err) => {
+  if (err && (err.code === "EADDRINUSE" || err.code === "EACCES")) {
+    console.error("[FATAL] Server port bind failed:", err);
+    process.exit(1);
+  }
+  console.error("[UncaughtException] Daemon kept alive:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[UnhandledRejection] Daemon kept alive:", reason);
 });
 
 function getLocalIpv4Addresses() {

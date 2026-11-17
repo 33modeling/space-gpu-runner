@@ -9,6 +9,7 @@
 import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import vm from "node:vm";
 import { execFileSync } from "node:child_process";
@@ -65,10 +66,12 @@ function createServerLogicSandbox() {
     "doesRunMatchSiteJobs",
     "computeJobTargetMetrics",
     "computeAdjustedTargetsAfterSlotDelete",
+    "parseIncomingRequestUrl",
   ];
 
   const context = vm.createContext({
     Buffer,
+    URL,
     Date,
     Math,
     Number,
@@ -519,6 +522,21 @@ describe("Suite 5: 프론트엔드 인라인 핸들러 보안 이스케이프 �
     const res = ui.parseSlotSpecToRunIds("1, 3-4, #360999", mockFleet);
     assert.deepEqual(Array.from(res.matchedRunIds), ["360101", "360103", "360104", "360999"]);
   });
+
+  test("TC-27: `parseIncomingRequestUrl`이 스캐너의 `//`, 다중 슬래시(`///api/state`), 비정상 URL에서도 크래시(`ERR_INVALID_URL`) 없이 안전 처리", () => {
+    const doubleSlash = srv.parseIncomingRequestUrl("//");
+    assert.ok(doubleSlash, "`//` 요청은 루트 `/`로 안전 정규화되어야 함");
+    assert.equal(doubleSlash.pathname, "/");
+
+    const multiSlashApi = srv.parseIncomingRequestUrl("///api/state?siteId=n9");
+    assert.ok(multiSlashApi);
+    assert.equal(multiSlashApi.pathname, "/api/state");
+    assert.equal(multiSlashApi.searchParams.get("siteId"), "n9");
+
+    assert.equal(srv.parseIncomingRequestUrl("10.113.125.253:4300"), null, "비정상 CONNECT 타깃은 null 반환");
+    assert.equal(srv.parseIncomingRequestUrl("/bad\0null"), null, "Null 바이트 포함 URL은 null 반환");
+    assert.equal(srv.parseIncomingRequestUrl("http://[invalid"), null, "깨진 호스트 URL은 예외 대신 null 반환");
+  });
 });
 
 // ============================================================================
@@ -644,5 +662,39 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
         assert.equal(jf.remainingToCreate, 0, `[${cfgJob.name}] 목표 도달/초과 시 remainingToCreate는 0이어야 함`);
       }
     }
+  });
+
+  test("TC-28: 네트워크 스캐너의 `GET // HTTP/1.1` 및 깨진 인코딩 요청에도 데몬이 크래시하지 않고 정상 생존", async (t) => {
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
+    const targetUrl = new URL(BASE_URL);
+    const sendRawPath = (rawPath) =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: targetUrl.hostname,
+            port: Number(targetUrl.port || 4300),
+            method: "GET",
+            path: rawPath,
+            headers: { Host: `${targetUrl.hostname}:${targetUrl.port || 4300}` },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode));
+          }
+        );
+        req.on("error", reject);
+        req.end();
+      });
+
+    const codeDoubleSlash = await sendRawPath("//");
+    assert.equal(codeDoubleSlash, 200, "`GET //` 요청은 크래시 대신 200(index.html)으로 안전 응답해야 함");
+
+    const codeBadPercent = await sendRawPath("/%E0%A4%A");
+    assert.equal(codeBadPercent, 400, "깨진 퍼센트 인코딩 URI는 400으로 안전 거부해야 함");
+
+    const aliveCheck = await fetch(`${BASE_URL}/api/state`, {
+      headers: { "X-Admin-Password": ADMIN_PW, "X-Site-Id": "n9" },
+    });
+    assert.equal(aliveCheck.status, 200, "스캐너 프로브 직후에도 데몬이 정상 응답해야 함");
   });
 });

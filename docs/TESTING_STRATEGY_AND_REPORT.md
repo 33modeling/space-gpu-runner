@@ -88,7 +88,7 @@ flowchart TB
 # 1. 빠른 정적 구문 검사 (server.mjs + public/app.js)
 npm run check
 
-# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 26개 케이스)
+# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 28개 케이스)
 npm test
 
 # (선택) 커스텀 포트 또는 비밀번호 사용 환경에서 실행 시
@@ -96,13 +96,13 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 ```
 
 > [!NOTE]
-> 로컬 `4300` 포트 데몬이 실행 중이지 않거나 네트워크가 격리된 CI 샌드박스 환경에서 실행할 경우, Suite 1~5(`TC-01`~`TC-18`, `TC-24`~`TC-25`)는 전수 실행되고 Suite 6(`TC-19`~`TC-23`, `TC-26`)은 실패 대신 안전하게 `SKIP` 처리되도록 구성되어 있습니다.
+> 로컬 `4300` 포트 데몬이 실행 중이지 않거나 네트워크가 격리된 CI 샌드박스 환경에서 실행할 경우, Suite 1~5(`TC-01`~`TC-18`, `TC-24`~`TC-25`, `TC-27`)는 전수 실행되고 Suite 6(`TC-19`~`TC-23`, `TC-26`, `TC-28`)은 실패 대신 안전하게 `SKIP` 처리되도록 구성되어 있습니다.
 
 ---
 
 ## 4. 자동화 테스트 스위트(`tests/run-tests.mjs`) 상세 구성 명세
 
-총 **6개 스위트, 26개 자동화 테스트 케이스(`TC-01` ~ `TC-26`)** 로 구성되어 있습니다.
+총 **6개 스위트, 28개 자동화 테스트 케이스(`TC-01` ~ `TC-28`)** 로 구성되어 있습니다.
 
 | 테스트 ID | 소속 스위트 | 검증 대상 함수 / 엔드포인트 | 테스트 조건 및 검증 내용 (Assertions) | 결과 |
 | :---: | :--- | :--- | :--- | :---: |
@@ -132,6 +132,8 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-24** | Suite 3 (목표GPU상한) | `computeJobTargetMetrics` | `targetPendingRuns > 0` 및 목표 초과 가동(`49 > 30`) 시 `targetCount`/`targetGpuCount`가 부풀려지지 않고 추가 스폰이 `0`으로 차단되는지 검증 | ✅ PASS |
 | **TC-25** | Suite 3 (목표GPU보호) | `computeAdjustedTargetsAfterSlotDelete` | 목표 초과 워커(`49 > 30`) 슬롯 영구 삭제 시 기존 설정 목표치(`30워커·120GPU`)가 훼손되지 않고 그대로 보존되는지 검증 | ✅ PASS |
 | **TC-26** | Suite 6 (라이브API) | `GET /api/state` (`targetCount`) | 라이브 `workerFleet.byJob`의 `targetCount === minConcurrentRuns` 및 `targetGpuCount === minConcurrentRuns * coreCount` 무결성 검증 | ✅ PASS |
+| **TC-27** | Suite 5 (URL파서방어) | `parseIncomingRequestUrl` | 사내 보안 스캐너의 `//`, 다중 슬래시(`///api/state`), Null 바이트·비정상 URL 입력 시 `ERR_INVALID_URL` 크래시 없이 안전 처리 검증 | ✅ PASS |
+| **TC-28** | Suite 6 (스캐너생존) | Raw `GET // HTTP/1.1` | 라이브 데몬에 원시 `GET //` 및 깨진 퍼센트 인코딩(`/%E0%A4%A`) 프로브 전송 후 크래시 없이 정상 응답 유지 검증 | ✅ PASS |
 
 ---
 
@@ -140,7 +142,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 테스트 및 검증은 **① 전수 정적 코드 감사 ➔ ② 자동화 단위·보안 테스트 구축 및 결함 교정 ➔ ③ 시나리오 기반 통합 검증 ➔ ④ 라이브 데몬 계약 검증 ➔ ⑤ 40시간+ 실전 운영 Soak 로그 대조**의 5단계 절차로 진행했습니다.
 
 ### 5.1 자동화 테스트 스위트 실행 결과
-라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 26개 테스트 전 항목 통과(`26 pass, 0 fail`, 소요 시간 `447.5ms`)** 를 확인했습니다.
+라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 28개 테스트 전 항목 통과(`28 pass, 0 fail`, 소요 시간 `549.9ms`)** 를 확인했습니다.
 
 ```text
 ▶ Suite 1: 정적 구문 및 코드베이스 무결성 검증 (Static & Structural Verification)
@@ -159,13 +161,13 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 ▶ Suite 4: 멀티 사이트(N9 H100 vs N6 A100) 코어 선택 및 토큰/로그 파싱 검증
   ✔ TC-13 ~ TC-15 전 항목 통과
 
-▶ Suite 5: 프론트엔드 인라인 핸들러 보안 이스케이프 및 슬롯 범위 파서 검증
-  ✔ TC-16 ~ TC-18 전 항목 통과
+▶ Suite 5: 프론트엔드 인라인 핸들러 보안 이스케이프 및 URL 파서 검증
+  ✔ TC-16 ~ TC-18, TC-27 전 항목 통과
 
-▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 목표 GPU 정합성 검증
-  ✔ TC-19 ~ TC-23, TC-26 전 항목 통과
+▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 스캐너 생존성 검증
+  ✔ TC-19 ~ TC-23, TC-26, TC-28 전 항목 통과
 
-ℹ tests 26 | suites 6 | pass 26 | fail 0 | duration_ms 447.5ms
+ℹ tests 28 | suites 6 | pass 28 | fail 0 | duration_ms 549.9ms
 ```
 
 ---
@@ -248,7 +250,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
    ```bash
    npm run check && npm test
    ```
-   모든 테스트 케이스(`TC-01` ~ `TC-26`)가 `0 fail`로 통과해야 합니다.
+   모든 테스트 케이스(`TC-01` ~ `TC-28`)가 `0 fail`로 통과해야 합니다.
 2. **신규 인라인 핸들러 추가 시 보안 점검**:
    `public/app.js`에서 HTML 문자열 내 `onclick="..."`에 동적 문자열 인자를 전달할 때는 반드시 `escapeHtml`이 아닌 `escapeJsStr`을 사용하고 `TC-17`을 통과하는지 확인합니다.
 3. **신규 일괄 제어/자동화 루프 추가 시 그룹 안전 점검**:
