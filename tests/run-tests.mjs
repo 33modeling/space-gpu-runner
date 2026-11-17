@@ -8,8 +8,10 @@
 
 import test, { describe } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { execFileSync } from "node:child_process";
@@ -52,8 +54,15 @@ function extractFunctionSource(source, fnName) {
 function createServerLogicSandbox() {
   const fnNames = [
     "normalizeSiteId",
+    "parseFiniteNumber",
+    "toSafeInt",
+    "toSafeNum",
+    "safeDecodeURIComponent",
+    "writeStateFileAtomic",
+    "readStateJsonWithFallback",
     "decodeJwtPayload",
     "detectSiteIdFromTokenOrText",
+    "isRunOwnedByUser",
     "classifyRunStatus",
     "selectPreferredGpuCore",
     "getInFlightReservationsForJob",
@@ -66,6 +75,7 @@ function createServerLogicSandbox() {
     "doesRunMatchSiteJobs",
     "computeJobTargetMetrics",
     "computeAdjustedTargetsAfterSlotDelete",
+    "readJsonBody",
     "parseIncomingRequestUrl",
   ];
 
@@ -83,12 +93,24 @@ function createServerLogicSandbox() {
     Map,
     RegExp,
     JSON,
+    Error,
+    Promise,
+    Infinity,
+    decodeURIComponent,
+    fs,
+    path,
+    process,
+    console: { log() {}, warn() {}, error() {} },
+    MAX_JSON_BODY_BYTES: 5 * 1024 * 1024,
+    atomicStateWriteSeq: 0,
     currentSite: "n9",
+    mockOwner: "admin",
     rawState: { sites: { n9: { id: "n9" }, n6: { id: "n6" } } },
     state: { jobs: [] },
     inFlightJobReservations: new Map(),
     getCurrentSiteId: () => context.currentSite,
     getSiteGpuModel: (sid) => (sid === "n6" ? "A100" : "H100"),
+    resolveCurrentUserName: () => context.mockOwner || "admin",
     extractAssignedSlotFromRun: (r) => {
       const m = String(r?.containerName || r?.name || "").match(/-s(\d+)-/i);
       return m ? Number(m[1]) : null;
@@ -696,5 +718,179 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       headers: { "X-Admin-Password": ADMIN_PW, "X-Site-Id": "n9" },
     });
     assert.equal(aliveCheck.status, 200, "스캐너 프로브 직후에도 데몬이 정상 응답해야 함");
+  });
+
+  test("TC-29: `toSafeInt` / `toSafeNum` 비정상 입력(`NaN`, 빈문자열, 객체) 방어 및 스케줄러 파라미터 보호", () => {
+    assert.equal(srv.toSafeInt("abc", 48, 1, 9999), 48, "숫자가 아닌 문자열 입력 시 기존 설정값(48) 유지");
+    assert.equal(srv.toSafeInt("", 48, 1, 9999), 48, "빈 문자열 입력 시 1로 초기화되지 않고 기존 설정값(48) 유지");
+    assert.equal(srv.toSafeInt(NaN, 15, 1, 86400), 15, "NaN 입력 시 폴백값(15) 유지");
+    assert.equal(srv.toSafeInt({}, 300, 1, 86400), 300, "객체 입력 시 폴백값(300) 유지");
+    assert.equal(srv.toSafeInt("0", 5, 0, 9999), 0, "명시적 '0' 입력(Pending 해제)은 0으로 정확히 반영");
+    assert.equal(srv.toSafeInt(-10, 48, 1, 9999), 1, "하한 미만 음수는 최솟값(1)으로 클램핑");
+
+    const metrics = srv.computeJobTargetMetrics({
+      minConcurrentRuns: "not-a-number",
+      targetPendingRuns: "bad",
+      coreCount: "",
+      runningCount: "nan",
+      pendingCount: null,
+    });
+    assert.equal(Number.isNaN(metrics.targetCount), false);
+    assert.equal(Number.isNaN(metrics.deficit), false);
+    assert.equal(metrics.targetCount, 1);
+  });
+
+  test("TC-30: 멀티테넌트 그룹(`SR-Coredata`) 동명 프리픽스 컨테이너에 대한 소유권 격리(`isRunOwnedByUser`) 검증", () => {
+    const prevOwner = srv.mockOwner;
+    try {
+      srv.mockOwner = "minsoo3.kim";
+      const jobV8 = { id: "job-v8", name: "v8", siteId: "n9" };
+      const myRun = { id: 901, name: "v8-s1-1234", userId: "minsoo3.kim", status: "Running" };
+      const colleagueSamePrefixRun = { id: 902, name: "v8-colleague-exp", userId: "other.researcher", status: "Running" };
+      const optimisticRunWithoutUser = { id: 903, name: "v8-s2-1235", status: "Pending" };
+
+      assert.equal(srv.doesRunMatchJob(myRun, jobV8, [jobV8]), true, "내 계정의 v8 컨테이너는 정상 매칭되어야 함");
+      assert.equal(
+        srv.doesRunMatchJob(colleagueSamePrefixRun, jobV8, [jobV8]),
+        false,
+        "타 연구원이 우연히 v8- 프리픽스로 띄운 컨테이너는 내 규칙에 절대 매칭되면 안 됨"
+      );
+      assert.equal(
+        srv.doesRunMatchJob(optimisticRunWithoutUser, jobV8, [jobV8]),
+        true,
+        "직후 생성된 낙관적 런(userId 미포함)은 정상 매칭되어야 함"
+      );
+    } finally {
+      srv.mockOwner = prevOwner;
+    }
+  });
+
+  test("TC-31: 원자적 `state.json` 저장(`writeStateFileAtomic`) 및 손상 시 `.bak` 자동 복구(`readStateJsonWithFallback`) 검증", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sgr-atomic-test-"));
+    const testStatePath = path.join(tmpDir, "state.json");
+    try {
+      srv.writeStateFileAtomic(testStatePath, { version: 1, targetGpus: 120 });
+      srv.writeStateFileAtomic(testStatePath, { version: 2, targetGpus: 192 });
+      assert.equal(fs.existsSync(`${testStatePath}.bak`), true, "2회차 원자적 저장 시 직전 정상 상태의 .bak 백업이 생성되어야 함");
+
+      // Simulate sudden power-loss / partial truncated JSON corruption on state.json
+      fs.writeFileSync(testStatePath, '{"version": 3, "corrupted": ', "utf-8");
+      const recovered = srv.readStateJsonWithFallback(testStatePath);
+      assert.ok(recovered, "손상된 state.json 발견 시 .bak 백업으로부터 자동 복구되어야 함");
+      assert.equal(recovered.version, 1, "백업된 직전 정상 스냅샷이 손실 없이 복원되어야 함");
+
+      const restoredDisk = JSON.parse(fs.readFileSync(testStatePath, "utf-8"));
+      assert.equal(restoredDisk.version, 1, "디스크의 손상된 state.json 파일도 정상 JSON으로 자동 복원되어야 함");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("TC-32: `readJsonBody` 멀티 청크 UTF-8 한글 보존, 잘못된 JSON `400`, 5MB 초과 페이로드 `413` 및 스트림 즉시 차단 검증", async () => {
+    // 1. Multi-chunk split inside 3-byte UTF-8 Korean characters
+    const payloadObj = { name: "목표GPU자동할당규칙", cmd: "echo 한글테스트 완료" };
+    const fullBuf = Buffer.from(JSON.stringify(payloadObj), "utf-8");
+    const splitIdx = fullBuf.indexOf(Buffer.from("표", "utf-8")) + 1; // split right in the middle of a 3-byte UTF-8 sequence!
+    const reqUtf8 = new EventEmitter();
+    reqUtf8.destroy = () => {};
+    const p1 = srv.readJsonBody(reqUtf8);
+    reqUtf8.emit("data", fullBuf.subarray(0, splitIdx));
+    reqUtf8.emit("data", fullBuf.subarray(splitIdx));
+    reqUtf8.emit("end");
+    const parsedUtf8 = await p1;
+    assert.equal(parsedUtf8.name, payloadObj.name, "TCP 패킷 경계에서 쪼개진 한글 UTF-8 바이트가 깨짐(U+FFFD) 없이 복원되어야 함");
+    assert.equal(parsedUtf8.cmd, payloadObj.cmd);
+
+    // 2. Malformed JSON -> statusCode 400
+    const reqBad = new EventEmitter();
+    reqBad.destroy = () => {};
+    const p2 = srv.readJsonBody(reqBad);
+    reqBad.emit("data", Buffer.from("{bad json", "utf-8"));
+    reqBad.emit("end");
+    await assert.rejects(p2, (err) => err.statusCode === 400 && err.message === "Invalid JSON body");
+
+    // 3. > 5MB payload -> statusCode 413 + immediate req.destroy()
+    let destroyed = false;
+    const reqHuge = new EventEmitter();
+    reqHuge.destroy = () => {
+      destroyed = true;
+    };
+    const p3 = srv.readJsonBody(reqHuge);
+    reqHuge.emit("data", Buffer.alloc(5 * 1024 * 1024 + 1024, 0x61));
+    await assert.rejects(p3, (err) => err.statusCode === 413 && err.message === "Payload too large");
+    assert.equal(destroyed, true, "5MB 초과 스트림 수신 즉시 req.destroy()를 호출해 OOM을 차단해야 함");
+  });
+
+  test("TC-33: `targetPendingRuns > 0` 상태에서 총 목표(`minConcurrentRuns`) 도달 시 스케줄러 무한 틱 폭주 방지 및 토큰 갱신 타임아웃 검증", () => {
+    // Verify `refreshAccessToken` has `AbortSignal.timeout` so singleflight token refresh can never deadlock forever
+    const refreshFnSrc = extractFunctionSource(serverSrc, "refreshAccessToken");
+    assert.match(refreshFnSrc, /AbortSignal\.timeout\(\s*\d+\s*\)/, "refreshAccessToken fetch에 AbortSignal.timeout이 적용되어야 함");
+
+    // Verify `setInterval` loop uses `computeJobTargetMetrics` instead of `matchingPending.length < targetPending`
+    assert.equal(
+      serverSrc.includes("targetPending > 0 ? matchingPending.length < targetPending : matchingActive.length < minConcurrent"),
+      false,
+      "setInterval 루프에 총 목표 상한을 무시하는 구형 hasDeficit 식이 남아있으면 안 됨"
+    );
+    const cappedMetrics = srv.computeJobTargetMetrics({
+      minConcurrentRuns: 48,
+      targetPendingRuns: 5,
+      coreCount: 4,
+      runningCount: 45,
+      pendingCount: 3,
+      inFlightCount: 0,
+    });
+    assert.equal(cappedMetrics.deficit, 0, "45 Running + 3 Pending = 48 Active 도달 시 targetPending=5여도 deficit=0이어야 함");
+  });
+
+  test("TC-34: 프론트엔드(`public/app.js` & `public/index.html`) 미정의 함수 호출(`renderSiteSelectorBar` 등) 부재 및 타유저 슬롯 보호 검증", () => {
+    assert.equal(
+      appJsSrc.includes("renderSiteSelectorBar"),
+      false,
+      "loadSpaceRuns()를 크래시시키던 미정의 renderSiteSelectorBar 호출이 존재하면 안 됨"
+    );
+    assert.equal(
+      appJsSrc.includes("syncSitesListFromServer(data.sites)"),
+      true,
+      "loadSpaceRuns 및 loadServerState는 syncSitesListFromServer를 통해 멀티사이트 바를 안전 갱신해야 함"
+    );
+    assert.equal(
+      appJsSrc.includes("🔒보호"),
+      true,
+      "언매칭 타유저 워크로드 슬롯에는 Kill 버튼 대신 🔒보호 배지가 표시되어야 함"
+    );
+  });
+
+  test("TC-35: 라이브 API 라우트에 깨진 URI(`DELETE /api/presets/%E0%A4%A`) 및 잘못된 JSON 전송 시 `500` 대신 `400`으로 안전 처리", async (t) => {
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
+    const targetUrl = new URL(BASE_URL);
+    const codeBadDelete = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: targetUrl.hostname,
+          port: Number(targetUrl.port || 4300),
+          method: "DELETE",
+          path: "/api/presets/%E0%A4%A",
+          headers: {
+            Host: `${targetUrl.hostname}:${targetUrl.port || 4300}`,
+            "X-Admin-Password": ADMIN_PW,
+          },
+        },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(codeBadDelete, 400, "깨진 퍼센트 인코딩 API 경로는 URIError(500) 대신 400을 반환해야 함");
+
+    const badJsonRes = await fetch(`${BASE_URL}/api/auth/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{invalid-json",
+    });
+    assert.equal(badJsonRes.status, 400, "잘못된 JSON 본문은 500 대신 400을 반환해야 함");
   });
 });

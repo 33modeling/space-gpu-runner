@@ -1,8 +1,8 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.2.0`
-- **최종 검증일**: `2026-11-16`
+- **문서 버전**: `v2.3.0`
+- **최종 검증일**: `2026-11-17`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/app.js`, 라이브 데몬(`0.0.0.0:4300`)
 - **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test`)
 
@@ -88,7 +88,7 @@ flowchart TB
 # 1. 빠른 정적 구문 검사 (server.mjs + public/app.js)
 npm run check
 
-# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 28개 케이스)
+# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 35개 케이스)
 npm test
 
 # (선택) 커스텀 포트 또는 비밀번호 사용 환경에서 실행 시
@@ -96,13 +96,13 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 ```
 
 > [!NOTE]
-> 로컬 `4300` 포트 데몬이 실행 중이지 않거나 네트워크가 격리된 CI 샌드박스 환경에서 실행할 경우, Suite 1~5(`TC-01`~`TC-18`, `TC-24`~`TC-25`, `TC-27`)는 전수 실행되고 Suite 6(`TC-19`~`TC-23`, `TC-26`, `TC-28`)은 실패 대신 안전하게 `SKIP` 처리되도록 구성되어 있습니다.
+> 로컬 `4300` 포트 데몬이 실행 중이지 않거나 네트워크가 격리된 CI 샌드박스 환경에서 실행할 경우, 모든 오프라인 단위·정적 테스트(`27개`, `TC-01`~`TC-18`, `TC-24`~`TC-25`, `TC-27`, `TC-29`~`TC-34`)는 전수 실행되고 라이브 포트 연동 테스트(`8개`, `TC-19`~`TC-23`, `TC-26`, `TC-28`, `TC-35`)는 실패 대신 안전하게 `SKIP` 처리되도록 구성되어 있습니다.
 
 ---
 
 ## 4. 자동화 테스트 스위트(`tests/run-tests.mjs`) 상세 구성 명세
 
-총 **6개 스위트, 28개 자동화 테스트 케이스(`TC-01` ~ `TC-28`)** 로 구성되어 있습니다.
+총 **6개 스위트, 35개 자동화 테스트 케이스(`TC-01` ~ `TC-35`)** 로 구성되어 있습니다.
 
 | 테스트 ID | 소속 스위트 | 검증 대상 함수 / 엔드포인트 | 테스트 조건 및 검증 내용 (Assertions) | 결과 |
 | :---: | :--- | :--- | :--- | :---: |
@@ -134,6 +134,13 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-26** | Suite 6 (라이브API) | `GET /api/state` (`targetCount`) | 라이브 `workerFleet.byJob`의 `targetCount === minConcurrentRuns` 및 `targetGpuCount === minConcurrentRuns * coreCount` 무결성 검증 | ✅ PASS |
 | **TC-27** | Suite 5 (URL파서방어) | `parseIncomingRequestUrl` | 사내 보안 스캐너의 `//`, 다중 슬래시(`///api/state`), Null 바이트·비정상 URL 입력 시 `ERR_INVALID_URL` 크래시 없이 안전 처리 검증 | ✅ PASS |
 | **TC-28** | Suite 6 (스캐너생존) | Raw `GET // HTTP/1.1` | 라이브 데몬에 원시 `GET //` 및 깨진 퍼센트 인코딩(`/%E0%A4%A`) 프로브 전송 후 크래시 없이 정상 응답 유지 검증 | ✅ PASS |
+| **TC-29** | Suite 6 (입력값방어) | `toSafeInt` / `computeJobTargetMetrics` | `"abc"`, 빈 문자열(`""`), `NaN`, `{}` 입력 시 `NaN` 전염 없이 기존 설정값을 보존하고 `"0"`은 `0`으로 정확히 인식하는지 검증 | ✅ PASS |
+| **TC-30** | Suite 6 (동명프리픽스보호) | `isRunOwnedByUser` / `doesRunMatchJob` | 공유 그룹 내 타 연구원이 우연히 동일 접두사(`v8-...`)로 컨테이너를 실행해도 소유권 검증으로 내 규칙에 매칭되지 않음을 검증 | ✅ PASS |
+| **TC-31** | Suite 6 (원자적영속성) | `writeStateFileAtomic` / `readStateJsonWithFallback` | 임시 파일(`tmp` + `renameSync`) 원자적 기록 및 `state.json` 부분 손상 시 `.bak` 백업으로부터 무손실 자동 복구 검증 | ✅ PASS |
+| **TC-32** | Suite 6 (스트림보안/UTF-8) | `readJsonBody` | TCP 패킷 경계에서 쪼개진 3바이트 한글 UTF-8 무결성, 잘못된 JSON `400`, 5MB 초과 페이로드 `413` 및 즉시 `req.destroy()` OOM 차단 검증 | ✅ PASS |
+| **TC-33** | Suite 6 (무한틱방지/타임아웃) | `setInterval` & `refreshAccessToken` | `targetPendingRuns > 0`에서 총 목표(`minConcurrentRuns`) 도달 시 `deficit=0`으로 무한 1초 폴링 폭주가 차단되고 토큰 갱신에 타임아웃이 적용됨을 검증 | ✅ PASS |
+| **TC-34** | Suite 6 (프론트런타임무결성) | `public/app.js` 심볼/슬롯 | `loadSpaceRuns()`를 실패시키던 미정의 `renderSiteSelectorBar` 제거 및 언매칭 타유저 슬롯 `🔒보호` 배지 적용 검증 | ✅ PASS |
+| **TC-35** | Suite 6 (라이브라우트방어) | `DELETE /api/presets/%E0%A4%A` | 라이브 API 라우트에 깨진 URI 인코딩 및 잘못된 JSON 전송 시 `500` 스택트레이스 대신 `400`으로 안전 응답 검증 | ✅ PASS |
 
 ---
 
@@ -142,14 +149,11 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 테스트 및 검증은 **① 전수 정적 코드 감사 ➔ ② 자동화 단위·보안 테스트 구축 및 결함 교정 ➔ ③ 시나리오 기반 통합 검증 ➔ ④ 라이브 데몬 계약 검증 ➔ ⑤ 40시간+ 실전 운영 Soak 로그 대조**의 5단계 절차로 진행했습니다.
 
 ### 5.1 자동화 테스트 스위트 실행 결과
-라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 28개 테스트 전 항목 통과(`28 pass, 0 fail`, 소요 시간 `549.9ms`)** 를 확인했습니다.
+라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 35개 테스트 전 항목 통과(`35 pass, 0 fail`, 소요 시간 `604.5ms`)** 를 확인했습니다.
 
 ```text
 ▶ Suite 1: 정적 구문 및 코드베이스 무결성 검증 (Static & Structural Verification)
-  ✔ TC-01: server.mjs Node.js ESM 구문 검사 통과 (`node --check`)
-  ✔ TC-02: public/app.js 프론트엔드 스크립트 구문 검사 통과 (`node --check`)
-  ✔ TC-03: 미선언 상수(`DEFAULT_SITES`) 부재 및 핵심 안전 헬퍼 존재 검증
-  ✔ TC-04: index.html 핵심 DOM 컨테이너 ID와 app.js 바인딩 정합성 검증
+  ✔ TC-01 ~ TC-04 전 항목 통과
 ✔ Suite 1
 
 ▶ Suite 2: 공유 그룹(SR-Coredata) 타 사용자 보호 및 규칙 매칭 검증
@@ -164,10 +168,10 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 ▶ Suite 5: 프론트엔드 인라인 핸들러 보안 이스케이프 및 URL 파서 검증
   ✔ TC-16 ~ TC-18, TC-27 전 항목 통과
 
-▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 스캐너 생존성 검증
-  ✔ TC-19 ~ TC-23, TC-26, TC-28 전 항목 통과
+▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약, 원자적 복구 및 스캐너 생존성 검증
+  ✔ TC-19 ~ TC-23, TC-26, TC-28 ~ TC-35 전 항목 통과
 
-ℹ tests 28 | suites 6 | pass 28 | fail 0 | duration_ms 549.9ms
+ℹ tests 35 | suites 6 | pass 35 | fail 0 | duration_ms 604.5ms
 ```
 
 ---
@@ -239,6 +243,12 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **프론트상태 #12** | 사이트 탭 전환 시 비동기 폴링 구 응답 덮어쓰기 및 슬롯 선택 잔류 | `reqSiteId` 일치 검증 가드 및 상태 초기화 추가 완료 |
 | **프론트상태 #13** | 호버 동결 중 대기 슬롯 `🗑️-1` 정적 숫자 반복 전송 및 `remainingToSpawn` 오타 | `{ delta: -1 }` 상대 증감 방식 및 `remainingToCreate` 수정 완료 |
 | **로그파서 #14** | `Epoch 3/10 | Step 450/1000` 로그에서 Step 대신 Epoch 분수를 잡던 정규식 버그 (`TC-15` 적발) | 명시적 `Step` 키워드 우선 매칭으로 교정 완료 |
+| **안정성 #15** | `refreshAccessToken` 및 웹훅 `fetch`에 타임아웃이 없어 네트워크 행(Hang) 시 전체 스케줄러·승인 루프 영구 데드락 위험 | `AbortSignal.timeout(15000)` / `(8000)` 적용 완료 |
+| **스케줄러 #16** | `setInterval` 루프가 `targetPendingRuns > 0`일 때 총 목표(`minConcurrentRuns`) 도달 후에도 1~4초마다 무한 틱·디스크 쓰기 폭주 | `computeJobTargetMetrics` 기반 `deficit > 0` 판정으로 통일 완료 |
+| **영속성 #17** | `saveState()`가 `fs.writeFileSync`로 직접 덮어써 비정상 종료 시 `state.json` 반쪽 기록·초기화 위험 | 임시 파일 원자적 교체(`renameSync`) + `.bak` 자동 백업/복구 구현 |
+| **스트림/UTF-8 #18** | `readJsonBody` 5MB 초과 시 스트림 미파괴로 OOM 위험 및 멀티 청크 한글 UTF-8 깨짐(`U+FFFD`) | `Buffer[]` 병합 디코딩 + 초과 즉시 `req.destroy()` 및 `400`/`413` 상태코드 적용 |
+| **프론트런타임 #19** | `loadSpaceRuns()` 내 미정의 함수 `renderSiteSelectorBar()` 호출로 런 목록 테이블 렌더링 `ReferenceError` 발생 | `syncSitesListFromServer` + `renderMultiSiteSwitcherBar`로 교정 완료 |
+| **입력/그룹방어 #20** | API 파라미터 깨진 인코딩 `URIError(500)`, 숫자 설정 `NaN` 오염, 타유저 동명 프리픽스·슬롯 UI Kill 노출 | `safeDecodeURIComponent`, `toSafeInt`, `isRunOwnedByUser`, `🔒보호` 전수 적용 완료 |
 
 ---
 
@@ -250,7 +260,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
    ```bash
    npm run check && npm test
    ```
-   모든 테스트 케이스(`TC-01` ~ `TC-28`)가 `0 fail`로 통과해야 합니다.
+   모든 테스트 케이스(`TC-01` ~ `TC-35`)가 `0 fail`로 통과해야 합니다.
 2. **신규 인라인 핸들러 추가 시 보안 점검**:
    `public/app.js`에서 HTML 문자열 내 `onclick="..."`에 동적 문자열 인자를 전달할 때는 반드시 `escapeHtml`이 아닌 `escapeJsStr`을 사용하고 `TC-17`을 통과하는지 확인합니다.
 3. **신규 일괄 제어/자동화 루프 추가 시 그룹 안전 점검**:

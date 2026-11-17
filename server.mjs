@@ -254,6 +254,107 @@ function normalizeSiteId(val) {
   return s || "n9";
 }
 
+function parseFiniteNumber(val) {
+  if (typeof val === "number") return Number.isFinite(val) ? val : null;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function toSafeInt(val, fallback = 0, min = -Infinity, max = Infinity) {
+  const parsed = parseFiniteNumber(val);
+  const fb = parseFiniteNumber(fallback) ?? 0;
+  const base = parsed !== null ? Math.trunc(parsed) : Math.trunc(fb);
+  return Math.min(max, Math.max(min, base));
+}
+
+function toSafeNum(val, fallback = 0, min = -Infinity, max = Infinity) {
+  const parsed = parseFiniteNumber(val);
+  const fb = parseFiniteNumber(fallback) ?? 0;
+  const base = parsed !== null ? parsed : fb;
+  return Math.min(max, Math.max(min, base));
+}
+
+function safeDecodeURIComponent(str) {
+  if (typeof str !== "string") return "";
+  try {
+    const decoded = decodeURIComponent(str);
+    return decoded.includes("\0") ? null : decoded;
+  } catch {
+    return null;
+  }
+}
+
+let atomicStateWriteSeq = 0;
+
+function writeStateFileAtomic(filePath, dataObj) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const jsonText = JSON.stringify(dataObj, null, 2);
+  atomicStateWriteSeq += 1;
+  const tmpPath = `${filePath}.tmp.${process.pid}.${atomicStateWriteSeq}`;
+  const bakPath = `${filePath}.bak`;
+  try {
+    fs.writeFileSync(tmpPath, jsonText, "utf-8");
+    if (fs.existsSync(filePath)) {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.size > 2) {
+          fs.copyFileSync(filePath, bakPath);
+        }
+      } catch {
+        // ignore backup copy failure
+      }
+    }
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore cleanup failure
+    }
+    throw err;
+  }
+}
+
+function readStateJsonWithFallback(filePath) {
+  const bakPath = `${filePath}.bak`;
+  if (fs.existsSync(filePath)) {
+    try {
+      const text = fs.readFileSync(filePath, "utf-8");
+      if (text && text.trim()) {
+        return JSON.parse(text);
+      }
+    } catch (err) {
+      console.error(`[State] Corrupted ${filePath} (${err.message}), attempting .bak recovery...`);
+    }
+  }
+  if (fs.existsSync(bakPath)) {
+    try {
+      const bakText = fs.readFileSync(bakPath, "utf-8");
+      if (bakText && bakText.trim()) {
+        const parsed = JSON.parse(bakText);
+        try {
+          fs.copyFileSync(bakPath, filePath);
+        } catch {
+          // ignore restore copy failure
+        }
+        console.warn(`[State] Successfully recovered state from ${bakPath}`);
+        return parsed;
+      }
+    } catch (bakErr) {
+      console.error(`[State] Backup ${bakPath} also invalid:`, bakErr.message);
+    }
+  }
+  return null;
+}
+
 function isApprovalOrAllocationLogMessage(msg = "") {
   const s = String(msg);
   return (
@@ -266,8 +367,8 @@ function isApprovalOrAllocationLogMessage(msg = "") {
 
 function loadState() {
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+    const raw = readStateJsonWithFallback(STATE_FILE);
+    if (raw && typeof raw === "object") {
       const rawHistory = Array.isArray(raw.history) ? raw.history.slice(0, 200) : [];
       const rawApprovalHistory = Array.isArray(raw.approvalHistory)
         ? raw.approvalHistory.slice(0, 300)
@@ -625,7 +726,7 @@ function saveState() {
         }
       }
     }
-    fs.writeFileSync(STATE_FILE, JSON.stringify(rawState, null, 2), "utf-8");
+    writeStateFileAtomic(STATE_FILE, rawState);
   } catch (e) {
     console.error("[State] Failed to save state.json:", e.message);
   }
@@ -759,6 +860,15 @@ function resolveCurrentUserName(siteId = getCurrentSiteId()) {
     return jwt.preferred_username || jwt.username || jwt.user_name || jwt.sub || jwt.user_id || jwt.email || "admin";
   }
   return "admin";
+}
+
+function isRunOwnedByUser(run, expectedUser = resolveCurrentUserName()) {
+  if (!run) return false;
+  const owner = String(expectedUser || "").trim();
+  if (!owner || owner === "admin") return true;
+  const runUser = String(run.userId || run.userName || run.user || run.createdBy || "").trim();
+  if (!runUser) return true;
+  return runUser.toLowerCase() === owner.toLowerCase();
 }
 
 function extractItemsArray(res) {
@@ -1198,6 +1308,7 @@ async function refreshAccessToken(siteId = getCurrentSiteId()) {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(15000),
         body: JSON.stringify({
           grant_type: "refresh_token",
           refresh_token: rt,
@@ -2576,6 +2687,7 @@ async function pushAlertNotification(level, title, message, meta = {}) {
     fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(8000),
       body: JSON.stringify({
         text: textBody,
         content: textBody,
@@ -3642,8 +3754,14 @@ function getJobContainerPrefix(job) {
     .slice(0, 28);
 }
 
-function doesRunMatchJob(run, job, allJobs = state.jobs) {
+function doesRunMatchJob(run, job, allJobs = state.jobs, ownerOverride = undefined) {
   if (!run || !job) return false;
+  const expectedOwner =
+    ownerOverride !== undefined
+      ? ownerOverride
+      : resolveCurrentUserName(job.siteId || getCurrentSiteId());
+  if (!isRunOwnedByUser(run, expectedOwner)) return false;
+
   const rId = String(run.id || run.runId || "");
   if (job.lastRunId && rId && rId === String(job.lastRunId)) return true;
 
@@ -3706,12 +3824,12 @@ function computeJobTargetMetrics({
   pendingCount = 0,
   inFlightCount = 0,
 } = {}) {
-  const targetCount = Math.max(1, Number(minConcurrentRuns || 1));
-  const targetPendingCount = Math.max(0, Number(targetPendingRuns ?? 0));
-  const coreCountPerWorker = Math.max(1, Number(coreCount || 1));
-  const runCnt = Math.max(0, Number(runningCount || 0));
-  const pendCnt = Math.max(0, Number(pendingCount || 0));
-  const flightCnt = Math.max(0, Number(inFlightCount || 0));
+  const targetCount = toSafeInt(minConcurrentRuns, 1, 1, 99999);
+  const targetPendingCount = toSafeInt(targetPendingRuns, 0, 0, 99999);
+  const coreCountPerWorker = toSafeInt(coreCount, 1, 1, 1024);
+  const runCnt = toSafeInt(runningCount, 0, 0, 999999);
+  const pendCnt = toSafeInt(pendingCount, 0, 0, 999999);
+  const flightCnt = toSafeInt(inFlightCount, 0, 0, 999999);
 
   const activeCount = runCnt + pendCnt;
   const effectiveActiveCount = activeCount + flightCnt;
@@ -3767,12 +3885,12 @@ function computeAdjustedTargetsAfterSlotDelete({
   runningDeletedCount = 0,
   pendingDeletedCount = 0,
 } = {}) {
-  const curTarget = Math.max(1, Number(prevTarget || 1));
-  const curPendingTarget = Math.max(0, Number(prevPendingTarget ?? 0));
-  const actBefore = Math.max(0, Number(activeBefore || 0));
-  const pendBefore = Math.max(0, Number(pendingBefore || 0));
-  const runDel = Math.max(0, Number(runningDeletedCount || 0));
-  const pendDel = Math.max(0, Number(pendingDeletedCount || 0));
+  const curTarget = toSafeInt(prevTarget, 1, 1, 99999);
+  const curPendingTarget = toSafeInt(prevPendingTarget, 0, 0, 99999);
+  const actBefore = toSafeInt(activeBefore, 0, 0, 999999);
+  const pendBefore = toSafeInt(pendingBefore, 0, 0, 999999);
+  const runDel = toSafeInt(runningDeletedCount, 0, 0, 999999);
+  const pendDel = toSafeInt(pendingDeletedCount, 0, 0, 999999);
   const totalDel = runDel + pendDel;
   const remainingActive = Math.max(0, actBefore - totalDel);
 
@@ -5164,19 +5282,28 @@ setInterval(() => {
           const matchingPending = matchingActive.filter(
             (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
           );
-          const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
-          const minConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
+          const targetPending = toSafeInt(job.targetPendingRuns, 0, 0, 9999);
+          const minConcurrent = toSafeInt(job.minConcurrentRuns, 1, 1, 9999);
+          const coreCountPerWorker = toSafeInt(job.coreCount, 1, 1, 1024);
+          const inFlightSlots = getInFlightReservationsForJob(job.id);
 
           if (targetPending > 0 && !Array.isArray(job._knownPendingRunIds) && matchingPending.length > 0) {
             job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
           }
 
-          const hasDeficit =
-            targetPending > 0 ? matchingPending.length < targetPending : matchingActive.length < minConcurrent;
+          const metrics = computeJobTargetMetrics({
+            minConcurrentRuns: minConcurrent,
+            targetPendingRuns: targetPending,
+            coreCount: coreCountPerWorker,
+            runningCount: matchingRunning.length,
+            pendingCount: matchingPending.length,
+            inFlightCount: inFlightSlots.length,
+          });
+          const hasDeficit = metrics.deficit > 0;
           if (hasDeficit) {
-            const jobCooldownSec = Math.max(1, Number(job.cooldownSec || configuredSchedSec || 15));
+            const jobCooldownSec = toSafeInt(job.cooldownSec, configuredSchedSec || 15, 1, 86400);
             const lastTrigMs = job.lastTriggeredAt ? new Date(job.lastTriggeredAt).getTime() : 0;
-            let eligibleMs = lastTrigMs ? lastTrigMs + jobCooldownSec * 1000 : now;
+            let eligibleMs = lastTrigMs && !Number.isNaN(lastTrigMs) ? lastTrigMs + jobCooldownSec * 1000 : now;
 
             if (targetPending > 0) {
               const matchingAll = knownRuns.filter((r) => doesRunMatchJob(r, job, state.jobs));
@@ -5221,9 +5348,12 @@ setInterval(() => {
             if (earliestDeficitSpawnMs === null || eligibleMs < earliestDeficitSpawnMs) {
               earliestDeficitSpawnMs = eligibleMs;
             }
-          } else if (targetPending > 0) {
-            job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
+          } else {
+            job._pendingRefillImmediate = false;
             job._incompletePendingBatchRetryAtMs = 0;
+            if (targetPending > 0) {
+              job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
+            }
           }
         }
 
@@ -5253,22 +5383,47 @@ setInterval(() => {
 /**
  * HTTP Server & REST API
  */
+const MAX_JSON_BODY_BYTES = 5 * 1024 * 1024;
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+
     req.on("data", (chunk) => {
-      data += chunk;
-      if (data.length > 5 * 1024 * 1024) reject(new Error("Payload too large"));
+      if (settled) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf-8");
+      totalBytes += buf.length;
+      if (totalBytes > MAX_JSON_BODY_BYTES) {
+        settled = true;
+        chunks.length = 0;
+        const err = Object.assign(new Error("Payload too large"), { statusCode: 413 });
+        reject(err);
+        req.destroy();
+        return;
+      }
+      chunks.push(buf);
     });
+
     req.on("end", () => {
-      if (!data) return resolve({});
+      if (settled) return;
+      settled = true;
+      if (totalBytes === 0) return resolve({});
+      const rawText = Buffer.concat(chunks, totalBytes).toString("utf-8");
+      if (!rawText.trim()) return resolve({});
       try {
-        resolve(JSON.parse(data));
+        resolve(JSON.parse(rawText));
       } catch {
-        reject(new Error("Invalid JSON body"));
+        reject(Object.assign(new Error("Invalid JSON body"), { statusCode: 400 }));
       }
     });
-    req.on("error", reject);
+
+    req.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -5308,15 +5463,21 @@ function buildSitesSummaryPayload() {
     const jwt = decodeJwtPayload(profile.accessToken);
     const remSec = jwt?.exp ? Math.floor(jwt.exp - Date.now() / 1000) : null;
     const siteJobs = (rawState.jobs || []).filter((j) => normalizeSiteId(j.siteId || "n9") === sid);
-    const enabledJobs = siteJobs.filter((j) => j.enabled);
-    const targetJobs = enabledJobs.length > 0 ? enabledJobs : siteJobs;
-    const targetWorkers = targetJobs.reduce((acc, j) => acc + Math.max(1, Number(j.minConcurrentRuns || 1)), 0);
-    const targetGpus = targetJobs.reduce(
-      (acc, j) => acc + Math.max(1, Number(j.minConcurrentRuns || 1)) * Math.max(1, Number(j.coreCount || 1)),
-      0
-    );
     const knownRuns = getSiteKnownRuns(sid);
     const allActiveRuns = knownRuns.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE");
+    const enabledJobs = siteJobs.filter((j) => j.enabled);
+    const jobsWithActiveRuns = siteJobs.filter((j) => allActiveRuns.some((r) => doesRunMatchJob(r, j, siteJobs)));
+    const targetJobs =
+      enabledJobs.length > 0
+        ? enabledJobs
+        : jobsWithActiveRuns.length > 0
+        ? jobsWithActiveRuns
+        : siteJobs.slice(0, 1);
+    const targetWorkers = targetJobs.reduce((acc, j) => acc + toSafeInt(j.minConcurrentRuns, 1, 1, 99999), 0);
+    const targetGpus = targetJobs.reduce(
+      (acc, j) => acc + toSafeInt(j.minConcurrentRuns, 1, 1, 99999) * toSafeInt(j.coreCount, 1, 1, 1024),
+      0
+    );
     const activeRuns =
       siteJobs.length > 0
         ? allActiveRuns.filter((r) => siteJobs.some((j) => doesRunMatchJob(r, j, siteJobs)))
@@ -5518,7 +5679,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname.startsWith("/api/sites/") && req.method === "DELETE") {
-      const targetSid = decodeURIComponent(pathname.split("/").pop() || "").trim().toLowerCase();
+      const decodedSid = safeDecodeURIComponent(pathname.split("/").pop() || "");
+      if (decodedSid === null) {
+        return sendJson(res, 400, { error: "Malformed URI" });
+      }
+      const targetSid = decodedSid.trim().toLowerCase();
       if (targetSid === "n9" || targetSid === "n6") {
         return sendJson(res, 400, { error: "기본 사이트(N9, N6)는 삭제할 수 없습니다." });
       }
@@ -5612,32 +5777,36 @@ const server = http.createServer(async (req, res) => {
         ...(body.orgId !== undefined ? { orgId: String(body.orgId).trim() } : {}),
         ...(body.userName !== undefined ? { userName: String(body.userName).trim() } : {}),
         ...(body.schedulerEnabled !== undefined ? { schedulerEnabled: Boolean(body.schedulerEnabled) } : {}),
-        ...(body.checkIntervalSec !== undefined ? { checkIntervalSec: Math.max(1, Number(body.checkIntervalSec)) } : {}),
-        ...(body.approvalCheckIntervalSec !== undefined
-          ? { approvalCheckIntervalSec: Math.max(1, Number(body.approvalCheckIntervalSec)) }
+        ...(body.checkIntervalSec !== undefined
+          ? { checkIntervalSec: toSafeInt(body.checkIntervalSec, state.config.checkIntervalSec ?? 15, 1, 86400) }
           : {}),
-        ...(body.uiRefreshIntervalSec !== undefined ? { uiRefreshIntervalSec: Math.max(1, Number(body.uiRefreshIntervalSec)) } : {}),
+        ...(body.approvalCheckIntervalSec !== undefined
+          ? { approvalCheckIntervalSec: toSafeInt(body.approvalCheckIntervalSec, state.config.approvalCheckIntervalSec ?? 3, 1, 3600) }
+          : {}),
+        ...(body.uiRefreshIntervalSec !== undefined
+          ? { uiRefreshIntervalSec: toSafeInt(body.uiRefreshIntervalSec, state.config.uiRefreshIntervalSec ?? 5, 1, 3600) }
+          : {}),
         ...(body.postCreateApproveRetries !== undefined
-          ? { postCreateApproveRetries: Math.max(1, Number(body.postCreateApproveRetries)) }
+          ? { postCreateApproveRetries: toSafeInt(body.postCreateApproveRetries, state.config.postCreateApproveRetries ?? 12, 1, 60) }
           : {}),
         ...(body.postCreateApproveDelaySec !== undefined
-          ? { postCreateApproveDelaySec: Math.max(1, Number(body.postCreateApproveDelaySec)) }
+          ? { postCreateApproveDelaySec: toSafeInt(body.postCreateApproveDelaySec, state.config.postCreateApproveDelaySec ?? 1, 1, 60) }
           : {}),
         ...(body.autoApprovalScope !== undefined ? { autoApprovalScope: String(body.autoApprovalScope) } : {}),
         ...(body.smartLoadGuardEnabled !== undefined
           ? { smartLoadGuardEnabled: Boolean(body.smartLoadGuardEnabled) }
           : {}),
         ...(body.maxPendingWorkers !== undefined
-          ? { maxPendingWorkers: Math.max(1, Math.min(32, Number(body.maxPendingWorkers || 2))) }
+          ? { maxPendingWorkers: toSafeInt(body.maxPendingWorkers, state.config.maxPendingWorkers ?? 2, 1, 32) }
           : {}),
         ...(body.stepByStepRunningCheck !== undefined
           ? { stepByStepRunningCheck: Boolean(body.stepByStepRunningCheck) }
           : {}),
         ...(body.apiLatencyWarnMs !== undefined
-          ? { apiLatencyWarnMs: Math.max(300, Number(body.apiLatencyWarnMs || 1800)) }
+          ? { apiLatencyWarnMs: toSafeInt(body.apiLatencyWarnMs, state.config.apiLatencyWarnMs ?? 1800, 300, 60000) }
           : {}),
         ...(body.apiLatencyCriticalMs !== undefined
-          ? { apiLatencyCriticalMs: Math.max(500, Number(body.apiLatencyCriticalMs || 3500)) }
+          ? { apiLatencyCriticalMs: toSafeInt(body.apiLatencyCriticalMs, state.config.apiLatencyCriticalMs ?? 3500, 500, 120000) }
           : {}),
         ...(body.adaptivePollingEnabled !== undefined
           ? { adaptivePollingEnabled: Boolean(body.adaptivePollingEnabled) }
@@ -5645,7 +5814,7 @@ const server = http.createServer(async (req, res) => {
         // Feature 1: Watchdog
         ...(body.watchdogEnabled !== undefined ? { watchdogEnabled: Boolean(body.watchdogEnabled) } : {}),
         ...(body.maxPendingTimeoutMin !== undefined
-          ? { maxPendingTimeoutMin: Math.max(3, Number(body.maxPendingTimeoutMin || 20)) }
+          ? { maxPendingTimeoutMin: toSafeInt(body.maxPendingTimeoutMin, state.config.maxPendingTimeoutMin ?? 120, 3, 10080) }
           : {}),
         ...(body.logErrorAutoRestart !== undefined ? { logErrorAutoRestart: Boolean(body.logErrorAutoRestart) } : {}),
         ...(body.customErrorKeywords !== undefined ? { customErrorKeywords: String(body.customErrorKeywords || "").trim() } : {}),
@@ -5656,13 +5825,21 @@ const server = http.createServer(async (req, res) => {
         ...(body.fallbackCoreId !== undefined ? { fallbackCoreId: String(body.fallbackCoreId || "").trim() } : {}),
         // Feature 5: Time-of-Day / Weekend Auto-Scaling
         ...(body.timeScaleEnabled !== undefined ? { timeScaleEnabled: Boolean(body.timeScaleEnabled) } : {}),
-        ...(body.dayTargetWorkers !== undefined ? { dayTargetWorkers: Math.max(1, Number(body.dayTargetWorkers || 20)) } : {}),
-        ...(body.nightTargetWorkers !== undefined ? { nightTargetWorkers: Math.max(1, Number(body.nightTargetWorkers || 48)) } : {}),
-        ...(body.weekendTargetWorkers !== undefined
-          ? { weekendTargetWorkers: Math.max(1, Number(body.weekendTargetWorkers || 64)) }
+        ...(body.dayTargetWorkers !== undefined
+          ? { dayTargetWorkers: toSafeInt(body.dayTargetWorkers, state.config.dayTargetWorkers ?? 20, 1, 9999) }
           : {}),
-        ...(body.nightStartHour !== undefined ? { nightStartHour: Math.max(0, Math.min(23, Number(body.nightStartHour ?? 20))) } : {}),
-        ...(body.nightEndHour !== undefined ? { nightEndHour: Math.max(0, Math.min(23, Number(body.nightEndHour ?? 8))) } : {}),
+        ...(body.nightTargetWorkers !== undefined
+          ? { nightTargetWorkers: toSafeInt(body.nightTargetWorkers, state.config.nightTargetWorkers ?? 48, 1, 9999) }
+          : {}),
+        ...(body.weekendTargetWorkers !== undefined
+          ? { weekendTargetWorkers: toSafeInt(body.weekendTargetWorkers, state.config.weekendTargetWorkers ?? 64, 1, 9999) }
+          : {}),
+        ...(body.nightStartHour !== undefined
+          ? { nightStartHour: toSafeInt(body.nightStartHour, state.config.nightStartHour ?? 20, 0, 23) }
+          : {}),
+        ...(body.nightEndHour !== undefined
+          ? { nightEndHour: toSafeInt(body.nightEndHour, state.config.nightEndHour ?? 8, 0, 23) }
+          : {}),
         // Feature 6: Webhook & Browser Notification Center
         ...(body.webhookUrl !== undefined ? { webhookUrl: String(body.webhookUrl || "").trim() } : {}),
         ...(body.browserNotifyEnabled !== undefined ? { browserNotifyEnabled: Boolean(body.browserNotifyEnabled) } : {}),
@@ -5681,15 +5858,15 @@ const server = http.createServer(async (req, res) => {
           ? { autoStopOnCompleteKeyword: String(body.autoStopOnCompleteKeyword || "").trim() }
           : {}),
         ...(body.maxTotalSucceededRuns !== undefined
-          ? { maxTotalSucceededRuns: Math.max(0, Number(body.maxTotalSucceededRuns || 0)) }
+          ? { maxTotalSucceededRuns: toSafeInt(body.maxTotalSucceededRuns, state.config.maxTotalSucceededRuns ?? 0, 0, 999999) }
           : {}),
         ...(body.nextStageCommand !== undefined ? { nextStageCommand: String(body.nextStageCommand || "").trim() } : {}),
         ...(body.badNodeGuardEnabled !== undefined ? { badNodeGuardEnabled: Boolean(body.badNodeGuardEnabled) } : {}),
         ...(body.badNodeRapidFailSec !== undefined
-          ? { badNodeRapidFailSec: Math.max(20, Number(body.badNodeRapidFailSec || 180)) }
+          ? { badNodeRapidFailSec: toSafeInt(body.badNodeRapidFailSec, state.config.badNodeRapidFailSec ?? 180, 20, 86400) }
           : {}),
         ...(body.badNodeCooldownSec !== undefined
-          ? { badNodeCooldownSec: Math.max(5, Number(body.badNodeCooldownSec || 25)) }
+          ? { badNodeCooldownSec: toSafeInt(body.badNodeCooldownSec, state.config.badNodeCooldownSec ?? 25, 5, 3600) }
           : {}),
       };
       // Smart JWT classification & dead refresh-token cleanup on config save
@@ -5905,7 +6082,8 @@ const server = http.createServer(async (req, res) => {
 
     // 4. Load single WLM Specification detail
     if (pathname.startsWith("/api/space/specification/") && req.method === "GET") {
-      const specId = pathname.split("/").pop();
+      const specId = safeDecodeURIComponent(pathname.split("/").pop() || "");
+      if (!specId) return sendJson(res, 400, { error: "Malformed specification ID" });
       const spec = await spaceApi.getSpecificationDetail(specId);
       return sendJson(res, 200, spec?.data || spec);
     }
@@ -5937,16 +6115,18 @@ const server = http.createServer(async (req, res) => {
 
       let rollingResult = null;
       if (body.rollingRestart) {
+        const myUser = resolveCurrentUserName();
         const runs = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
         const runningRuns = runs
           .filter(
             (r) =>
               classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
               String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING") &&
+              isRunOwnedByUser(r, myUser) &&
               doesRunMatchSiteJobs(r, state.jobs, body.jobId)
           )
           .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
-        const batchSize = Math.max(1, Math.min(8, Number(body.batchSize || 2)));
+        const batchSize = toSafeInt(body.batchSize, 2, 1, 8);
         const targets = runningRuns.slice(0, batchSize);
         const terminatedIds = [];
         for (const r of targets) {
@@ -6010,7 +6190,8 @@ const server = http.createServer(async (req, res) => {
     // 7. Get Live WLM Run Log
     if (pathname.startsWith("/api/space/runs/") && pathname.endsWith("/log") && req.method === "GET") {
       const parts = pathname.split("/");
-      const runId = parts[parts.length - 2];
+      const runId = safeDecodeURIComponent(parts[parts.length - 2] || "");
+      if (!runId) return sendJson(res, 400, { error: "Malformed run ID" });
       const logText = await spaceApi.getRunLog(runId, { tailLines: 500 });
       return sendJson(res, 200, { runId, log: logText });
     }
@@ -6018,7 +6199,8 @@ const server = http.createServer(async (req, res) => {
     // 8. Stop/Terminate a WLM Run (optionally decrementing rule target count when `reduceTarget: true` / "슬롯 삭제")
     if (pathname.startsWith("/api/space/runs/") && pathname.endsWith("/stop") && req.method === "POST") {
       const parts = pathname.split("/");
-      const runId = parts[parts.length - 2];
+      const runId = safeDecodeURIComponent(parts[parts.length - 2] || "");
+      if (!runId) return sendJson(res, 400, { error: "Malformed run ID" });
       const body = await readJsonBody(req).catch(() => ({}));
       const reduceTarget = Boolean(body?.reduceTarget);
       const knownRunsBeforeStop = getSiteKnownRuns() || [];
@@ -6332,16 +6514,13 @@ const server = http.createServer(async (req, res) => {
         const myUser = resolveCurrentUserName();
         const terminatedIds = [];
         const terminatedNames = [];
+        let terminatedPendingCount = 0;
+        let terminatedRunningCount = 0;
         for (const job of targetJobs) {
-          const targetCnt = Math.max(1, Number(job.minConcurrentRuns || 1));
-          const matchingActive = activeRuns.filter((r) => {
-            if (!doesRunMatchJob(r, job, state.jobs)) return false;
-            const runUser = String(r.userId || r.userName || r.user || "").trim();
-            if (myUser && myUser !== "admin" && runUser && runUser.toLowerCase() !== String(myUser).toLowerCase()) {
-              return false;
-            }
-            return true;
-          });
+          const targetCnt = toSafeInt(job.minConcurrentRuns, 1, 1, 99999);
+          const matchingActive = activeRuns.filter(
+            (r) => isRunOwnedByUser(r, myUser) && doesRunMatchJob(r, job, state.jobs)
+          );
           const excessTotal = Math.max(0, matchingActive.length - targetCnt);
           if (excessTotal <= 0) continue;
           // Trim non-Running Pending workers FIRST (newest first), then newest Running workers (preserving longest-running training containers!)
@@ -6355,11 +6534,14 @@ const server = http.createServer(async (req, res) => {
           for (const r of candidates) {
             const rId = String(r.id ?? r.runId ?? "");
             if (!rId) continue;
+            const wasRunning = String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING");
             try {
               await spaceApi.terminateRun(rId);
               markRunRecentlyTerminated(rId);
               terminatedIds.push(rId);
               terminatedNames.push(r.containerName || r.name || `#${rId}`);
+              if (wasRunning) terminatedRunningCount += 1;
+              else terminatedPendingCount += 1;
               if (candidates.length > 1) await sleep(180);
             } catch {
               // ignore
@@ -6375,13 +6557,15 @@ const server = http.createServer(async (req, res) => {
         const fleet = computeWorkerFleetStats(updatedRuns);
         addLog(
           "warn",
-          `✂️ [목표 수량 맞춤 초과 워커 정리] 설정된 목표 워커/GPU 수를 초과한 워커 ${terminatedIds.length}개(${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 정리하여 목표 수량에 정확히 맞췄습니다.`,
-          { terminatedIds, terminatedNames }
+          `✂️ [목표 수량 맞춤 초과 워커 정리] 설정된 목표 워커/GPU 수를 초과한 워커 ${terminatedIds.length}개(Pending ${terminatedPendingCount}개 · Running ${terminatedRunningCount}개 · ${terminatedNames.slice(0, 6).join(", ")}${terminatedNames.length > 6 ? ` 외 ${terminatedNames.length - 6}개` : ""})를 정리하여 목표 수량에 정확히 맞췄습니다.`,
+          { terminatedIds, terminatedNames, terminatedPendingCount, terminatedRunningCount }
         );
         return sendJson(res, 200, {
           ok: true,
           action,
           terminatedCount: terminatedIds.length,
+          terminatedPendingCount,
+          terminatedRunningCount,
           terminatedIds,
           terminatedNames,
           jobs: state.jobs,
@@ -6391,7 +6575,10 @@ const server = http.createServer(async (req, res) => {
 
       if (action === "stop_pending") {
         // Strictly restrict bulk cancel to Pending runs matching our site's job rules (NEVER cancel colleagues' Pending runs!)
-        const matchedPendingRuns = pendingRuns.filter((r) => doesRunMatchSiteJobs(r, state.jobs, body.jobId));
+        const myUser = resolveCurrentUserName();
+        const matchedPendingRuns = pendingRuns.filter(
+          (r) => isRunOwnedByUser(r, myUser) && doesRunMatchSiteJobs(r, state.jobs, body.jobId)
+        );
         const terminatedIds = [];
         for (const r of matchedPendingRuns) {
           const rId = String(r.id ?? r.runId ?? "");
@@ -6421,8 +6608,11 @@ const server = http.createServer(async (req, res) => {
 
       if (action === "rolling_restart") {
         // Strictly restrict rolling restart to Running runs matching our site's job rules (NEVER restart colleagues' runs!)
-        const matchedRunningRuns = runningRuns.filter((r) => doesRunMatchSiteJobs(r, state.jobs, body.jobId));
-        const batchSize = Math.max(1, Math.min(8, Number(body.batchSize || 1)));
+        const myUser = resolveCurrentUserName();
+        const matchedRunningRuns = runningRuns.filter(
+          (r) => isRunOwnedByUser(r, myUser) && doesRunMatchSiteJobs(r, state.jobs, body.jobId)
+        );
+        const batchSize = toSafeInt(body.batchSize, 1, 1, 8);
         const targets = matchedRunningRuns.slice(0, batchSize);
         const terminatedIds = [];
         const terminatedNames = [];
@@ -6467,7 +6657,10 @@ const server = http.createServer(async (req, res) => {
           saveState();
         }
         // Strictly restrict `stop_all` to active runs matching our site's job rules (NEVER terminate colleagues' active runs in the group!)
-        const matchedActiveRuns = activeRuns.filter((r) => doesRunMatchSiteJobs(r, state.jobs, body.jobId));
+        const myUser = resolveCurrentUserName();
+        const matchedActiveRuns = activeRuns.filter(
+          (r) => isRunOwnedByUser(r, myUser) && doesRunMatchSiteJobs(r, state.jobs, body.jobId)
+        );
         const terminatedIds = [];
         for (const r of matchedActiveRuns) {
           const rId = String(r.id ?? r.runId ?? "");
@@ -6504,21 +6697,12 @@ const server = http.createServer(async (req, res) => {
     // 8-A2. Features 1–6 Quick Toggle & Settings Update Endpoint
     if (pathname === "/api/automation/quick-update" && req.method === "POST") {
       const body = await readJsonBody(req);
-      const keys = [
+      const boolKeys = [
         "watchdogEnabled",
-        "maxPendingTimeoutMin",
         "logErrorAutoRestart",
-        "customErrorKeywords",
         "injectWorkerEnv",
         "hybridFallbackEnabled",
-        "fallbackCoreId",
         "timeScaleEnabled",
-        "dayTargetWorkers",
-        "nightTargetWorkers",
-        "weekendTargetWorkers",
-        "nightStartHour",
-        "nightEndHour",
-        "webhookUrl",
         "browserNotifyEnabled",
         "notifyOnTokenExpiring",
         "notifyOnZombieTerminated",
@@ -6526,16 +6710,35 @@ const server = http.createServer(async (req, res) => {
         "notifyOnError",
         "syncEditedScriptsOnStart",
         "autoStopOnComplete",
-        "autoStopOnCompleteKeyword",
-        "maxTotalSucceededRuns",
-        "nextStageCommand",
         "badNodeGuardEnabled",
-        "badNodeRapidFailSec",
-        "badNodeCooldownSec",
       ];
-      for (const k of keys) {
+      for (const k of boolKeys) {
+        if (body[k] !== undefined) state.config[k] = Boolean(body[k]);
+      }
+      const strKeys = [
+        "customErrorKeywords",
+        "fallbackCoreId",
+        "webhookUrl",
+        "autoStopOnCompleteKeyword",
+        "nextStageCommand",
+      ];
+      for (const k of strKeys) {
+        if (body[k] !== undefined) state.config[k] = String(body[k] ?? "").trim();
+      }
+      const intSpecs = {
+        maxPendingTimeoutMin: [120, 3, 10080],
+        dayTargetWorkers: [20, 1, 9999],
+        nightTargetWorkers: [48, 1, 9999],
+        weekendTargetWorkers: [64, 1, 9999],
+        nightStartHour: [20, 0, 23],
+        nightEndHour: [8, 0, 23],
+        maxTotalSucceededRuns: [0, 0, 999999],
+        badNodeRapidFailSec: [180, 20, 86400],
+        badNodeCooldownSec: [25, 5, 3600],
+      };
+      for (const [k, [defVal, minVal, maxVal]] of Object.entries(intSpecs)) {
         if (body[k] !== undefined) {
-          state.config[k] = body[k];
+          state.config[k] = toSafeInt(body[k], state.config[k] ?? defVal, minVal, maxVal);
         }
       }
       if (state.config.timeScaleEnabled) {
@@ -6589,13 +6792,15 @@ const server = http.createServer(async (req, res) => {
         state.jobs.find((j) => j.enabled) ||
         state.jobs[0] ||
         {};
+      const presetWorkers = toSafeInt(body.minConcurrentRuns, activeJob.minConcurrentRuns ?? 1, 1, 9999);
+      const presetCoreCount = toSafeInt(body.coreCount, activeJob.coreCount ?? 1, 1, 1024);
       const newPreset = {
         id: body.id || `preset-${Date.now()}`,
         name: String(body.name || "새 실험 프리셋").trim(),
-        badge: String(body.badge || `${body.minConcurrentRuns || activeJob.minConcurrentRuns || 1}W`).trim(),
+        badge: String(body.badge || `${presetWorkers}W`).trim(),
         executionCommand: String(body.executionCommand ?? activeJob.executionCommand ?? "bash /group-volume/run.sh").trim(),
-        minConcurrentRuns: Math.max(1, Number(body.minConcurrentRuns ?? activeJob.minConcurrentRuns ?? 1)),
-        coreCount: Math.max(1, Number(body.coreCount ?? activeJob.coreCount ?? 1)),
+        minConcurrentRuns: presetWorkers,
+        coreCount: presetCoreCount,
         allowSpot: Boolean(body.allowSpot ?? activeJob.allowSpot),
         expectedRunTime: String(body.expectedRunTime ?? activeJob.expectedRunTime ?? "8h"),
         injectWorkerEnv: Boolean(body.injectWorkerEnv ?? state.config.injectWorkerEnv),
@@ -6705,7 +6910,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname.startsWith("/api/presets/") && req.method === "DELETE") {
-      const presetId = decodeURIComponent(pathname.split("/").pop() || "");
+      const presetId = safeDecodeURIComponent(pathname.split("/").pop() || "");
+      if (presetId === null) return sendJson(res, 400, { error: "Malformed preset ID" });
       state.presets = (state.presets || []).filter((p) => p.id !== presetId);
       saveState();
       addLog("info", `🗑️ [프리셋 삭제] ID=${presetId}`);
@@ -6876,13 +7082,14 @@ const server = http.createServer(async (req, res) => {
       const idx = state.jobs.findIndex((j) => j.id === body.id);
       const existingJob = idx >= 0 ? state.jobs[idx] : null;
       const fallbackJob = state.jobs[0] || {};
-      const prevMinConcurrent = existingJob ? Math.max(1, Number(existingJob.minConcurrentRuns || 1)) : null;
-      const prevTargetPending = existingJob ? Math.max(0, Number(existingJob.targetPendingRuns || 0)) : null;
-      const resolvedCoreCount = Math.max(1, Number(body.coreCount ?? existingJob?.coreCount ?? 1));
+      const prevMinConcurrent = existingJob ? toSafeInt(existingJob.minConcurrentRuns, 1, 1, 99999) : null;
+      const prevTargetPending = existingJob ? toSafeInt(existingJob.targetPendingRuns, 0, 0, 99999) : null;
+      const resolvedCoreCount = toSafeInt(body.coreCount, existingJob?.coreCount ?? 1, 1, 1024);
+      const parsedTargetGpus = parseFiniteNumber(body.targetGpus);
       const resolvedMinConcurrent =
-        body.targetGpus !== undefined && Number(body.targetGpus) > 0
-          ? Math.max(1, Math.ceil(Number(body.targetGpus) / resolvedCoreCount))
-          : Math.max(1, Number(body.minConcurrentRuns ?? existingJob?.minConcurrentRuns ?? 1));
+        parsedTargetGpus !== null && parsedTargetGpus > 0
+          ? Math.max(1, Math.min(99999, Math.ceil(parsedTargetGpus / resolvedCoreCount)))
+          : toSafeInt(body.minConcurrentRuns, existingJob?.minConcurrentRuns ?? 1, 1, 99999);
       const jobObj = {
         id: body.id || `job-${Date.now()}`,
         siteId: normalizeSiteId(body.siteId || existingJob?.siteId || getCurrentSiteId()),
@@ -6902,17 +7109,16 @@ const server = http.createServer(async (req, res) => {
         expectedRunTime: String(body.expectedRunTime || "8h").trim(),
         enableWebConsole: body.enableWebConsole !== false,
         minConcurrentRuns: resolvedMinConcurrent,
-        targetPendingRuns: Math.max(
-          0,
-          Number(body.targetPendingRuns !== undefined ? body.targetPendingRuns : existingJob?.targetPendingRuns ?? 0)
-        ),
+        targetPendingRuns: toSafeInt(body.targetPendingRuns, existingJob?.targetPendingRuns ?? 0, 0, 99999),
         restartOnSuccess: body.restartOnSuccess !== false,
         restartOnFail: body.restartOnFail !== false,
-        cooldownSec: Math.max(1, Number(body.cooldownSec || 15)),
+        cooldownSec: toSafeInt(body.cooldownSec, existingJob?.cooldownSec ?? 15, 1, 86400),
         volumeClaim: Array.isArray(body.volumeClaim) ? body.volumeClaim : existingJob?.volumeClaim || fallbackJob.volumeClaim || [],
         injectWorkerEnv: body.injectWorkerEnv !== undefined ? Boolean(body.injectWorkerEnv) : existingJob?.injectWorkerEnv,
         maxTotalSucceededRuns:
-          body.maxTotalSucceededRuns !== undefined ? Number(body.maxTotalSucceededRuns) : existingJob?.maxTotalSucceededRuns,
+          body.maxTotalSucceededRuns !== undefined
+            ? toSafeInt(body.maxTotalSucceededRuns, existingJob?.maxTotalSucceededRuns ?? 0, 0, 999999)
+            : existingJob?.maxTotalSucceededRuns,
         nextStageCommand: body.nextStageCommand !== undefined ? String(body.nextStageCommand) : existingJob?.nextStageCommand,
         _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
         _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
@@ -6996,38 +7202,39 @@ const server = http.createServer(async (req, res) => {
         state.jobs.find((j) => hasActiveMatch(j)) ||
         state.jobs[0];
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
-      const prevMinConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
-      const prevTargetPending = Math.max(0, Number(job.targetPendingRuns || 0));
+      const prevMinConcurrent = toSafeInt(job.minConcurrentRuns, 1, 1, 99999);
+      const prevTargetPending = toSafeInt(job.targetPendingRuns, 0, 0, 99999);
       let shouldImmediateRefill = false;
       if (body.coreCount !== undefined) {
-        job.coreCount = Math.max(1, Number(body.coreCount || 1));
+        job.coreCount = toSafeInt(body.coreCount, job.coreCount ?? 1, 1, 1024);
       }
-      if (body.targetGpus !== undefined && Number(body.targetGpus) > 0) {
-        const gpusPerWorker = Math.max(1, Number(job.coreCount || 1));
-        const nextMinFromGpus = Math.max(1, Math.ceil(Number(body.targetGpus) / gpusPerWorker));
+      const parsedTargetGpus = parseFiniteNumber(body.targetGpus);
+      if (parsedTargetGpus !== null && parsedTargetGpus > 0) {
+        const gpusPerWorker = toSafeInt(job.coreCount, 1, 1, 1024);
+        const nextMinFromGpus = Math.max(1, Math.min(99999, Math.ceil(parsedTargetGpus / gpusPerWorker)));
         if (nextMinFromGpus !== job.minConcurrentRuns) shouldImmediateRefill = true;
         job.minConcurrentRuns = nextMinFromGpus;
       } else if (body.minConcurrentRuns !== undefined) {
-        const nextMin = Math.max(1, Number(body.minConcurrentRuns || 1));
+        const nextMin = toSafeInt(body.minConcurrentRuns, job.minConcurrentRuns ?? 1, 1, 99999);
         if (nextMin !== job.minConcurrentRuns) shouldImmediateRefill = true;
         job.minConcurrentRuns = nextMin;
       }
       if (body.targetPendingRuns !== undefined) {
-        const nextTargetPending = Math.max(0, Number(body.targetPendingRuns || 0));
+        const nextTargetPending = toSafeInt(body.targetPendingRuns, job.targetPendingRuns ?? 0, 0, 99999);
         if (nextTargetPending > 0 && nextTargetPending !== job.targetPendingRuns) shouldImmediateRefill = true;
         job.targetPendingRuns = nextTargetPending;
       }
       if (body.cooldownSec !== undefined) {
-        job.cooldownSec = Math.max(1, Number(body.cooldownSec || 15));
+        job.cooldownSec = toSafeInt(body.cooldownSec, job.cooldownSec ?? 15, 1, 86400);
       }
       if (body.checkIntervalSec !== undefined) {
-        state.config.checkIntervalSec = Math.max(1, Number(body.checkIntervalSec || 15));
+        state.config.checkIntervalSec = toSafeInt(body.checkIntervalSec, state.config.checkIntervalSec ?? 15, 1, 86400);
       }
       if (body.smartLoadGuardEnabled !== undefined) {
         state.config.smartLoadGuardEnabled = Boolean(body.smartLoadGuardEnabled);
       }
       if (body.maxPendingWorkers !== undefined) {
-        state.config.maxPendingWorkers = Math.max(1, Math.min(32, Number(body.maxPendingWorkers || 2)));
+        state.config.maxPendingWorkers = toSafeInt(body.maxPendingWorkers, state.config.maxPendingWorkers ?? 2, 1, 32);
       }
       if (body.stepByStepRunningCheck !== undefined) {
         state.config.stepByStepRunningCheck = Boolean(body.stepByStepRunningCheck);
@@ -7081,16 +7288,16 @@ const server = http.createServer(async (req, res) => {
         state.config.smartLoadGuardEnabled = Boolean(body.smartLoadGuardEnabled);
       }
       if (body.maxPendingWorkers !== undefined) {
-        state.config.maxPendingWorkers = Math.max(1, Math.min(32, Number(body.maxPendingWorkers || 2)));
+        state.config.maxPendingWorkers = toSafeInt(body.maxPendingWorkers, state.config.maxPendingWorkers ?? 2, 1, 32);
       }
       if (body.stepByStepRunningCheck !== undefined) {
         state.config.stepByStepRunningCheck = Boolean(body.stepByStepRunningCheck);
       }
       if (body.apiLatencyWarnMs !== undefined) {
-        state.config.apiLatencyWarnMs = Math.max(300, Number(body.apiLatencyWarnMs || 1800));
+        state.config.apiLatencyWarnMs = toSafeInt(body.apiLatencyWarnMs, state.config.apiLatencyWarnMs ?? 1800, 300, 60000);
       }
       if (body.apiLatencyCriticalMs !== undefined) {
-        state.config.apiLatencyCriticalMs = Math.max(500, Number(body.apiLatencyCriticalMs || 3500));
+        state.config.apiLatencyCriticalMs = toSafeInt(body.apiLatencyCriticalMs, state.config.apiLatencyCriticalMs ?? 3500, 500, 120000);
       }
       if (body.clearBackoff) {
         loadMonitorStats.backoffUntilMs = 0;
@@ -7116,7 +7323,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname.startsWith("/api/jobs/") && req.method === "DELETE") {
-      const jobId = pathname.split("/").pop();
+      const jobId = safeDecodeURIComponent(pathname.split("/").pop() || "");
+      if (jobId === null) return sendJson(res, 400, { error: "Malformed job ID" });
       state.jobs = state.jobs.filter((j) => j.id !== jobId);
       saveState();
       addLog("warn", `자동 실행 규칙 삭제됨: ${jobId}`);
@@ -7152,7 +7360,7 @@ const server = http.createServer(async (req, res) => {
             d.coreId !== undefined && String(d.coreId).trim()
               ? String(d.coreId).trim()
               : String(fallbackJob.coreId || ""),
-          coreCount: Math.max(1, Number(d.coreCount ?? existingJob?.coreCount ?? 1)),
+          coreCount: toSafeInt(d.coreCount, existingJob?.coreCount ?? 1, 1, 1024),
           quotaId:
             d.quotaId !== undefined && String(d.quotaId).trim()
               ? String(d.quotaId).trim()
@@ -7174,18 +7382,25 @@ const server = http.createServer(async (req, res) => {
           expectedRunTime:
             d.expectedRunTime !== undefined ? String(d.expectedRunTime || "8h").trim() : String(existingJob?.expectedRunTime || "8h"),
           enableWebConsole: d.enableWebConsole !== undefined ? d.enableWebConsole !== false : existingJob?.enableWebConsole !== false,
-          minConcurrentRuns:
-            d.targetGpus !== undefined && Number(d.targetGpus) > 0
-              ? Math.max(1, Math.ceil(Number(d.targetGpus) / Math.max(1, Number(d.coreCount ?? existingJob?.coreCount ?? 1))))
-              : Math.max(1, Number(d.minConcurrentRuns ?? existingJob?.minConcurrentRuns ?? 1)),
-          targetPendingRuns: Math.max(0, Number(d.targetPendingRuns ?? existingJob?.targetPendingRuns ?? 0)),
+          minConcurrentRuns: (() => {
+            const parsedTg = parseFiniteNumber(d.targetGpus);
+            const cc = toSafeInt(d.coreCount, existingJob?.coreCount ?? 1, 1, 1024);
+            return parsedTg !== null && parsedTg > 0
+              ? Math.max(1, Math.min(99999, Math.ceil(parsedTg / cc)))
+              : toSafeInt(d.minConcurrentRuns, existingJob?.minConcurrentRuns ?? 1, 1, 99999);
+          })(),
+          targetPendingRuns: toSafeInt(d.targetPendingRuns, existingJob?.targetPendingRuns ?? 0, 0, 99999),
           restartOnSuccess: d.restartOnSuccess !== undefined ? d.restartOnSuccess !== false : existingJob?.restartOnSuccess !== false,
           restartOnFail: d.restartOnFail !== undefined ? d.restartOnFail !== false : existingJob?.restartOnFail !== false,
-          cooldownSec: Math.max(1, Number(d.cooldownSec ?? existingJob?.cooldownSec ?? 15)),
+          cooldownSec: toSafeInt(d.cooldownSec, existingJob?.cooldownSec ?? 15, 1, 86400),
           volumeClaim: Array.isArray(d.volumeClaim) ? d.volumeClaim : fallbackJob.volumeClaim || [],
-          injectWorkerEnv: existingJob?.injectWorkerEnv,
-          maxTotalSucceededRuns: existingJob?.maxTotalSucceededRuns,
-          nextStageCommand: existingJob?.nextStageCommand,
+          injectWorkerEnv: d.injectWorkerEnv !== undefined ? Boolean(d.injectWorkerEnv) : existingJob?.injectWorkerEnv,
+          maxTotalSucceededRuns:
+            d.maxTotalSucceededRuns !== undefined
+              ? toSafeInt(d.maxTotalSucceededRuns, existingJob?.maxTotalSucceededRuns ?? 0, 0, 999999)
+              : existingJob?.maxTotalSucceededRuns,
+          nextStageCommand:
+            d.nextStageCommand !== undefined ? String(d.nextStageCommand) : existingJob?.nextStageCommand,
           _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
           _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
           lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
@@ -7202,7 +7417,7 @@ const server = http.createServer(async (req, res) => {
         job = updatedJob;
       }
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
-      const spawnCount = Math.min(64, Math.max(1, Number(body.spawnCount || 1)));
+      const spawnCount = toSafeInt(body.spawnCount, 1, 1, 64);
       let runs = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
       const triggerResults = [];
       for (let i = 0; i < spawnCount; i++) {
@@ -7274,8 +7489,14 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: "Not Found" });
     } catch (err) {
-      console.error("[API Error]", err);
-      sendJson(res, 500, { error: err?.message || "Internal Server Error" });
+      const statusCode =
+        Number.isInteger(err?.statusCode) && err.statusCode >= 400 && err.statusCode < 600
+          ? err.statusCode
+          : 500;
+      if (statusCode >= 500) {
+        console.error("[API Error]", err);
+      }
+      sendJson(res, statusCode, { error: err?.message || "Internal Server Error" });
     }
     });
   } catch (outerErr) {
@@ -7335,18 +7556,27 @@ server.listen(PORT, HOST, () => {
         fetchCurrentRuns()
           .then((initialRuns) => {
             for (const job of state.jobs.filter((j) => j.enabled)) {
-              const targetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
+              const targetPending = toSafeInt(job.targetPendingRuns, 0, 0, 9999);
               if (targetPending > 0) {
                 const matchingActive = initialRuns.filter(
                   (r) => doesRunMatchJob(r, job, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+                );
+                const matchingRunning = matchingActive.filter((r) =>
+                  String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
                 );
                 const matchingPending = matchingActive.filter(
                   (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
                 );
                 job._knownPendingRunIds = matchingPending.map((r) => String(r.id ?? r.runId ?? "")).filter(Boolean);
-                if (matchingPending.length < targetPending) {
-                  job._pendingRefillImmediate = true;
-                }
+                const initMetrics = computeJobTargetMetrics({
+                  minConcurrentRuns: job.minConcurrentRuns,
+                  targetPendingRuns: targetPending,
+                  coreCount: job.coreCount,
+                  runningCount: matchingRunning.length,
+                  pendingCount: matchingPending.length,
+                  inFlightCount: 0,
+                });
+                job._pendingRefillImmediate = initMetrics.deficit > 0;
               }
             }
           })

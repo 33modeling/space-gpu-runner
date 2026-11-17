@@ -182,9 +182,13 @@ async function selectSpaceSite(siteId, options = {}) {
     showToast(`🌐 관리 사이트 전환: ${prof.name} (${prof.gpuModel})`);
   }
   await loadServerState();
-  const firstJob = (serverState?.jobs || [])[0];
-  if (firstJob) {
-    loadJobToForm(firstJob, false, false);
+  const jobsArr = serverState?.jobs || [];
+  const preferredJob =
+    jobsArr.find((j) => j.enabled && (latestWorkerFleet?.jobs || []).some((jf) => jf.jobId === j.id && (jf.activeCount || 0) > 0)) ||
+    jobsArr.find((j) => j.enabled) ||
+    jobsArr[0];
+  if (preferredJob) {
+    loadJobToForm(preferredJob, false, false);
   } else {
     startNewJobRule();
   }
@@ -411,6 +415,23 @@ function maybeTriggerBrowserAlert(alerts, cfg) {
   }
 }
 
+function syncSitesListFromServer(rawSites) {
+  if (!rawSites) return;
+  const rawSitesArr = Array.isArray(rawSites) ? rawSites : Object.values(rawSites);
+  if (rawSitesArr.length > 0) {
+    sitesList = rawSitesArr.map((s) => ({
+      ...s,
+      tokenValid:
+        s.tokenValid !== undefined
+          ? Boolean(s.tokenValid)
+          : Boolean(s.hasAccessToken && (!s.jwtInfo || !s.jwtInfo.expired)),
+      activeRunsCount: s.activeWorkers ?? s.activeRunsCount ?? 0,
+      runningRunsCount: s.runningWorkers ?? s.runningRunsCount ?? 0,
+      totalTargetWorkers: s.targetWorkers ?? s.totalTargetWorkers ?? 0,
+    }));
+  }
+}
+
 async function loadServerState(options = {}) {
   if (!sessionPassword) return;
   const reqSiteId = currentSiteId;
@@ -420,19 +441,7 @@ async function loadServerState(options = {}) {
     if (currentSiteId !== reqSiteId) return;
     serverState = data;
     if (data.sites) {
-      const rawSitesArr = Array.isArray(data.sites) ? data.sites : Object.values(data.sites);
-      if (rawSitesArr.length > 0) {
-        sitesList = rawSitesArr.map((s) => ({
-          ...s,
-          tokenValid:
-            s.tokenValid !== undefined
-              ? Boolean(s.tokenValid)
-              : Boolean(s.hasAccessToken && (!s.jwtInfo || !s.jwtInfo.expired)),
-          activeRunsCount: s.activeWorkers ?? s.activeRunsCount ?? 0,
-          runningRunsCount: s.runningWorkers ?? s.runningRunsCount ?? 0,
-          totalTargetWorkers: s.targetWorkers ?? s.totalTargetWorkers ?? 0,
-        }));
-      }
+      syncSitesListFromServer(data.sites);
     }
     if (data.activeSiteId && !(sitesList || []).some((s) => s.id === currentSiteId)) {
       currentSiteId = data.activeSiteId;
@@ -1497,26 +1506,31 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   if (recon && Array.isArray(recon.unmatchedActiveRuns) && recon.unmatchedActiveRuns.length > 0) {
     for (const u of recon.unmatchedActiveRuns) {
       const uIdStr = String(u.id);
-      const isSelected = selectedWorkerRunIds.has(uIdStr);
       const isMine = Boolean(u.isMine);
+      const isSelected = isMine && selectedWorkerRunIds.has(uIdStr);
       const pillBg = isSelected ? "rgba(56,189,248,0.28)" : isMine ? "rgba(56,189,248,0.16)" : "rgba(168,85,247,0.16)";
       const pillBorder = isSelected ? "#38bdf8" : isMine ? "rgba(56,189,248,0.55)" : "rgba(168,85,247,0.55)";
       const pillColor = isMine ? "#7dd3fc" : "#d8b4fe";
       slotPills.push({
         key: `unmatched-${uIdStr}`,
-        sig: `${uIdStr}|${u.status}|${isSelected ? 1 : 0}|${u.coreCount}`,
+        sig: `${uIdStr}|${u.status}|${isSelected ? 1 : 0}|${isMine ? 1 : 0}|${u.coreCount}`,
         html: `
         <div class="mono" onclick="viewRunLog('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}')"
           title="클릭하여 로그 보기: ${escapeHtml(u.name)} (#${escapeHtml(uIdStr)}) · 계정: ${escapeHtml(u.userName)} · 상태: ${escapeHtml(u.status)}"
           style="cursor:pointer; display:inline-flex; flex-direction:column; gap:3px; padding:5px 8px; border-radius:7px; font-size:11px; background:${pillBg}; border:${isSelected ? "2px" : "1px"} solid ${pillBorder}; color:${pillColor}; font-weight:600;">
           <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
-            <label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:4px; cursor:pointer; margin:0; color:${pillColor};">
-              <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(uIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
-              <span>${isMine ? "📌 규칙외(내 런)" : `👥 타유저(${escapeHtml(u.userName)})`} <b>${escapeHtml(u.name)}</b> (#${escapeHtml(uIdStr)})</span>
-            </label>
-            <button type="button" class="danger sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800;"
-              onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(uIdStr)}', false, '')"
-              title="이 워크로드(#${escapeHtml(uIdStr)})를 즉시 강제 종료(Stop/Kill)합니다">🛑Kill</button>
+            ${
+              isMine
+                ? `<label onclick="event.stopPropagation();" style="display:inline-flex; align-items:center; gap:4px; cursor:pointer; margin:0; color:${pillColor};">
+                    <input type="checkbox" ${isSelected ? "checked" : ""} onchange="toggleSelectWorkerRun('${escapeJsStr(uIdStr)}', this.checked)" style="width:13px; height:13px; margin:0; accent-color:#38bdf8; cursor:pointer;" />
+                    <span>📌 규칙외(내 런) <b>${escapeHtml(u.name)}</b> (#${escapeHtml(uIdStr)})</span>
+                  </label>
+                  <button type="button" class="danger sm" style="padding:1px 5px; font-size:9.5px; line-height:1.25; font-weight:800;"
+                    onclick="event.stopPropagation(); killSingleWorkerSlot('${escapeJsStr(uIdStr)}', '${escapeJsStr(u.name)}', '규칙외 #${escapeJsStr(uIdStr)}', false, '')"
+                    title="이 워크로드(#${escapeHtml(uIdStr)})를 즉시 강제 종료(Stop/Kill)합니다">🛑Kill</button>`
+                : `<span>👥 타유저(${escapeHtml(u.userName)}) <b>${escapeHtml(u.name)}</b> (#${escapeHtml(uIdStr)})</span>
+                  <span style="font-size:9.5px; color:#d8b4fe; padding:1px 5px; border:1px solid rgba(168,85,247,0.45); border-radius:4px;">🔒보호</span>`
+            }
           </div>
           <span style="font-size:10px; opacity:0.9;">${u.isRunning ? "🟢 Running" : `⏳ ${escapeHtml(u.status)}`} · ${escapeHtml(u.coreName)}×${u.coreCount}</span>
         </div>
@@ -3427,7 +3441,7 @@ async function onSelectDiscoveredGroup(groupId) {
 async function onSelectSpecForJob(specId) {
   if (!specId) return;
   try {
-    const spec = await api(`/api/space/specification/${specId}`);
+    const spec = await api(`/api/space/specification/${encodeURIComponent(specId)}`);
     if (spec.groupPoolId || spec.poolId) document.getElementById("jobGroupPoolId").value = spec.groupPoolId || spec.poolId;
     if (spec.coreId) document.getElementById("jobCoreId").value = spec.coreId;
     if (spec.coreNum || spec.coreCount) {
@@ -4002,7 +4016,7 @@ async function saveJobRule() {
 
 async function deleteJob(id) {
   if (!confirm("이 자동 실행 규칙을 삭제하시겠습니까?")) return;
-  await api(`/api/jobs/${id}`, { method: "DELETE" });
+  await api(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (focusedFleetJobId === id) focusedFleetJobId = "";
   await loadServerState();
   if (serverState?.jobs?.[0]) {
@@ -4883,8 +4897,8 @@ async function loadSpaceRuns(options = {}) {
     const data = await api("/api/space/runs");
     if (currentSiteId !== reqSiteId) return;
     if (data.sites) {
-      latestSitesSummary = data.sites;
-      renderSiteSelectorBar();
+      syncSitesListFromServer(data.sites);
+      renderMultiSiteSwitcherBar(sitesList, currentSiteId);
     }
     if (data.workerFleet) {
       latestWorkerFleet = data.workerFleet;
@@ -4909,7 +4923,7 @@ async function viewRunLog(runId, name) {
   const box = document.getElementById("runLogBox");
   box.textContent = "로그 불러오는 중...";
   try {
-    const res = await api(`/api/space/runs/${runId}/log`);
+    const res = await api(`/api/space/runs/${encodeURIComponent(runId)}/log`);
     box.textContent = res.log || "(출력된 로그가 없습니다)";
     box.scrollTop = box.scrollHeight;
   } catch (e) {
