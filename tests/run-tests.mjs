@@ -61,9 +61,13 @@ function createServerLogicSandbox() {
     "writeStateFileAtomic",
     "readStateJsonWithFallback",
     "decodeJwtPayload",
+    "sanitizeGroupId",
+    "mergeSiteProfileUpdate",
+    "resolveSfmFilePaths",
     "detectSiteIdFromTokenOrText",
     "isRunOwnedByUser",
     "classifyRunStatus",
+    "isGenuineBadNodeFailureRun",
     "selectPreferredGpuCore",
     "getInFlightReservationsForJob",
     "reserveWorkerSlot",
@@ -892,5 +896,184 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       body: "{invalid-json",
     });
     assert.equal(badJsonRes.status, 400, "잘못된 JSON 본문은 500 대신 400을 반환해야 함");
+  });
+
+  test("TC-36: `resolveSfmFilePaths` `/user-volume/...` 경로 훼손 방지 및 복수 스크립트 자동 동기화 조건 검증", () => {
+    // 1. `/user-volume/...` must NEVER be mangled into `/group-volume/user-volume/...`
+    const u1 = srv.resolveSfmFilePaths(
+      "/user-volume/offpolicy-misranking/scripts/run_v8_nodes.sh",
+      "SR-Coredata",
+      "userA"
+    );
+    assert.equal(u1.volumeType, "user");
+    assert.equal(u1.containerPath, "/user-volume/offpolicy-misranking/scripts/run_v8_nodes.sh");
+    assert.equal(u1.viewerFilePath, "/SR-Coredata/user/offpolicy-misranking/scripts/run_v8_nodes.sh");
+    assert.equal(u1.onedataViewerPath, "/users/userA/offpolicy-misranking/scripts/run_v8_nodes.sh");
+    assert.equal(u1.sfmPath, "/user-volume/offpolicy-misranking/scripts/run_v8_nodes.sh");
+
+    // 2. `/users/<user>/...` DataViewer path maps cleanly to `/user-volume/...`
+    const u2 = srv.resolveSfmFilePaths("/users/userA/work/train.py", "", "userA");
+    assert.equal(u2.volumeType, "user");
+    assert.equal(u2.containerPath, "/user-volume/work/train.py");
+    assert.equal(u2.viewerFilePath, "/users/userA/work/train.py");
+
+    // 3. `/group-volume/...` and `/groups/<grp>/...` map cleanly to `/group-volume/...`
+    const g1 = srv.resolveSfmFilePaths("/group-volume/exp/run.sh", "SR-Coredata", "userA");
+    assert.equal(g1.volumeType, "group");
+    assert.equal(g1.containerPath, "/group-volume/exp/run.sh");
+    assert.equal(g1.viewerFilePath, "/SR-Coredata/group/exp/run.sh");
+    assert.equal(g1.onedataViewerPath, "/groups/SR-Coredata/exp/run.sh");
+
+    const g2 = srv.resolveSfmFilePaths("/groups/SR-Coredata/exp/eval.sh", "SR-Coredata", "userA");
+    assert.equal(g2.volumeType, "group");
+    assert.equal(g2.containerPath, "/group-volume/exp/eval.sh");
+
+    // 4. `buildRunPayload` must check per-script `> "${scriptPath}"` instead of global `"base64 -d >"`
+    assert.equal(
+      serverSrc.includes('!executionCommand.includes("base64 -d >")'),
+      false,
+      "단일 base64 검사로 두 번째 편집 스크립트 동기화를 막는 구형 조건이 남아있으면 안 됨"
+    );
+    assert.equal(
+      serverSrc.includes('!executionCommand.includes(`> "${scriptPath}"`)'),
+      true,
+      "스크립트 경로별 중복 주입 방지 조건이 적용되어야 함"
+    );
+  });
+
+  test("TC-37: `isGenuineBadNodeFailureRun` 수동 종료·취소·선점(Preempted) 오탐 차단 및 실제 조기 크래시만 감지 검증", () => {
+    const nowIso = new Date().toISOString();
+    const startIso = new Date(Date.now() - 20_000).toISOString();
+    const recentTermMap = new Map([["9001", Date.now()]]);
+
+    // Intentional stops / cancellations / Spot preemptions must NEVER trigger Bad-Node Guard
+    for (const nonCrashStatus of [
+      "STOPPED",
+      "KILLED",
+      "TERMINATED",
+      "CANCELED",
+      "CANCELLED",
+      "REJECTED",
+      "PREEMPTED",
+      "EVICTED",
+      "RUNNING",
+      "SUCCEEDED",
+    ]) {
+      assert.equal(
+        srv.isGenuineBadNodeFailureRun({ id: "8001", status: nonCrashStatus, startTime: startIso, endTime: nowIso }, recentTermMap),
+        false,
+        `${nonCrashStatus} 상태는 불량 노드 하드웨어/런타임 크래시로 오탐하면 안 됨`
+      );
+    }
+
+    // Runs terminated by our own controller (`recentlyTerminatedRunsMap`) must NEVER trigger Bad-Node Guard even if SPACE reports FAILED
+    assert.equal(
+      srv.isGenuineBadNodeFailureRun({ id: "9001", status: "FAILED", startTime: startIso, endTime: nowIso }, recentTermMap),
+      false,
+      "서버가 직접 종료 요청한 Run ID는 FAILED로 보고되더라도 불량 노드로 오탐하면 안 됨"
+    );
+
+    // Runs that never started (`startTime` missing) must not be treated as node runtime crashes
+    assert.equal(
+      srv.isGenuineBadNodeFailureRun({ id: "9002", status: "FAILED", startTime: null, endTime: nowIso }, recentTermMap),
+      false,
+      "startTime이 없는 런은 노드 런타임 조기 크래시로 오탐하면 안 됨"
+    );
+
+    // Genuine rapid runtime crashes (`FAILED`, `ERROR`, `OOM`, `CRASH`) must be detected
+    for (const crashStatus of ["FAILED", "ERROR", "OOMKilled", "CRASH"]) {
+      assert.equal(
+        srv.isGenuineBadNodeFailureRun({ id: "9003", status: crashStatus, startTime: startIso, endTime: nowIso }, recentTermMap),
+        true,
+        `실제 조기 실패 상태(${crashStatus})는 정상 감지되어야 함`
+      );
+    }
+  });
+
+  test("TC-38: 멀티 사이트 프로필 갱신(`mergeSiteProfileUpdate`) 시 `schedulerEnabled` · `autoApprovalScope` 유실 방지 검증", () => {
+    const existingN6 = {
+      id: "n6",
+      name: "SPACE N6 (A100 클러스터)",
+      gpuModel: "A100",
+      accessToken: "existing-access-token",
+      refreshToken: "existing-refresh-token",
+      groupId: "SR-Coredata",
+      userName: "researcher1",
+      schedulerEnabled: false,
+      autoApprovalScope: "my_runs",
+      customNote: "keep-me",
+    };
+
+    const updated = srv.mergeSiteProfileUpdate("n6", { name: "SPACE N6 Updated" }, existingN6);
+    assert.equal(updated.name, "SPACE N6 Updated");
+    assert.equal(updated.gpuModel, "A100");
+    assert.equal(updated.accessToken, "existing-access-token");
+    assert.equal(updated.schedulerEnabled, false, "사이트 프로필 수정 시 기존 schedulerEnabled=false 설정이 초기화되면 안 됨");
+    assert.equal(updated.autoApprovalScope, "my_runs", "사이트 프로필 수정 시 기존 autoApprovalScope 설정이 초기화되면 안 됨");
+    assert.equal(updated.customNote, "keep-me", "기존 확장 필드가 유실되면 안 됨");
+  });
+
+  test("TC-39: 프론트엔드 슬롯 툴바 규칙 범위(`jobId`), 슬롯 차감 시 총 GPU 입력 동기화, 하드코딩 계정명 제거 검증", () => {
+    // 1. `selectSpaceSite` inline handlers use `escapeJsStr`
+    assert.equal(
+      appJsSrc.includes("selectSpaceSite('${escapeHtml("),
+      false,
+      "인라인 JS 문자열 내부에 escapeHtml만 단독 사용한 selectSpaceSite 핸들러가 남아있으면 안 됨"
+    );
+    // 2. Per-rule slot toolbar `stop_pending` & `stop_all` pass `{ jobId: ... }`
+    assert.match(
+      appJsSrc,
+      /bulkControlWorkers\('stop_pending',\s*\{\s*jobId:/,
+      "슬롯 관리 바의 Pending 전체 취소는 현재 선택된 규칙 jobId 범위로 제한되어야 함"
+    );
+    assert.match(
+      appJsSrc,
+      /bulkControlWorkers\('stop_all',\s*\{\s*jobId:/,
+      "슬롯 관리 바의 전체 워커 종료는 현재 선택된 규칙 jobId 범위로 제한되어야 함"
+    );
+    // 3. `killSingleWorkerSlot` and `executeSelectedWorkersKill` sync total GPU & quick target inputs on `-1` target reduction
+    const killSingleSrc = extractFunctionSource(appJsSrc, "killSingleWorkerSlot");
+    const execSelectedSrc = extractFunctionSource(appJsSrc, "executeSelectedWorkersKill");
+    assert.equal(
+      killSingleSrc.includes("syncAllQuickTargetInputsDom("),
+      true,
+      "개별 슬롯 -1 영구 삭제 시 목표 총 GPU 및 빠른 입력칸이 즉시 동기화되어야 함"
+    );
+    assert.equal(
+      execSelectedSrc.includes("syncAllQuickTargetInputsDom("),
+      true,
+      "선택 슬롯 영구 삭제 시 목표 총 GPU 및 빠른 입력칸이 즉시 동기화되어야 함"
+    );
+    // 4. Hardcoded fallback username removed from `loadApprovals`
+    assert.equal(
+      appJsSrc.includes('"minsoo3.kim"'),
+      false,
+      "승인 내역 테이블에 특정 사용자 아이디가 하드코딩되어 있으면 안 됨"
+    );
+    // 5. Quick log viewer jump scrolls directly to log viewer section
+    assert.equal(
+      indexHtmlSrc.includes("switchMainView('workloads', 'log')"),
+      true,
+      "모니터링 빠른 로그 카드의 크게 보기 버튼은 switchMainView('workloads', 'log')를 호출해야 함"
+    );
+  });
+
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=6`, `/app.js?v=23`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
+    const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
+      fetch(`${BASE_URL}/`),
+      fetch(`${BASE_URL}/style.css?v=6`),
+      fetch(`${BASE_URL}/app.js?v=23`),
+      fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
+    ]);
+    assert.equal(htmlRes.status, 200);
+    assert.equal(cssRes.status, 200);
+    assert.equal(jsRes.status, 200);
+    assert.equal(stateRes.status, 200);
+    const htmlText = await htmlRes.text();
+    assert.equal(htmlText.includes('/app.js?v=23'), true, "라이브 index.html이 최신 캐시버전 app.js?v=23을 서빙해야 함");
+    const stateJson = await stateRes.json();
+    assert.equal(typeof stateJson.activeSiteId, "string");
+    assert.equal(Array.isArray(stateJson.jobs), true);
   });
 });

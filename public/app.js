@@ -315,7 +315,7 @@ function renderMultiSiteSwitcherBar(sites = sitesList, activeId = currentSiteId)
           return `<button
             type="button"
             class="seg-btn ${isCurrent ? "active" : ""}"
-            onclick="selectSpaceSite('${escapeHtml(s.id)}')"
+            onclick="selectSpaceSite('${escapeJsStr(s.id)}')"
           >
             <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:${dotColor};"></span>
             <span>${escapeHtml(s.id.toUpperCase())} (${escapeHtml(s.gpuModel)})</span>
@@ -346,7 +346,7 @@ function renderMultiSiteSwitcherBar(sites = sitesList, activeId = currentSiteId)
         return `<button
           type="button"
           class="chip-btn ${isCurrent ? "active" : ""}"
-          onclick="selectSpaceSite('${escapeHtml(s.id)}')"
+          onclick="selectSpaceSite('${escapeJsStr(s.id)}')"
         >
           ${escapeHtml(s.id.toUpperCase())} (${escapeHtml(s.gpuModel)}) · ${stLabel}
         </button>`;
@@ -584,7 +584,13 @@ function switchMainView(view = "monitor", targetSection = "") {
   }
 
   if (currentMainView === "workloads") {
-    if (targetSection && ["runs", "approvals", "history"].includes(targetSection)) {
+    if (targetSection === "log") {
+      switchWorkloadSubTab("runs");
+      setTimeout(() => {
+        const logEl = document.getElementById("logViewerTitle") || document.getElementById("runLogBox");
+        if (logEl) logEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 60);
+    } else if (targetSection && ["runs", "approvals", "history"].includes(targetSection)) {
       switchWorkloadSubTab(targetSection);
     } else {
       switchWorkloadSubTab(currentWorkloadSubTab);
@@ -1538,7 +1544,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
             <input type="number" id="quickTargetInput" class="mono" min="1" max="9999" value="${targetCnt}"
               onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', Number(this.value || 1)); }"
               style="width:82px; padding:6px 9px; font-size:13px;" />
-            <button type="button" class="sm" onclick="quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetInput').value || 1))">적용</button>
+            <button type="button" class="sm" onclick="quickUpdateTargetWorkers('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetInput')?.value || 1))">적용</button>
           </div>
         </div>
         <div class="quick-row" style="padding-top:10px; border-top:1px solid var(--border);">
@@ -1547,7 +1553,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
             <input type="number" id="quickTargetGpusInput" class="mono" min="1" max="99999" value="${targetGpus}"
               onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetGpus('${escapeJsStr(jf.jobId)}', Number(this.value || 1)); }"
               style="width:82px; padding:6px 9px; font-size:13px;" />
-            <button type="button" class="soft-success sm" onclick="quickUpdateTargetGpus('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetGpusInput').value || 1))">적용</button>
+            <button type="button" class="soft-success sm" onclick="quickUpdateTargetGpus('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetGpusInput')?.value || 1))">적용</button>
           </div>
         </div>
       </div>
@@ -1586,7 +1592,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
             <input type="number" id="quickTargetPendingInput" class="mono" min="0" max="9999" value="${targetPendingCnt}"
               onkeydown="if(event.key==='Enter'){ event.preventDefault(); quickUpdateTargetPending('${escapeJsStr(jf.jobId)}', Number(this.value || 0)); }"
               style="width:82px; padding:6px 9px; font-size:13px;" title="0=해제, 1 이상=유지할 Pending 대기 수" />
-            <button type="button" class="secondary sm" onclick="quickUpdateTargetPending('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetPendingInput').value || 0))">적용</button>
+            <button type="button" class="secondary sm" onclick="quickUpdateTargetPending('${escapeJsStr(jf.jobId)}', Number(document.getElementById('quickTargetPendingInput')?.value || 0))">적용</button>
           </div>
         </div>
       </div>
@@ -1678,10 +1684,10 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         </button>
         ${
           pendingCnt > 0
-            ? `<button type="button" class="secondary sm" onclick="bulkControlWorkers('stop_pending')">Pending 전체 취소</button>`
+            ? `<button type="button" class="secondary sm" onclick="bulkControlWorkers('stop_pending', { jobId: '${escapeJsStr(jf.jobId)}' })">Pending 전체 취소</button>`
             : ""
         }
-        <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all')">전체 워커 종료</button>
+        <button type="button" class="danger sm" onclick="bulkControlWorkers('stop_all', { jobId: '${escapeJsStr(jf.jobId)}' })">전체 워커 종료</button>
       </div>
     </div>
   `
@@ -1804,14 +1810,18 @@ function syncAllQuickTargetInputsDom(targetWorkers, gpusPerWorker, jobId = "") {
   const safeWorkers = Math.max(1, Number(targetWorkers || 1));
   const safeGpusPerWorker = Math.max(1, Number(gpusPerWorker || 1));
   const safeTotalGpus = safeWorkers * safeGpusPerWorker;
-  const qTarget = document.getElementById("quickTargetInput");
-  if (qTarget) qTarget.value = safeWorkers;
-  const topTarget = document.getElementById("topQuickTargetInput");
-  if (topTarget) topTarget.value = safeWorkers;
-  const qGpus = document.getElementById("quickTargetGpusInput");
-  if (qGpus) qGpus.value = safeTotalGpus;
-  const topGpus = document.getElementById("topQuickTargetGpusInput");
-  if (topGpus) topGpus.value = safeTotalGpus;
+  const focusedJob = typeof getFocusedJobFleet === "function" ? getFocusedJobFleet(latestWorkerFleet) : null;
+  const isSameFocusedJob = !jobId || !focusedJob?.jobId || String(focusedJob.jobId) === String(jobId);
+  if (isSameFocusedJob) {
+    const qTarget = document.getElementById("quickTargetInput");
+    if (qTarget) qTarget.value = safeWorkers;
+    const topTarget = document.getElementById("topQuickTargetInput");
+    if (topTarget) topTarget.value = safeWorkers;
+    const qGpus = document.getElementById("quickTargetGpusInput");
+    if (qGpus) qGpus.value = safeTotalGpus;
+    const topGpus = document.getElementById("topQuickTargetGpusInput");
+    if (topGpus) topGpus.value = safeTotalGpus;
+  }
   const formJobId = document.getElementById("jobId")?.value || "";
   if (!jobId || !formJobId || String(formJobId) === String(jobId)) {
     const minInput = document.getElementById("jobMinConcurrent");
@@ -1984,10 +1994,11 @@ async function quickUpdateTargetPending(jobId, valueOrOpts) {
       renderWorkerFleetBoard(latestWorkerFleet, { force: true });
       renderTopAutoStatusBanner({ force: true });
     }
+    const trimMsg = res.trimmedPendingCount > 0 ? ` (초과 Pending ${res.trimmedPendingCount}개 자동 취소됨)` : "";
     showToast(
       targetPending > 0
-        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (전체 목표 상한 범위 내에서 유지)`
-        : `⏳ 목표 Pending 대기 개수 지정이 해제(0)되었습니다! (전체 목표 워커·GPU 기준으로 자동 운영)`
+        ? `⏳ 목표 Pending 대기 개수가 ${targetPending}개로 지정되었습니다! (전체 목표 상한 범위 내에서 유지)${trimMsg}`
+        : `⏳ 목표 Pending 대기 개수 지정이 해제(0)되었습니다! (전체 목표 워커·GPU 기준으로 자동 운영)${trimMsg}`
     );
     await loadServerState();
   } catch (e) {
@@ -2333,8 +2344,9 @@ async function saveConfig(overrideSiteId = "") {
       headers: { "X-Site-Id": targetSiteId },
       body: JSON.stringify(payload),
     });
-    if (resCfg.siteId && resCfg.siteId !== currentSiteId) {
-      currentSiteId = resCfg.siteId;
+    const nextSid = resCfg.targetSiteId || resCfg.siteId;
+    if (nextSid && nextSid !== currentSiteId) {
+      currentSiteId = nextSid;
       try {
         localStorage.setItem("space_active_site_id", currentSiteId);
       } catch {}
@@ -2372,11 +2384,19 @@ async function quickUpdateAutomation(patch = {}) {
 
 async function bulkControlWorkers(action, extra = {}) {
   try {
+    const scopedJob = extra?.jobId
+      ? (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(extra.jobId)) || null
+      : null;
+    const scopePrefix = scopedJob?.jobName ? `[${scopedJob.jobName}] 규칙의 ` : "";
     if (action === "stop_all") {
-      const ok = confirm("정말 현재 가동 중인 모든 워커를 일괄 종료하시겠습니까? (주기적 자동 생성도 함께 일시정지됩니다)");
+      const ok = confirm(
+        scopedJob
+          ? `정말 [${scopedJob.jobName}] 규칙의 가동 중인 워커를 모두 종료하시겠습니까? (해당 규칙의 자동 생성도 일시정지됩니다)`
+          : "정말 현재 가동 중인 모든 워커를 일괄 종료하시겠습니까? (주기적 자동 생성도 함께 일시정지됩니다)"
+      );
       if (!ok) return;
     } else if (action === "stop_pending") {
-      const ok = confirm("현재 Pending / 준비 대기 중인 워커들을 모두 취소하시겠습니까?");
+      const ok = confirm(`현재 ${scopePrefix}Pending / 준비 대기 중인 워커들을 모두 취소하시겠습니까?`);
       if (!ok) return;
     } else if (action === "trim_to_target") {
       const jf =
@@ -2418,9 +2438,9 @@ async function bulkControlWorkers(action, extra = {}) {
     } else if (action === "trim_excess_pending") {
       showToast(`✂️ 초과 Pending 워커 ${res.terminatedCount || 0}개 정리 완료!`);
     } else if (action === "stop_pending") {
-      showToast(`⏳ Pending 워커 ${res.terminatedCount || 0}개 일괄 취소 완료!`);
+      showToast(`⏳ ${scopePrefix}Pending 워커 ${res.terminatedCount || 0}개 일괄 취소 완료!`);
     } else if (action === "stop_all") {
-      showToast(`🛑 전체 워커 ${res.terminatedCount || 0}개 일괄 종료 완료!`);
+      showToast(`🛑 ${scopePrefix}워커 ${res.terminatedCount || 0}개 일괄 종료 완료!`);
     }
     await loadServerState();
     await loadSpaceRuns();
@@ -3752,13 +3772,14 @@ async function loadApprovals() {
         .map(([k, v]) => `${k}×${v}`)
         .join(", ");
       const resStr = item.resourceSummary || resEntries || `GPU: ${resInfo.gpu ?? 0}`;
+      const fallbackUser = serverState?.config?.userName || serverState?.config?.resolvedUserName || "-";
       const reqIso = item.requestedAt || item.createdAt || tl?.autoApprovalRequestedAt || new Date().toISOString();
       rows.push({
         source: "Approvals (/run-approval)",
         approvalId: item.id,
         runId: item.runId || "-",
         runName: item.runName || item.runId || "-",
-        user: `${tl?.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동"} · ${item.userId || "minsoo3.kim"}`,
+        user: `${tl?.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동"} · ${item.userId || fallbackUser}`,
         resourceText: resStr,
         requestTimeText: `⚡ ${formatPreciseTime(reqIso, true)} (${formatRelativeAgo(reqIso)})`,
         stageLabel: `⏳ PENDING (자동 승인 처리 중)`,
@@ -3768,6 +3789,7 @@ async function loadApprovals() {
     });
 
     // 2. Items from `/taskorbit/api/v1/runs` (TaskOrbit Queue)
+    const fallbackUser = serverState?.config?.userName || serverState?.config?.resolvedUserName || "-";
     orbitRuns.forEach((r) => {
       const rId = String(r.runId || r.id || "");
       const stUpper = String(r.status || "").toUpperCase();
@@ -3781,7 +3803,7 @@ async function loadApprovals() {
         approvalId: null,
         runId: rId,
         runName: r.runName || r.name || rId,
-        user: `${tl?.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동"} · ${r.userId || "minsoo3.kim"}`,
+        user: `${tl?.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동"} · ${r.userId || fallbackUser}`,
         resourceText: r.resourceSummary || r.resourceProfile || r.coreName || `Priority: ${r.priorityValue ?? "Spot/Express"}`,
         requestTimeText: reqIso ? `⚡ ${formatPreciseTime(reqIso, true)}` : "-",
         stageLabel: stUpper === "PENDING" ? "⏳ PENDING" : `✅ ${stUpper}`,
@@ -3811,7 +3833,7 @@ async function loadApprovals() {
         approvalId: item.id ? String(item.id).slice(0, 8) : null,
         runId: item.runId || "-",
         runName: item.runName || tl?.runName || item.runId || "-",
-        user: `${tl?.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동신청"} · ${item.userId || "minsoo3.kim"}`,
+        user: `${tl?.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동신청"} · ${item.userId || fallbackUser}`,
         resourceText: resStr,
         requestTimeText: reqIso ? `⚡ ${formatPreciseTime(reqIso, true)} (${formatRelativeAgo(reqIso)})` : "-",
         stageLabel: stLower === "approved" ? "✅ APPROVED" : stLower.toUpperCase(),
@@ -3831,7 +3853,7 @@ async function loadApprovals() {
         approvalId: tl.approvalId ? String(tl.approvalId).slice(0, 8) : null,
         runId: rId,
         runName: tl.runName || `Run #${rId}`,
-        user: `${tl.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동신청"} · ${tl.approvedBy || "minsoo3.kim"}`,
+        user: `${tl.triggerSource === "auto_scheduler" ? "🤖무클릭자동" : "👆수동신청"} · ${tl.approvedBy || fallbackUser}`,
         resourceText: `${getActiveGpuModel(currentSiteId)} GPU×${tl.coreCount || 4}`,
         requestTimeText: reqIso ? `⚡ ${formatPreciseTime(reqIso, true)} (${formatRelativeAgo(reqIso)})` : "-",
         stageLabel: "✅ APPROVED",
@@ -3864,7 +3886,7 @@ async function loadApprovals() {
           : `<span class="mono txt-ok" style="font-weight:600; font-size:12px;">${escapeHtml(row.approvedInfo || "승인 통과됨")}</span>`;
         return `
           <tr>
-            <td class="mono">${escapeHtml(row.source)}${row.approvalId ? ` (#${row.approvalId})` : ""}</td>
+            <td class="mono">${escapeHtml(row.source)}${row.approvalId ? ` (#${escapeHtml(String(row.approvalId))})` : ""}</td>
             <td class="mono"><b>${escapeHtml(row.runName)}</b><br/><span class="hint">#${escapeHtml(row.runId)}</span></td>
             <td class="mono">${escapeHtml(row.user)}</td>
             <td class="mono">${escapeHtml(row.resourceText)}</td>
@@ -4141,17 +4163,22 @@ async function killSingleWorkerSlot(runId, runName = "", slotLabel = "", reduceT
     }
     if (res.targetAdjustment) {
       const adj = res.targetAdjustment;
-      const isSameFormJob = String(document.getElementById("jobId")?.value) === String(adj.jobId);
-      const minInput = document.getElementById("jobMinConcurrent");
-      if (minInput && isSameFormJob && adj.newTarget !== undefined) {
-        minInput.value = adj.newTarget;
+      const adjJobFleet = (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(adj.jobId));
+      const adjCoreCount = Math.max(
+        1,
+        Number(res.updatedJob?.coreCount || adjJobFleet?.coreCountPerWorker || document.getElementById("jobCoreCount")?.value || 1)
+      );
+      if (adj.newTarget !== undefined) {
+        syncAllQuickTargetInputsDom(adj.newTarget, adjCoreCount, adj.jobId);
       }
+      const isSameFormJob = String(document.getElementById("jobId")?.value) === String(adj.jobId);
       const pendInput = document.getElementById("jobTargetPending");
       if (pendInput && isSameFormJob && adj.newPendingTarget !== undefined) {
         pendInput.value = adj.newPendingTarget;
       }
+      const focusedJob = getFocusedJobFleet(latestWorkerFleet);
       const quickPendInput = document.getElementById("quickTargetPendingInput");
-      if (quickPendInput && adj.newPendingTarget !== undefined && String(focusedFleetJobId || "") === String(adj.jobId)) {
+      if (quickPendInput && adj.newPendingTarget !== undefined && String(focusedJob?.jobId || "") === String(adj.jobId)) {
         quickPendInput.value = adj.newPendingTarget;
       }
       const pendingChanged =
@@ -4231,17 +4258,22 @@ async function executeSelectedWorkersKill(reduceTarget = false, jobId = "") {
 
     if (res.targetAdjustment) {
       const adj = res.targetAdjustment;
-      const isSameFormJob = String(document.getElementById("jobId")?.value) === String(adj.jobId);
-      const minInput = document.getElementById("jobMinConcurrent");
-      if (minInput && isSameFormJob && adj.newTarget !== undefined) {
-        minInput.value = adj.newTarget;
+      const adjJobFleet = (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(adj.jobId));
+      const adjCoreCount = Math.max(
+        1,
+        Number(res.updatedJob?.coreCount || adjJobFleet?.coreCountPerWorker || document.getElementById("jobCoreCount")?.value || 1)
+      );
+      if (adj.newTarget !== undefined) {
+        syncAllQuickTargetInputsDom(adj.newTarget, adjCoreCount, adj.jobId);
       }
+      const isSameFormJob = String(document.getElementById("jobId")?.value) === String(adj.jobId);
       const pendInput = document.getElementById("jobTargetPending");
       if (pendInput && isSameFormJob && adj.newPendingTarget !== undefined) {
         pendInput.value = adj.newPendingTarget;
       }
+      const focusedJob = getFocusedJobFleet(latestWorkerFleet);
       const quickPendInput = document.getElementById("quickTargetPendingInput");
-      if (quickPendInput && adj.newPendingTarget !== undefined && String(focusedFleetJobId || "") === String(adj.jobId)) {
+      if (quickPendInput && adj.newPendingTarget !== undefined && String(focusedJob?.jobId || "") === String(adj.jobId)) {
         quickPendInput.value = adj.newPendingTarget;
       }
       const pendingChanged =

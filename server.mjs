@@ -783,6 +783,39 @@ function sanitizeGroupId(val) {
   return s;
 }
 
+function mergeSiteProfileUpdate(rawId, body = {}, existing = {}) {
+  const cleanId = String(rawId || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "");
+  const gpuModel = String(body.gpuModel || existing.gpuModel || (cleanId === "n6" ? "A100" : "H100"))
+    .trim()
+    .toUpperCase();
+  return {
+    ...existing,
+    id: cleanId,
+    name: String(body.name || existing.name || `SPACE ${cleanId.toUpperCase()} (${gpuModel} 클러스터)`).trim(),
+    shortName: String(body.shortName || existing.shortName || `${cleanId.toUpperCase()} (${gpuModel})`).trim(),
+    portalUrl: String(body.portalUrl || existing.portalUrl || `https://space.${cleanId}.sr-cloud.com`).trim().replace(/\/$/, ""),
+    baseUrl: String(body.baseUrl || existing.baseUrl || `https://mlp.${cleanId}.sr-cloud.com`).trim().replace(/\/$/, ""),
+    sfmUrl: String(body.sfmUrl || existing.sfmUrl || `https://sfsm.${cleanId}.sr-cloud.com`).trim().replace(/\/$/, ""),
+    viewerUrl: String(body.viewerUrl || existing.viewerUrl || `https://console-viewer.${cleanId}.sr-cloud.com`).trim().replace(/\/$/, ""),
+    gpuModel,
+    accessToken:
+      body.accessToken !== undefined
+        ? String(body.accessToken).replace(/^Bearer\s+/i, "").trim()
+        : existing.accessToken || "",
+    refreshToken: body.refreshToken !== undefined ? String(body.refreshToken).trim() : existing.refreshToken || "",
+    groupId: body.groupId !== undefined ? sanitizeGroupId(body.groupId) : existing.groupId || "SR-Coredata",
+    orgId: body.orgId !== undefined ? String(body.orgId).trim() : existing.orgId || "",
+    userName: body.userName !== undefined ? String(body.userName).trim() : existing.userName || "",
+    schedulerEnabled:
+      body.schedulerEnabled !== undefined ? Boolean(body.schedulerEnabled) : existing.schedulerEnabled ?? true,
+    autoApprovalScope:
+      body.autoApprovalScope !== undefined ? String(body.autoApprovalScope).trim() : existing.autoApprovalScope || "all_group",
+  };
+}
+
 function decodeJwtPayload(token) {
   if (!token || typeof token !== "string") return null;
   try {
@@ -1353,6 +1386,67 @@ async function refreshAccessToken(siteId = getCurrentSiteId()) {
   }
 }
 
+function resolveSfmFilePaths(filePath = "/group-volume/run.sh", groupId = "", userName = "") {
+  const rawStr = String(filePath || "/group-volume/run.sh").trim() || "/group-volume/run.sh";
+  const gId = String(groupId || "").trim();
+  const usr = String(userName || "").trim();
+
+  let volumeType = "group";
+  let relPath = "run.sh";
+
+  if (rawStr === "/user-volume" || rawStr.startsWith("/user-volume/")) {
+    volumeType = "user";
+    relPath = rawStr.replace(/^\/user-volume\/?/, "").replace(/^\/+/, "") || "run.sh";
+  } else if (rawStr.startsWith("/users/")) {
+    volumeType = "user";
+    const afterUsers = rawStr.replace(/^\/users\/+/, "");
+    const slashIdx = afterUsers.indexOf("/");
+    relPath = (slashIdx >= 0 ? afterUsers.slice(slashIdx + 1) : afterUsers).replace(/^\/+/, "") || "run.sh";
+  } else if (rawStr === "/group-volume" || rawStr.startsWith("/group-volume/")) {
+    volumeType = "group";
+    relPath = rawStr.replace(/^\/group-volume\/?/, "").replace(/^\/+/, "") || "run.sh";
+  } else if (rawStr.startsWith("/groups/")) {
+    volumeType = "group";
+    const afterGroups = rawStr.replace(/^\/groups\/+/, "");
+    const slashIdx = afterGroups.indexOf("/");
+    relPath = (slashIdx >= 0 ? afterGroups.slice(slashIdx + 1) : afterGroups).replace(/^\/+/, "") || "run.sh";
+  } else {
+    volumeType = "group";
+    relPath = rawStr.replace(/^\/+/, "") || "run.sh";
+  }
+
+  const containerPrefix = volumeType === "user" ? "/user-volume" : "/group-volume";
+  const containerPath = `${containerPrefix}/${relPath}`;
+  const viewerFilePath =
+    volumeType === "user"
+      ? gId
+        ? `/${gId}/user/${relPath}`
+        : usr
+        ? `/users/${usr}/${relPath}`
+        : `/user-volume/${relPath}`
+      : gId
+      ? `/${gId}/group/${relPath}`
+      : `/${relPath}`;
+  const onedataViewerPath =
+    volumeType === "user"
+      ? usr
+        ? `/users/${usr}/${relPath}`
+        : `/user-volume/${relPath}`
+      : gId
+      ? `/groups/${gId}/${relPath}`
+      : `/groups/${relPath}`;
+  const sfmPath = volumeType === "user" ? `/user-volume/${relPath}` : `/${relPath}`;
+
+  return {
+    volumeType,
+    relPath,
+    containerPath,
+    viewerFilePath,
+    onedataViewerPath,
+    sfmPath,
+  };
+}
+
 /**
  * SPACE WLM / TaskOrbit / Approvals / ACM / CIM / SFM API Wrappers
  */
@@ -1476,37 +1570,40 @@ const spaceApi = {
   },
 
   readSfmFile: async (filePath = "/group-volume/run.sh") => {
-    const rawStr = String(filePath || "/group-volume/run.sh").trim();
-    const containerPath = rawStr.startsWith("/group-volume")
-      ? rawStr
-      : `/group-volume/${rawStr.replace(/^\/+/, "")}`;
-    const relPath = containerPath.replace(/^\/group-volume\/?/, "");
-    const gId = resolveGroupId();
-    const viewerFilePath = gId ? `/${gId}/group/${relPath}` : `/${relPath}`;
+    const resolved = resolveSfmFilePaths(filePath, resolveGroupId(), resolveCurrentUserName());
+    const { containerPath, viewerFilePath, onedataViewerPath, sfmPath } = resolved;
+    const savedEntry =
+      state.scriptFiles?.[containerPath] || state.scriptFiles?.[`/group-volume${containerPath}`] || null;
 
-    // 1. Try local cached/edited version first if no remote token, or try remote Data Viewer / SFM download then fallback to local saved copy
-    try {
-      const dlRes = await spaceRequest("/api/dataviewer/v1/files/content", {
-        params: { path: viewerFilePath },
-        rawResponse: true,
-      });
-      if (typeof dlRes === "string" && dlRes.length > 0 && !dlRes.trim().startsWith("<!DOCTYPE html")) {
-        return {
-          path: containerPath,
-          viewerPath: viewerFilePath,
-          content: dlRes,
-          source: "space_dataviewer",
-          updatedAt: state.scriptFiles?.[containerPath]?.updatedAt || new Date().toISOString(),
-          autoInject: Boolean(state.scriptFiles?.[containerPath]?.autoInject),
-        };
+    // 1. Try remote Data Viewer / SFM download then fallback to local saved copy
+    const candidateViewerPaths =
+      onedataViewerPath && onedataViewerPath !== viewerFilePath
+        ? [viewerFilePath, onedataViewerPath]
+        : [viewerFilePath];
+    for (const vPath of candidateViewerPaths) {
+      try {
+        const dlRes = await spaceRequest("/api/dataviewer/v1/files/content", {
+          params: { path: vPath },
+          rawResponse: true,
+        });
+        if (typeof dlRes === "string" && dlRes.length > 0 && !dlRes.trim().startsWith("<!DOCTYPE html")) {
+          return {
+            path: containerPath,
+            viewerPath: vPath,
+            content: dlRes,
+            source: "space_dataviewer",
+            updatedAt: savedEntry?.updatedAt || new Date().toISOString(),
+            autoInject: Boolean(savedEntry?.autoInject),
+          };
+        }
+      } catch {
+        // Try next candidate or SFM `/files`
       }
-    } catch {
-      // Fallback to SFM `/files` or local script store
     }
     try {
       const sfmRes = await spaceRequest("/files", {
         baseUrl: state.config.sfmUrl,
-        params: { path: `/${relPath}` },
+        params: { path: sfmPath },
         rawResponse: true,
       });
       if (typeof sfmRes === "string" && sfmRes.length > 0 && !sfmRes.trim().startsWith("<!DOCTYPE html")) {
@@ -1515,23 +1612,22 @@ const spaceApi = {
           viewerPath: viewerFilePath,
           content: sfmRes,
           source: "space_sfm",
-          updatedAt: state.scriptFiles?.[containerPath]?.updatedAt || new Date().toISOString(),
-          autoInject: Boolean(state.scriptFiles?.[containerPath]?.autoInject),
+          updatedAt: savedEntry?.updatedAt || new Date().toISOString(),
+          autoInject: Boolean(savedEntry?.autoInject),
         };
       }
     } catch {
       // Fallback to in-dashboard script store (`state.scriptFiles`)
     }
 
-    const saved = state.scriptFiles?.[containerPath];
-    if (saved) {
+    if (savedEntry) {
       return {
         path: containerPath,
         viewerPath: viewerFilePath,
-        content: saved.content || "",
+        content: savedEntry.content || "",
         source: "dashboard_store",
-        updatedAt: saved.updatedAt || null,
-        autoInject: Boolean(saved.autoInject),
+        updatedAt: savedEntry.updatedAt || null,
+        autoInject: Boolean(savedEntry.autoInject),
       };
     }
 
@@ -1546,15 +1642,14 @@ const spaceApi = {
   },
 
   writeSfmFile: async (filePath = "/group-volume/run.sh", content = "") => {
-    const rawStr = String(filePath || "/group-volume/run.sh").trim();
-    const containerPath = rawStr.startsWith("/group-volume")
-      ? rawStr
-      : `/group-volume/${rawStr.replace(/^\/+/, "")}`;
-    const relPath = containerPath.replace(/^\/group-volume\/?/, "");
-    const gId = resolveGroupId();
-    const viewerFilePath = gId ? `/${gId}/group/${relPath}` : `/${relPath}`;
+    const resolved = resolveSfmFilePaths(filePath, resolveGroupId(), resolveCurrentUserName());
+    const { containerPath, viewerFilePath, onedataViewerPath, sfmPath } = resolved;
 
     if (!state.scriptFiles) state.scriptFiles = {};
+    // Clean up legacy mangled `/group-volume/user-volume/...` duplicate entry if present
+    if (containerPath.startsWith("/user-volume/") && state.scriptFiles[`/group-volume${containerPath}`]) {
+      delete state.scriptFiles[`/group-volume${containerPath}`];
+    }
     state.scriptFiles[containerPath] = {
       path: containerPath,
       content: String(content ?? ""),
@@ -1565,26 +1660,36 @@ const spaceApi = {
 
     let remoteSaved = false;
     let remoteMethod = "auto_inject_on_worker_start";
-    try {
-      await spaceRequest("/api/dataviewer/v1/files/content", {
-        method: "PUT",
-        params: { path: viewerFilePath },
-        body: { path: viewerFilePath, content: String(content ?? "") },
-      });
-      remoteSaved = true;
-      remoteMethod = "space_dataviewer_put";
-    } catch {
+    const candidateViewerPaths =
+      onedataViewerPath && onedataViewerPath !== viewerFilePath
+        ? [viewerFilePath, onedataViewerPath]
+        : [viewerFilePath];
+    for (const vPath of candidateViewerPaths) {
+      try {
+        await spaceRequest("/api/dataviewer/v1/files/content", {
+          method: "PUT",
+          params: { path: vPath },
+          body: { path: vPath, content: String(content ?? "") },
+        });
+        remoteSaved = true;
+        remoteMethod = "space_dataviewer_put";
+        break;
+      } catch {
+        // Try next candidate
+      }
+    }
+    if (!remoteSaved) {
       try {
         await spaceRequest("/files", {
           method: "POST",
           baseUrl: state.config.sfmUrl,
-          params: { path: `/${relPath}` },
-          body: { path: `/${relPath}`, content: String(content ?? "") },
+          params: { path: sfmPath },
+          body: { path: sfmPath, content: String(content ?? "") },
         });
         remoteSaved = true;
         remoteMethod = "space_sfm_post";
       } catch {
-        // SFM web viewer is read-only or requires multipart; `auto_inject_on_worker_start` guarantees writing into `/group-volume/...` inside container on start!
+        // SFM web viewer is read-only or requires multipart; `auto_inject_on_worker_start` guarantees writing into containerPath on start!
       }
     }
 
@@ -2472,6 +2577,37 @@ function classifyRunStatus(statusRaw) {
     return "FAILED";
   }
   return "UNKNOWN";
+}
+
+function isGenuineBadNodeFailureRun(run, recentlyTerminatedMap = null) {
+  if (!run || typeof run !== "object") return false;
+  const fId = String(run.id ?? run.runId ?? "").trim();
+  if (fId && recentlyTerminatedMap && typeof recentlyTerminatedMap.has === "function" && recentlyTerminatedMap.has(fId)) {
+    return false;
+  }
+  const s = String(run.status || run.state || run.phase || "").toUpperCase().trim();
+  if (!s) return false;
+  const isOom = s.includes("OOM");
+  if (
+    !isOom &&
+    ["STOPPED", "KILLED", "TERMINATED", "CANCELED", "CANCELLED", "REJECTED", "PREEMPTED", "EVICTED"].some((k) =>
+      s.includes(k)
+    )
+  ) {
+    return false;
+  }
+  if (!isOom && !["FAILED", "ERROR", "CRASH", "ABORTED"].some((k) => s.includes(k))) {
+    return false;
+  }
+  const startMs = run.startTime ? new Date(run.startTime).getTime() : 0;
+  if (!startMs || Number.isNaN(startMs) || startMs <= 0) {
+    return false;
+  }
+  if (run.endTime) {
+    const endMs = new Date(run.endTime).getTime();
+    if (Number.isNaN(endMs) || endMs < startMs) return false;
+  }
+  return true;
 }
 
 /**
@@ -3472,7 +3608,7 @@ async function buildRunPayload(job, options = {}) {
     executionCommand = `export WORKER_SLOT=${slotIndex} WORKER_INDEX=${slotIndex - 1} WORKER_TOTAL=${targetCount} WORKER_NAME="${containerName}"; ${executionCommand}`;
   }
 
-  // Batch 2 - Feature 1: Auto-sync scripts edited in the dashboard (`state.scriptFiles`) into `/group-volume/...` inside the worker container on start!
+  // Batch 2 - Feature 1: Auto-sync scripts edited in the dashboard (`state.scriptFiles`) into `/group-volume/...` or `/user-volume/...` inside the worker container on start!
   if (state.config.syncEditedScriptsOnStart !== false && state.scriptFiles) {
     for (const [scriptPath, scriptEntry] of Object.entries(state.scriptFiles)) {
       if (
@@ -3481,7 +3617,7 @@ async function buildRunPayload(job, options = {}) {
         typeof scriptEntry.content === "string" &&
         scriptEntry.content.length > 0 &&
         executionCommand.includes(scriptPath) &&
-        !executionCommand.includes("base64 -d >")
+        !executionCommand.includes(`> "${scriptPath}"`)
       ) {
         const b64 = Buffer.from(scriptEntry.content, "utf-8").toString("base64");
         const dirName = path.posix.dirname(scriptPath);
@@ -4521,7 +4657,8 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
   if (state.config.badNodeGuardEnabled !== false) {
     const rapidSecLimit = Math.max(20, Number(state.config.badNodeRapidFailSec || 180));
     const cooldownSec = Math.max(5, Number(state.config.badNodeCooldownSec || 25));
-    const failedRuns = matchingRuns.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "FAILED");
+    const recentTermMap = getSiteRuntime().recentlyTerminatedRunsMap;
+    const failedRuns = matchingRuns.filter((r) => isGenuineBadNodeFailureRun(r, recentTermMap));
     for (const fr of failedRuns.slice(0, 5)) {
       const fId = String(fr.id ?? fr.runId ?? "");
       if (!fId || badNodeStats.seenFailedRunIds.has(fId)) continue;
@@ -5615,23 +5752,9 @@ const server = http.createServer(async (req, res) => {
       if (!rawId) {
         return sendJson(res, 400, { error: "사이트 ID(예: n6, n7, n8, n9)를 입력해 주세요." });
       }
-      const gpuModel = String(body.gpuModel || (rawId === "n6" ? "A100" : "H100")).trim().toUpperCase();
       const existing = rawState.sites?.[rawId] || {};
-      rawState.sites[rawId] = {
-        id: rawId,
-        name: String(body.name || existing.name || `SPACE ${rawId.toUpperCase()} (${gpuModel} 클러스터)`).trim(),
-        shortName: String(body.shortName || existing.shortName || `${rawId.toUpperCase()} (${gpuModel})`).trim(),
-        portalUrl: String(body.portalUrl || existing.portalUrl || `https://space.${rawId}.sr-cloud.com`).trim().replace(/\/$/, ""),
-        baseUrl: String(body.baseUrl || existing.baseUrl || `https://mlp.${rawId}.sr-cloud.com`).trim().replace(/\/$/, ""),
-        sfmUrl: String(body.sfmUrl || existing.sfmUrl || `https://sfsm.${rawId}.sr-cloud.com`).trim().replace(/\/$/, ""),
-        viewerUrl: String(body.viewerUrl || existing.viewerUrl || `https://console-viewer.${rawId}.sr-cloud.com`).trim().replace(/\/$/, ""),
-        gpuModel,
-        accessToken: body.accessToken !== undefined ? String(body.accessToken).replace(/^Bearer\s+/i, "").trim() : existing.accessToken || "",
-        refreshToken: body.refreshToken !== undefined ? String(body.refreshToken).trim() : existing.refreshToken || "",
-        groupId: body.groupId !== undefined ? sanitizeGroupId(body.groupId) : existing.groupId || "SR-Coredata",
-        orgId: body.orgId !== undefined ? String(body.orgId).trim() : existing.orgId || "",
-        userName: body.userName !== undefined ? String(body.userName).trim() : existing.userName || "",
-      };
+      rawState.sites[rawId] = mergeSiteProfileUpdate(rawId, body, existing);
+      const gpuModel = rawState.sites[rawId].gpuModel;
       const hasJobForSite = (rawState.jobs || []).some((j) => normalizeSiteId(j.siteId || "n9") === rawId);
       if (!hasJobForSite) {
         rawState.jobs.push({
@@ -5691,7 +5814,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 404, { error: "해당 사이트를 찾을 수 없습니다." });
       }
       delete rawState.sites[targetSid];
-      rawState.jobs = (rawState.jobs || []).filter((j) => j.siteId !== targetSid);
+      rawState.jobs = (rawState.jobs || []).filter((j) => normalizeSiteId(j.siteId || "n9") !== targetSid);
       if (rawState.activeSiteId === targetSid) {
         rawState.activeSiteId = "n9";
       }
@@ -5910,6 +6033,7 @@ const server = http.createServer(async (req, res) => {
       const fleet = computeWorkerFleetStats(getSiteKnownRuns(targetSiteId));
       return sendJson(res, 200, {
         ok: true,
+        siteId: targetSiteId,
         targetSiteId,
         activeSiteId: rawState.activeSiteId,
         sites: buildSitesSummaryPayload(),
@@ -6592,6 +6716,15 @@ const server = http.createServer(async (req, res) => {
             // ignore
           }
         }
+        if (terminatedIds.length > 0) {
+          const termSet = new Set(terminatedIds.map(String));
+          for (const j of state.jobs) {
+            if (Array.isArray(j._knownPendingRunIds)) {
+              j._knownPendingRunIds = j._knownPendingRunIds.filter((id) => !termSet.has(String(id)));
+            }
+          }
+          saveState();
+        }
         const updatedRuns = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
         const fleet = computeWorkerFleetStats(updatedRuns);
         addLog("warn", `⏳ [Pending 워커 일괄 취소] 규칙에 매칭된 준비 대기 워커 ${terminatedIds.length}개를 일괄 취소했습니다.`, {
@@ -7252,9 +7385,13 @@ const server = http.createServer(async (req, res) => {
         const trimRes = await trimExcessPendingWorkersForJob(job, getSiteKnownRuns()).catch(() => ({ terminatedIds: [] }));
         trimmedPendingCount = trimRes.terminatedIds?.length || 0;
         if (trimmedPendingCount > 0) {
+          const targetDiffLabel =
+            job.minConcurrentRuns < prevMinConcurrent
+              ? `${prevMinConcurrent}→${job.minConcurrentRuns}워커`
+              : `Pending ${prevTargetPending}→${job.targetPendingRuns}개`;
           addLog(
             "info",
-            `✂️ [${job.name}] 목표 하향(${prevMinConcurrent}→${job.minConcurrentRuns}워커)에 맞춰 초과 Pending 워커 ${trimmedPendingCount}개 자동 취소 완료`
+            `✂️ [${job.name}] 목표 하향(${targetDiffLabel})에 맞춰 초과 Pending 워커 ${trimmedPendingCount}개 자동 취소 완료`
           );
         }
       }

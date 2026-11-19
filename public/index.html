@@ -14,7 +14,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="/style.css?v=5" />
+  <link rel="stylesheet" href="/style.css?v=6" />
 </head>
 <body>
   <!-- Password Gate Modal -->
@@ -113,7 +113,7 @@
           <h2 id="monitorQuickLogTitle">컨테이너 실시간 로그</h2>
           <div class="btn-row">
             <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">새로고침</button>
-            <button type="button" class="secondary sm" onclick="switchMainView('workloads', 'runs')">워크로드 페이지에서 크게 보기</button>
+            <button type="button" class="secondary sm" onclick="switchMainView('workloads', 'log')">워크로드 페이지에서 크게 보기</button>
             <button type="button" class="secondary sm" onclick="closeMonitorQuickLog()">닫기</button>
           </div>
         </div>
@@ -727,7 +727,7 @@
                 </label>
                 <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
                   <span>대기 한도(분)</span>
-                  <input type="number" id="cfgMaxPendingTimeoutMin" min="3" max="180" value="20" class="mono" style="width:68px;" />
+                  <input type="number" id="cfgMaxPendingTimeoutMin" min="3" max="10080" value="20" class="mono" style="width:68px;" />
                 </div>
               </div>
               <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
@@ -745,7 +745,7 @@
                 </label>
                 <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
                   <span>쿨다운(초)</span>
-                  <input type="number" id="cfgBadNodeCooldownSec" value="25" min="5" max="300" class="mono" style="width:68px;" />
+                  <input type="number" id="cfgBadNodeCooldownSec" value="25" min="5" max="3600" class="mono" style="width:68px;" />
                 </div>
               </div>
               <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
@@ -764,9 +764,9 @@
                 <input type="checkbox" id="cfgTimeScaleEnabled" /> 시간대별(주간 · 야간 · 주말) 목표 워커 수 자동 전환 사용
               </label>
               <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; align-items:center; font-size:12.5px; color:var(--muted);">
-                <span>주간 목표 <input type="number" id="cfgDayTargetWorkers" min="1" max="256" value="20" class="mono" style="width:72px; margin-left:4px;" /></span>
-                <span>야간 목표 <input type="number" id="cfgNightTargetWorkers" min="1" max="256" value="48" class="mono" style="width:72px; margin-left:4px;" /></span>
-                <span>주말 목표 <input type="number" id="cfgWeekendTargetWorkers" min="1" max="256" value="64" class="mono" style="width:72px; margin-left:4px;" /></span>
+                <span>주간 목표 <input type="number" id="cfgDayTargetWorkers" min="1" max="9999" value="20" class="mono" style="width:72px; margin-left:4px;" /></span>
+                <span>야간 목표 <input type="number" id="cfgNightTargetWorkers" min="1" max="9999" value="48" class="mono" style="width:72px; margin-left:4px;" /></span>
+                <span>주말 목표 <input type="number" id="cfgWeekendTargetWorkers" min="1" max="9999" value="64" class="mono" style="width:72px; margin-left:4px;" /></span>
               </div>
             </div>
 
@@ -808,6 +808,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=22"></script>
+  <script src="/app.js?v=23"></script>
 </body>
 </html>
