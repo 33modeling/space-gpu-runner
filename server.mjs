@@ -1073,6 +1073,26 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
   }
   const reqLatencyMs = Date.now() - reqStartMs;
 
+  if (res.status === 401 && state.config.refreshToken && !isRetry && !endpoint.includes("/api/acm/token")) {
+    const errPreview = await res.text().catch(() => "");
+    if (!errPreview.includes("insufficient permission")) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) {
+        return spaceRequest(endpoint, options, true);
+      }
+    }
+    if (!skipTelemetry) {
+      recordApiTelemetry({
+        endpoint,
+        latencyMs: reqLatencyMs,
+        status: res.status,
+        ok: false,
+        errorMsg: errPreview.slice(0, 200) || "HTTP 401",
+      });
+    }
+    throw new Error(`SPACE API Error [401] ${endpoint}: ${errPreview.slice(0, 300) || "Unauthorized"}`);
+  }
+
   if (rawResponse) {
     const text = await res.text();
     if (!skipTelemetry) {
@@ -1092,16 +1112,6 @@ async function spaceRequest(endpoint, options = {}, isRetry = false) {
 
   const contentType = res.headers.get("content-type") || "";
   const data = contentType.includes("application/json") ? await res.json().catch(() => null) : await res.text();
-
-  if (res.status === 401 && state.config.refreshToken && !isRetry && !endpoint.includes("/api/acm/token")) {
-    const errStr = typeof data === "object" && data !== null ? JSON.stringify(data) : String(data || "");
-    if (!errStr.includes("insufficient permission")) {
-      const refreshed = await refreshAccessToken();
-      if (refreshed) {
-        return spaceRequest(endpoint, options, true);
-      }
-    }
-  }
 
   if (!res.ok) {
     const errMsg = typeof data === "object" && data !== null ? data.message || data.detail || data.error || JSON.stringify(data) : String(data);
@@ -1318,6 +1328,74 @@ function resolveSiteCoreName(coreId, rawCoreName = null, siteId = getCurrentSite
   return `${gpuModel} (Core #${coreId})`;
 }
 
+function shouldAlertAccessTokenExpiring({
+  accessJwt = null,
+  refreshToken = "",
+  lastDeadRefreshToken = "",
+  nowMs = Date.now(),
+} = {}) {
+  const remSec = accessJwt?.exp ? Math.floor(accessJwt.exp - nowMs / 1000) : null;
+  if (remSec === null) {
+    return { shouldAlert: false, shouldProactiveRefresh: false, bucket: null, remainingSec: null, reason: null };
+  }
+
+  const cleanRt = String(refreshToken || "").trim();
+  const rtJwt = cleanRt ? decodeJwtPayload(cleanRt) : null;
+  const rtRemSec = rtJwt?.exp ? Math.floor(rtJwt.exp - nowMs / 1000) : null;
+  const isRefreshDead = !cleanRt || cleanRt === lastDeadRefreshToken || (rtRemSec !== null && rtRemSec <= 0);
+  const shouldProactiveRefresh = !isRefreshDead && remSec <= 300;
+
+  if (!isRefreshDead) {
+    // 1. Refresh Token itself is about to expire within 30 minutes -> warn once per 15m bucket
+    if (rtRemSec !== null && rtRemSec > 0 && rtRemSec <= 1800) {
+      return {
+        shouldAlert: true,
+        shouldProactiveRefresh,
+        bucket: `rt-${Math.ceil(rtRemSec / 900)}`,
+        remainingSec: rtRemSec,
+        reason: "refresh_token_expiring",
+      };
+    }
+    // 2. Refresh Token is healthy, so normal 30m Access Token countdown must NOT spam alerts;
+    //    only alert if Access Token dropped below 120s AND proactive refresh still hasn't renewed it.
+    if (remSec > 0 && remSec <= 120) {
+      return {
+        shouldAlert: true,
+        shouldProactiveRefresh: true,
+        bucket: "at-imminent-after-refresh-fail",
+        remainingSec: remSec,
+        reason: "refresh_failed_imminent",
+      };
+    }
+    return {
+      shouldAlert: false,
+      shouldProactiveRefresh,
+      bucket: null,
+      remainingSec: remSec,
+      reason: null,
+    };
+  }
+
+  // No usable Refresh Token -> alert at 30m and 15m before Access Token expires
+  if (remSec > 0 && remSec <= 1800) {
+    return {
+      shouldAlert: true,
+      shouldProactiveRefresh: false,
+      bucket: `at-${Math.ceil(remSec / 900)}`,
+      remainingSec: remSec,
+      reason: "no_refresh_token",
+    };
+  }
+
+  return {
+    shouldAlert: false,
+    shouldProactiveRefresh: false,
+    bucket: null,
+    remainingSec: remSec,
+    reason: null,
+  };
+}
+
 async function refreshAccessToken(siteId = getCurrentSiteId()) {
   const rtState = getSiteRuntime(siteId);
   const siteCfg = getSiteProfile(siteId);
@@ -1329,6 +1407,9 @@ async function refreshAccessToken(siteId = getCurrentSiteId()) {
   const rtJwt = decodeJwtPayload(rt);
   if (rtJwt?.exp && rtJwt.exp * 1000 < Date.now()) {
     rtState.lastDeadRefreshToken = rt;
+    return false;
+  }
+  if (rtState.refreshBackoffUntilMs && Date.now() < rtState.refreshBackoffUntilMs) {
     return false;
   }
   if (rtState.refreshInFlightPromise) {
@@ -1352,13 +1433,25 @@ async function refreshAccessToken(siteId = getCurrentSiteId()) {
       if (!res.ok) {
         const errText = await res.text();
         recordApiTelemetry({ endpoint: "/api/acm/token", latencyMs, status: res.status, ok: false, errorMsg: errText });
-        if (res.status === 400 || res.status === 401) {
+        if (res.status === 400 || res.status === 401 || res.status === 403) {
           rtState.lastDeadRefreshToken = rt;
+          addLog("error", `Access Token 자동 갱신 실패 (HTTP ${res.status} · Refresh Token 만료) — 시스템 설정에서 새 토큰을 등록해 주세요.`, {
+            siteId,
+            error: errText.slice(0, 200),
+          });
+        } else {
+          rtState.refreshTransientErrorCount = (rtState.refreshTransientErrorCount || 0) + 1;
+          const backoffSec = Math.min(60, 15 * Math.min(4, rtState.refreshTransientErrorCount));
+          rtState.refreshBackoffUntilMs = Date.now() + backoffSec * 1000;
+          if (!rtState.lastRefreshErrLogAtMs || Date.now() - rtState.lastRefreshErrLogAtMs >= 60_000) {
+            rtState.lastRefreshErrLogAtMs = Date.now();
+            addLog(
+              "warn",
+              `⚠️ [일시적 게이트웨이 지연] 토큰 갱신 서버 응답 오류(HTTP ${res.status}) — ${backoffSec}초 후 자동 재시도합니다 (Refresh Token 유지됨)`,
+              { siteId, status: res.status, error: errText.slice(0, 180) }
+            );
+          }
         }
-        addLog("error", `Access Token 자동 갱신 실패 (HTTP ${res.status}) — 1번 카드에서 새 토큰을 붙여넣어 주세요.`, {
-          siteId,
-          error: errText.slice(0, 200),
-        });
         return false;
       }
       recordApiTelemetry({ endpoint: "/api/acm/token", latencyMs, status: res.status, ok: true });
@@ -1367,6 +1460,8 @@ async function refreshAccessToken(siteId = getCurrentSiteId()) {
       const newRefresh = data?.refresh_token || data?.data?.refresh_token;
       if (newAccess) {
         rtState.lastDeadRefreshToken = "";
+        rtState.refreshTransientErrorCount = 0;
+        rtState.refreshBackoffUntilMs = 0;
         siteCfg.accessToken = newAccess;
         if (newRefresh) siteCfg.refreshToken = newRefresh;
         saveState();
@@ -1374,7 +1469,15 @@ async function refreshAccessToken(siteId = getCurrentSiteId()) {
         return true;
       }
     } catch (e) {
-      addLog("error", `Access Token 갱신 중 예외 발생: ${e.message}`, { siteId });
+      rtState.refreshTransientErrorCount = (rtState.refreshTransientErrorCount || 0) + 1;
+      const backoffSec = Math.min(60, 15 * Math.min(4, rtState.refreshTransientErrorCount));
+      rtState.refreshBackoffUntilMs = Date.now() + backoffSec * 1000;
+      if (!rtState.lastRefreshErrLogAtMs || Date.now() - rtState.lastRefreshErrLogAtMs >= 60_000) {
+        rtState.lastRefreshErrLogAtMs = Date.now();
+        addLog("warn", `⚠️ [네트워크 지연] Access Token 갱신 요청 지연(${e.message}) — ${backoffSec}초 후 자동 재시도합니다`, {
+          siteId,
+        });
+      }
     }
     return false;
   })();
@@ -2253,6 +2356,55 @@ function buildAutoApprovalTimeline(allRuns = getSiteKnownRuns()) {
   return list.slice(0, 40);
 }
 
+function shouldAutoApproveItem(
+  item,
+  {
+    scope = "all_group",
+    currentUser = "",
+    jobs = [],
+    trackedRunIds = null,
+    targetRunId = null,
+    targetRunName = null,
+    forceAll = false,
+  } = {}
+) {
+  if (!item || typeof item !== "object") return false;
+  if (forceAll || scope === "all_group") return true;
+
+  const rId = String(item.runId || item.id || "");
+  const rName = String(item.runName || item.name || item.containerName || "");
+  const itemUser = String(item.userId || item.userName || item.user || "").trim();
+
+  if (targetRunId && rId === String(targetRunId)) return true;
+  if (targetRunName && (rName === String(targetRunName) || rId === String(targetRunName))) return true;
+  if (trackedRunIds && typeof trackedRunIds.has === "function" && trackedRunIds.has(rId)) return true;
+
+  const ownedByMe = isRunOwnedByUser({ userId: itemUser }, currentUser);
+  if (ownedByMe && Array.isArray(jobs)) {
+    for (const j of jobs) {
+      if (!j || j.autoApprove === false) continue;
+      const pref28 = getJobContainerPrefix(j);
+      const pref32 = String(j.name || "gpu-job")
+        .replace(/[^a-zA-Z0-9-]/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 32);
+      if (
+        (pref28 && (rName === pref28 || rName.startsWith(pref28 + "-"))) ||
+        (pref32 && (rName === pref32 || rName.startsWith(pref32 + "-")))
+      ) {
+        return true;
+      }
+    }
+  }
+
+  if (scope === "my_runs") {
+    if (currentUser && currentUser !== "admin" && itemUser && itemUser.toLowerCase() === currentUser.toLowerCase()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function processPendingApprovals(options = {}) {
   const rt = getSiteRuntime();
   const { targetRunId = null, targetRunName = null, forceAll = false } = options;
@@ -2277,14 +2429,6 @@ async function processPendingApprovals(options = {}) {
     }
 
     const currentUser = resolveCurrentUserName();
-    const jobPrefixes = state.jobs
-      .filter((j) => j.autoApprove !== false)
-      .map((j) =>
-        String(j.name || "gpu-job")
-          .replace(/[^a-zA-Z0-9-]/g, "-")
-          .replace(/^-+|-+$/g, "")
-          .slice(0, 32)
-      );
     const trackedRunIds = new Set(state.jobs.filter((j) => j.autoApprove !== false && j.lastRunId).map((j) => String(j.lastRunId)));
     if (targetRunId) trackedRunIds.add(String(targetRunId));
 
@@ -2298,24 +2442,16 @@ async function processPendingApprovals(options = {}) {
     approvalLoopStats.nextCheckAt = new Date(nowMs + (approvalLoopStats.effectiveIntervalSec || 3) * 1000).toISOString();
     approvalLoopStats.lastError = summary.errors?.approvals || summary.errors?.taskOrbit || null;
 
-    const shouldApproveItem = (item) => {
-      if (forceAll || scope === "all_group") return true;
-      const rId = String(item.runId || item.id || "");
-      const rName = String(item.runName || item.name || item.containerName || "");
-      const itemUser = String(item.userId || item.userName || "");
-
-      if (targetRunId && rId === String(targetRunId)) return true;
-      if (targetRunName && (rName === String(targetRunName) || rId.includes(String(targetRunName)))) return true;
-      if (trackedRunIds.has(rId)) return true;
-      if (jobPrefixes.some((pref) => pref && (rName.startsWith(pref) || rId.startsWith(pref)))) return true;
-
-      if (scope === "my_runs") {
-        if (currentUser && currentUser !== "admin" && itemUser && itemUser.toLowerCase() === currentUser.toLowerCase()) {
-          return true;
-        }
-      }
-      return false;
-    };
+    const shouldApproveItem = (item) =>
+      shouldAutoApproveItem(item, {
+        scope,
+        currentUser,
+        jobs: state.jobs,
+        trackedRunIds,
+        targetRunId,
+        targetRunName,
+        forceAll,
+      });
 
     // 1. Approve in `/taskorbit/api/v1/approvals` (primary `/run-approval` table used by Admin)
     for (const item of summary.approvals) {
@@ -2448,22 +2584,22 @@ async function processPendingApprovals(options = {}) {
       }
     }
 
-    // 4. Sync `job.lastStatus` if a job's `lastRunId` was waiting for approval and is now confirmed `approved`
+    // 4. Sync `job.lastStatus` ONLY if `job.lastStatus` was actively waiting on approval (`"승인 추적 중"`)
     let stateChanged = false;
+    const knownRunsNow = getSiteKnownRuns();
     for (const job of state.jobs) {
-      if (!job.lastRunId) continue;
+      if (!job.enabled || !job.lastRunId || !job.lastStatus || !job.lastStatus.includes("승인 추적 중")) continue;
       const matchedApproval = (summary.recentApprovals || []).find(
         (a) => String(a.runId) === String(job.lastRunId) && String(a.status || "").toLowerCase() === "approved"
       );
-      if (
-        matchedApproval &&
-        job.lastStatus &&
-        !job.lastStatus.includes("승인 완료") &&
-        !job.lastStatus.includes("목표 워커 수 달성") &&
-        !job.lastStatus.includes("자동 증설 중")
-      ) {
+      if (matchedApproval) {
         const typeTag = job.allowSpot ? "🟧 Spot" : "🟦 Standard";
-        job.lastStatus = `${typeTag} 제출 및 ✅ Admin 승인 완료 (${matchedApproval.runName || job.name} · #${job.lastRunId} → GPU 실행 중)`;
+        const knownRun = knownRunsNow.find((r) => String(r.id ?? r.runId ?? "") === String(job.lastRunId));
+        const isAlreadyRunning = knownRun
+          ? String(knownRun.status || knownRun.state || knownRun.phase || "").toUpperCase().includes("RUNNING")
+          : false;
+        const phaseNote = isAlreadyRunning ? "GPU 실행 중" : "클러스터 대기열(Pending) 진입";
+        job.lastStatus = `${typeTag} 제출 및 ✅ Admin 승인 완료 (${matchedApproval.runName || job.name} · #${job.lastRunId} → ${phaseNote})`;
         stateChanged = true;
       }
     }
@@ -2471,8 +2607,13 @@ async function processPendingApprovals(options = {}) {
       saveState();
     }
 
-    const remainingPending = Math.max(0, summary.approvals.length - approvedItems.length);
+    const actionablePendingTotal = summary.approvals.filter(
+      (item) => (!item.status || String(item.status).toLowerCase() === "pending") && shouldApproveItem(item)
+    ).length;
+    const remainingPending = Math.max(0, actionablePendingTotal - approvedItems.length);
+    const groupRemainingPending = Math.max(0, summary.approvals.length - approvedItems.length);
     approvalLoopStats.pendingCount = remainingPending;
+    approvalLoopStats.groupPendingCount = groupRemainingPending;
     approvalLoopStats.recentApprovedCount = (summary.recentApprovals || []).filter(
       (a) => String(a.status || "").toLowerCase() === "approved"
     ).length;
@@ -2481,6 +2622,7 @@ async function processPendingApprovals(options = {}) {
       approvedCount: approvedItems.length,
       items: approvedItems,
       pendingApprovalsTotal: remainingPending,
+      groupPendingApprovalsTotal: groupRemainingPending,
       pendingTaskOrbitTotal: summary.pendingApprovalRuns.length,
       loopStats: approvalLoopStats,
     };
@@ -3385,16 +3527,65 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
 }
 
 /**
- * Feature 1: Zombie / Stuck Pending Worker Watchdog Sweep
- * Automatically terminates non-Running active workers (`Pending`/`Creating`/`Approved`)
- * only when stuck longer than `maxPendingTimeoutMin` minutes (minimum 120 minutes for normal Pending queue runs
- * so workers legitimately waiting for cluster GPU nodes are never prematurely killed and re-created).
+ * Feature 1: Zombie / Stuck Worker Watchdog Sweep
+ * - Terminates true container startup hangs (`Creating`, `ContainerCreating`, `Initializing`, `Starting`, `Pulling`, `Migrating`)
+ *   when stuck longer than `maxPendingTimeoutMin` minutes.
+ * - Preserves normal FIFO cluster queue waiting runs (`Pending`, `Queued`, `Waiting`, `Approved`, `Scheduled`)
+ *   so workers waiting for physical GPUs NEVER lose their queue seniority (unless `recycleQueuePending === true` and `targetPendingRuns === 0`).
  */
+function shouldWatchdogTerminateNonRunningRun(
+  run,
+  matchedJob = null,
+  nowMs = Date.now(),
+  configuredPendingMin = 20,
+  recycleQueuePending = false
+) {
+  if (!run || typeof run !== "object") return { terminate: false, reason: "invalid_run" };
+  const stUpper = String(run.status || run.state || run.phase || "").toUpperCase().trim();
+  if (!stUpper || stUpper.includes("RUNNING")) {
+    return { terminate: false, reason: "running_or_empty" };
+  }
+
+  const timeBasis = run.startTime || run.registerTime || run.createdAt || null;
+  const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
+  if (!startMs || Number.isNaN(startMs)) {
+    return { terminate: false, reason: "missing_timestamp" };
+  }
+  const stuckMs = Math.max(0, nowMs - startMs);
+  const stuckMin = Math.round(stuckMs / 60000);
+
+  const isContainerInitPhase = ["CREATING", "INITIALIZING", "STARTING", "PULL", "MIGRATING"].some((k) =>
+    stUpper.includes(k)
+  );
+  const isFifoQueueWaiting =
+    !isContainerInitPhase &&
+    ["PENDING", "QUEUE", "WAIT", "APPROV", "ADMITTED", "SCHEDULED"].some((k) => stUpper.includes(k));
+
+  if (isFifoQueueWaiting) {
+    const hasPendingQueuePolicy = Number(matchedJob?.targetPendingRuns || 0) > 0;
+    if (hasPendingQueuePolicy || !recycleQueuePending) {
+      return { terminate: false, reason: "fifo_queue_protected", stuckMin };
+    }
+    const queueTimeoutMin = Math.max(360, Number(configuredPendingMin || 120));
+    if (stuckMs >= queueTimeoutMin * 60 * 1000) {
+      return { terminate: true, reason: "queue_recycle_timeout", stuckMin };
+    }
+    return { terminate: false, reason: "within_queue_timeout", stuckMin };
+  }
+
+  const initTimeoutMin = Math.max(10, Number(configuredPendingMin || 20));
+  if (stuckMs >= initTimeoutMin * 60 * 1000) {
+    return { terminate: true, reason: "container_init_stuck", stuckMin };
+  }
+  return { terminate: false, reason: "within_init_timeout", stuckMin };
+}
+
 async function runWatchdogSweep(allRuns = getSiteKnownRuns()) {
   watchdogStats.lastSweepAt = new Date().toISOString();
   if (state.config.watchdogEnabled === false) return { terminatedIds: [] };
 
-  const configuredPendingMin = Math.max(10, Number(state.config.maxPendingTimeoutMin || 120));
+  const configuredPendingMin = Math.max(10, Number(state.config.maxPendingTimeoutMin || 20));
+  const recycleQueuePending = Boolean(state.config.recycleQueuePending);
   const now = Date.now();
   const runsList = Array.isArray(allRuns) ? allRuns : [];
 
@@ -3408,47 +3599,36 @@ async function runWatchdogSweep(allRuns = getSiteKnownRuns()) {
     (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
 
-  // If the user configured a target Pending queue (`targetPendingRuns > 0`) or a long allocation interval (`>= 180s`),
-  // Pending workers are intentionally waiting in the cluster queue for free GPU nodes and should not be killed early.
-  const hasLongQueuePolicy = state.jobs.some(
-    (j) => j.enabled && (Number(j.targetPendingRuns || 0) > 0 || Number(j.cooldownSec || 0) >= 180)
-  );
-
   const terminatedIds = [];
   for (const r of nonRunningActive) {
-    const stUpper = String(r.status || r.state || r.phase || "").toUpperCase();
-    const isNormalQueuePending =
-      stUpper.includes("PENDING") || stUpper.includes("QUEUE") || stUpper.includes("WAIT") || stUpper.includes("APPROV");
-    // Normal cluster queue Pending runs wait at least 180 minutes (or 360 minutes under long-queue policy)
-    const effectiveTimeoutMin = isNormalQueuePending
-      ? Math.max(hasLongQueuePolicy ? 360 : 180, configuredPendingMin)
-      : configuredPendingMin;
-    const maxPendingMs = effectiveTimeoutMin * 60 * 1000;
-
-    const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
-    const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
-    if (!startMs || Number.isNaN(startMs)) continue;
-    const stuckMs = now - startMs;
-    if (stuckMs >= maxPendingMs) {
+    const matchedJob = state.jobs.find((j) => doesRunMatchJob(r, j, state.jobs)) || null;
+    const check = shouldWatchdogTerminateNonRunningRun(
+      r,
+      matchedJob,
+      now,
+      configuredPendingMin,
+      recycleQueuePending
+    );
+    if (check.terminate) {
       const rId = String(r.id ?? r.runId ?? "");
       const rName = r.containerName || r.name || `#${rId}`;
-      const stuckMin = Math.round(stuckMs / 60000);
+      const stuckMin = check.stuckMin;
       try {
         await spaceApi.terminateRun(rId);
         markRunRecentlyTerminated(rId);
         terminatedIds.push(rId);
         watchdogStats.zombieTerminatedCount += 1;
-        watchdogStats.lastActionMessage = `먹통 Pending 워커 ${rName} (#${rId}, ${stuckMin}분 경과) 자동 종료`;
+        watchdogStats.lastActionMessage = `먹통 컨테이너 ${rName} (#${rId}, ${stuckMin}분 경과) 자동 종료`;
         addLog(
           "warn",
           `🧟 [Watchdog 좀비 워커 자동 정리] ${rName} (#${rId})가 ${stuckMin}분째 '${r.status || r.state}' 상태로 멈춰 있어 자동 종료했습니다. 새 워커로 교체합니다.`,
-          { runId: rId, runName: rName, stuckMin }
+          { runId: rId, runName: rName, stuckMin, reason: check.reason }
         );
         if (state.config.notifyOnZombieTerminated !== false) {
           await pushAlertNotification(
             "warn",
-            `좀비 Pending 워커 자동 교체 (${rName})`,
-            `${rName} (#${rId}) 워커가 ${stuckMin}분 동안 Running으로 진입하지 못해 자동 종료 후 재할당합니다.`,
+            `좀비 워커 자동 교체 (${rName})`,
+            `${rName} (#${rId}) 워커가 ${stuckMin}분 동안 '${r.status || r.state}' 상태에서 진행되지 않아 자동 종료 후 재할당합니다.`,
             { runId: rId, stuckMin, dedupeKey: `zombie-${rId}` }
           );
         }
@@ -5075,24 +5255,53 @@ async function runSchedulerTick(manual = false, options = {}) {
     // Feature 5: Dynamically apply KST Time-of-Day / Weekend Auto-Scaling target worker counts if enabled
     applyTimeScaleToJobs();
 
-    // Feature 6: Check JWT token remaining time and trigger alert if expiring within 30 minutes
-    const jwt = decodeJwtPayload(state.config.accessToken);
-    if (jwt?.exp && state.config.notifyOnTokenExpiring !== false) {
-      const remSec = Math.floor(jwt.exp - Date.now() / 1000);
-      if (remSec > 0 && remSec <= 1800) {
-        const bucket = Math.ceil(remSec / 900); // alert at 30m and 15m buckets
-        if (rt.lastTokenExpiryAlertBucket !== bucket) {
-          rt.lastTokenExpiryAlertBucket = bucket;
-          const remMin = Math.max(1, Math.round(remSec / 60));
-          await pushAlertNotification(
-            "warn",
-            `[${getSiteProfile().name}] SPACE Access Token 만료 임박 (${remMin}분 남음)`,
-            `${getSiteProfile().name}의 Access Token이 약 ${remMin}분 후 만료됩니다. 자동 갱신(Refresh Token) 상태를 확인하거나 새 토큰을 등록해 주세요.`,
-            { siteId: getCurrentSiteId(), remainingSec: remSec, dedupeKey: `token-exp-${getCurrentSiteId()}-${bucket}` }
-          );
+    // Feature 6: Proactively renew Access Token via Refresh Token at <=5m remaining,
+    // and only emit expiry warnings when auto-refresh is unavailable, Refresh Token itself is expiring, or auto-refresh failed!
+    let jwt = decodeJwtPayload(state.config.accessToken);
+    if (jwt?.exp) {
+      let tokenCheck = shouldAlertAccessTokenExpiring({
+        accessJwt: jwt,
+        refreshToken: state.config.refreshToken,
+        lastDeadRefreshToken: rt.lastDeadRefreshToken,
+        nowMs: Date.now(),
+      });
+      if (tokenCheck.shouldProactiveRefresh) {
+        const renewed = await refreshAccessToken();
+        if (renewed) {
+          jwt = decodeJwtPayload(state.config.accessToken);
+          tokenCheck = shouldAlertAccessTokenExpiring({
+            accessJwt: jwt,
+            refreshToken: state.config.refreshToken,
+            lastDeadRefreshToken: rt.lastDeadRefreshToken,
+            nowMs: Date.now(),
+          });
         }
-      } else if (remSec > 1800) {
-        rt.lastTokenExpiryAlertBucket = null;
+      }
+      if (state.config.notifyOnTokenExpiring !== false) {
+        if (tokenCheck.shouldAlert && tokenCheck.bucket) {
+          if (rt.lastTokenExpiryAlertBucket !== tokenCheck.bucket) {
+            rt.lastTokenExpiryAlertBucket = tokenCheck.bucket;
+            const remMin = Math.max(1, Math.round((tokenCheck.remainingSec || 60) / 60));
+            const isRtExpiring = tokenCheck.reason === "refresh_token_expiring";
+            await pushAlertNotification(
+              "warn",
+              isRtExpiring
+                ? `[${getSiteProfile().name}] SPACE Refresh 세션 만료 임박 (${remMin}분 남음)`
+                : `[${getSiteProfile().name}] SPACE Access Token 만료 임박 (${remMin}분 남음)`,
+              isRtExpiring
+                ? `${getSiteProfile().name}의 Refresh Token 세션이 약 ${remMin}분 후 만료됩니다. 시스템 설정에서 새 토큰을 갱신해 주세요.`
+                : `${getSiteProfile().name}의 Access Token이 약 ${remMin}분 후 만료되며 자동 갱신을 사용할 수 없습니다. 새 토큰을 등록해 주세요.`,
+              {
+                siteId: getCurrentSiteId(),
+                remainingSec: tokenCheck.remainingSec,
+                reason: tokenCheck.reason,
+                dedupeKey: `token-exp-${getCurrentSiteId()}-${tokenCheck.bucket}`,
+              }
+            );
+          }
+        } else if (!tokenCheck.shouldAlert) {
+          rt.lastTokenExpiryAlertBucket = null;
+        }
       }
     }
 
@@ -7253,7 +7462,12 @@ const server = http.createServer(async (req, res) => {
             ? toSafeInt(body.maxTotalSucceededRuns, existingJob?.maxTotalSucceededRuns ?? 0, 0, 999999)
             : existingJob?.maxTotalSucceededRuns,
         nextStageCommand: body.nextStageCommand !== undefined ? String(body.nextStageCommand) : existingJob?.nextStageCommand,
-        _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
+        _stage2Transitioned:
+          existingJob &&
+          String(body.executionCommand || "").trim() &&
+          String(body.executionCommand).trim() !== String(existingJob.executionCommand || "").trim()
+            ? false
+            : Boolean(existingJob?._stage2Transitioned),
         _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
         _pendingRefillImmediate: true,
         lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
@@ -7538,7 +7752,12 @@ const server = http.createServer(async (req, res) => {
               : existingJob?.maxTotalSucceededRuns,
           nextStageCommand:
             d.nextStageCommand !== undefined ? String(d.nextStageCommand) : existingJob?.nextStageCommand,
-          _stage2Transitioned: Boolean(existingJob?._stage2Transitioned),
+          _stage2Transitioned:
+            existingJob &&
+            String(d.executionCommand || "").trim() &&
+            String(d.executionCommand).trim() !== String(existingJob.executionCommand || "").trim()
+              ? false
+              : Boolean(existingJob?._stage2Transitioned),
           _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
           lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
           lastTriggeredAt: existingJob ? existingJob.lastTriggeredAt : null,

@@ -61,13 +61,16 @@ function createServerLogicSandbox() {
     "writeStateFileAtomic",
     "readStateJsonWithFallback",
     "decodeJwtPayload",
+    "shouldAlertAccessTokenExpiring",
     "sanitizeGroupId",
     "mergeSiteProfileUpdate",
     "resolveSfmFilePaths",
     "detectSiteIdFromTokenOrText",
     "isRunOwnedByUser",
+    "shouldAutoApproveItem",
     "classifyRunStatus",
     "isGenuineBadNodeFailureRun",
+    "shouldWatchdogTerminateNonRunningRun",
     "selectPreferredGpuCore",
     "getInFlightReservationsForJob",
     "reserveWorkerSlot",
@@ -1058,12 +1061,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=6`, `/app.js?v=23`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=6`, `/app.js?v=24`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=6`),
-      fetch(`${BASE_URL}/app.js?v=23`),
+      fetch(`${BASE_URL}/app.js?v=24`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1071,9 +1074,165 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes('/app.js?v=23'), true, "라이브 index.html이 최신 캐시버전 app.js?v=23을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=24"), true, "라이브 index.html이 최신 캐시버전 app.js?v=24을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
+  });
+
+  test("TC-41: `shouldWatchdogTerminateNonRunningRun` FIFO 클러스터 대기열(`Pending`) 순번 보존 및 진짜 컨테이너 생성 먹통(`Creating`)만 종료 검증", () => {
+    const nowMs = Date.now();
+    const eightHoursAgoIso = new Date(nowMs - 8 * 60 * 60 * 1000).toISOString();
+    const thirtyMinAgoIso = new Date(nowMs - 30 * 60 * 1000).toISOString();
+    const pendingQueueJob = { id: "job-v8", name: "v8", targetPendingRuns: 6 };
+    const normalJob = { id: "job-std", name: "worker-std", targetPendingRuns: 0 };
+
+    // 1. Workers in FIFO cluster queue (`Pending` / `Queued` / `Approved` / `Scheduled`) must NOT lose 8 hours of queue seniority!
+    for (const qState of ["Pending", "Queued", "Approved", "Scheduled", "Waiting"]) {
+      const resQueue = srv.shouldWatchdogTerminateNonRunningRun(
+        { id: "368273", status: qState, registerTime: eightHoursAgoIso },
+        pendingQueueJob,
+        nowMs,
+        20,
+        false
+      );
+      assert.equal(resQueue.terminate, false, `${qState} 대기열 워커는 8시간 대기 중이어도 큐 순번 보존을 위해 강제 종료하면 안 됨`);
+
+      const resStdQueue = srv.shouldWatchdogTerminateNonRunningRun(
+        { id: "368274", status: qState, registerTime: eightHoursAgoIso },
+        normalJob,
+        nowMs,
+        20,
+        false
+      );
+      assert.equal(resStdQueue.terminate, false, `기본 정책(recycleQueuePending=false)에서 정상 ${qState} 대기열 워커를 종료하면 안 됨`);
+    }
+
+    // 2. Genuinely stuck container initialization states (`Creating`, `ContainerCreating`, `Initializing`, `Pulling`) MUST be replaced!
+    for (const stuckState of ["Creating", "ContainerCreating", "Initializing", "ImagePulling", "Starting"]) {
+      const resStuck = srv.shouldWatchdogTerminateNonRunningRun(
+        { id: "369001", status: stuckState, registerTime: thirtyMinAgoIso },
+        pendingQueueJob,
+        nowMs,
+        20,
+        false
+      );
+      assert.equal(resStuck.terminate, true, `${stuckState} 상태에서 30분째 멈춘 컨테이너는 좀비로 감지해 교체해야 함`);
+    }
+  });
+
+  test("TC-42: `shouldAlertAccessTokenExpiring` Refresh Token 정상 시 15분 주기 오탐 알림 차단 및 5xx 게이트웨이 백오프 검증", () => {
+    const nowMs = Date.now();
+    const makeJwtToken = (expSecFromNow) => {
+      const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+      const payload = Buffer.from(JSON.stringify({ exp: Math.floor(nowMs / 1000) + expSecFromNow })).toString("base64url");
+      return `${header}.${payload}.sig`;
+    };
+
+    const healthyRefresh = makeJwtToken(6 * 3600); // 6h remaining on Refresh Token
+    const expiringRefresh = makeJwtToken(20 * 60); // 20m remaining on Refresh Token
+
+    // 1. Access Token has 27m or 13m left, Refresh Token is healthy -> NO false-alarm alert!
+    const at27m = srv.shouldAlertAccessTokenExpiring({
+      accessJwt: { exp: Math.floor(nowMs / 1000) + 27 * 60 },
+      refreshToken: healthyRefresh,
+      lastDeadRefreshToken: "",
+      nowMs,
+    });
+    assert.equal(at27m.shouldAlert, false, "Refresh Token이 유효할 때 27분 남은 Access Token으로 오탐 경고를 띄우면 안 됨");
+    assert.equal(at27m.shouldProactiveRefresh, false);
+
+    // 2. Access Token has 4m left (<= 300s), Refresh Token is healthy -> trigger proactive refresh without spamming alert!
+    const at4m = srv.shouldAlertAccessTokenExpiring({
+      accessJwt: { exp: Math.floor(nowMs / 1000) + 240 },
+      refreshToken: healthyRefresh,
+      lastDeadRefreshToken: "",
+      nowMs,
+    });
+    assert.equal(at4m.shouldAlert, false, "선제 자동 갱신 구간(4분 남음)에서는 갱신을 먼저 수행하고 오탐 알림을 보내지 않아야 함");
+    assert.equal(at4m.shouldProactiveRefresh, true, "만료 5분 이하 진입 시 선제 토큰 자동 갱신 플래그가 켜져야 함");
+
+    // 3. Refresh Token itself has 20m left -> SHOULD alert about Refresh session expiry!
+    const rtExp = srv.shouldAlertAccessTokenExpiring({
+      accessJwt: { exp: Math.floor(nowMs / 1000) + 15 * 60 },
+      refreshToken: expiringRefresh,
+      lastDeadRefreshToken: "",
+      nowMs,
+    });
+    assert.equal(rtExp.shouldAlert, true);
+    assert.equal(rtExp.reason, "refresh_token_expiring");
+
+    // 4. No Refresh Token at all & Access Token has 20m left -> SHOULD alert!
+    const noRt = srv.shouldAlertAccessTokenExpiring({
+      accessJwt: { exp: Math.floor(nowMs / 1000) + 20 * 60 },
+      refreshToken: "",
+      lastDeadRefreshToken: "",
+      nowMs,
+    });
+    assert.equal(noRt.shouldAlert, true);
+    assert.equal(noRt.reason, "no_refresh_token");
+
+    // 5. Verify `refreshAccessToken` implements `refreshBackoffUntilMs` so HTTP 503 gateway blips never hammer `/api/acm/token`
+    const refreshFnSrc = extractFunctionSource(serverSrc, "refreshAccessToken");
+    assert.equal(
+      refreshFnSrc.includes("refreshBackoffUntilMs"),
+      true,
+      "refreshAccessToken에 5xx/네트워크 오류 백오프(refreshBackoffUntilMs)가 적용되어야 함"
+    );
+  });
+
+  test("TC-43: `shouldAutoApproveItem` 공유 그룹(`SR-Coredata`) 내 접두사 하이픈 경계 및 소유자 검증, `job.lastStatus` 덮어쓰기 방지 검증", () => {
+    const jobs = [{ id: "job-v8", name: "v8", autoApprove: true }];
+    const trackedIds = new Set(["370327"]);
+
+    // 1. Colleague's run with similar prefix (`v80-colleague` or `v8-colleague`) MUST NOT be auto-approved under `my_runs` or `job_only`!
+    assert.equal(
+      srv.shouldAutoApproveItem(
+        { id: "app-1", runId: "99901", runName: "v80-colleague-01", userId: "colleague.park" },
+        { scope: "my_runs", currentUser: "minsoo3.kim", jobs, trackedRunIds: trackedIds }
+      ),
+      false,
+      "접두사 하이픈 경계가 다른 타유저 런(v80-...)을 자동 승인하면 안 됨"
+    );
+    assert.equal(
+      srv.shouldAutoApproveItem(
+        { id: "app-2", runId: "99902", runName: "v8-s01-1123", userId: "colleague.park" },
+        { scope: "my_runs", currentUser: "minsoo3.kim", jobs, trackedRunIds: trackedIds }
+      ),
+      false,
+      "my_runs 범위에서 타유저 소유의 동명 프리픽스 런을 자동 승인하면 안 됨"
+    );
+
+    // 2. Own rule run (`v8-s07-1123`, `minsoo3.kim`) MUST be auto-approved
+    assert.equal(
+      srv.shouldAutoApproveItem(
+        { id: "app-3", runId: "99903", runName: "v8-s07-1123", userId: "minsoo3.kim" },
+        { scope: "job_only", currentUser: "minsoo3.kim", jobs, trackedRunIds: trackedIds }
+      ),
+      true,
+      "내 계정의 규칙 매칭 런은 job_only 범위에서도 즉시 자동 승인되어야 함"
+    );
+
+    // 3. `processPendingApprovals` must only overwrite `job.lastStatus` when `job.lastStatus.includes("승인 추적 중")`
+    const procAppSrc = extractFunctionSource(serverSrc, "processPendingApprovals");
+    assert.equal(
+      procAppSrc.includes('job.lastStatus.includes("승인 추적 중")'),
+      true,
+      "processPendingApprovals가 스케줄러의 정상 목표 유지 상태(lastStatus)를 덮어쓰지 않도록 승인 추적 중일 때만 갱신해야 함"
+    );
+  });
+
+  test("TC-44: 규칙 명령어 수정 시 파이프라인 `_stage2Transitioned` 리셋 및 사이트 전환 시 빠른 로그 초기화 검증", () => {
+    assert.equal(
+      serverSrc.includes('String(body.executionCommand).trim() !== String(existingJob.executionCommand || "").trim()'),
+      true,
+      "실행 명령어 변경 시 Stage 2 전환 플래그(_stage2Transitioned)가 자동 초기화되어야 함"
+    );
+    const selectSiteSrc = extractFunctionSource(appJsSrc, "selectSpaceSite");
+    assert.equal(
+      selectSiteSrc.includes("closeMonitorQuickLog"),
+      true,
+      "사이트 전환(N9 <-> N6) 시 이전 사이트의 빠른 로그 프리뷰 창을 닫아야 함"
+    );
   });
 });

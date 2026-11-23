@@ -198,6 +198,10 @@ async function selectSpaceSite(siteId, options = {}) {
   lastKnownActiveWorkerIdsSig = "";
   selectedWorkerRunIds.clear();
   latestRawSpaceRuns = [];
+  window._initialEditorLoaded = false;
+  if (typeof closeMonitorQuickLog === "function") {
+    closeMonitorQuickLog();
+  }
   try {
     await api("/api/sites/select", {
       method: "POST",
