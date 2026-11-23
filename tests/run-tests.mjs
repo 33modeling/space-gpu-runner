@@ -77,6 +77,13 @@ function createServerLogicSandbox() {
     "releaseWorkerSlot",
     "pickNextWorkerSlot",
     "parseWorkerLogProgress",
+    "formatWebhookPayload",
+    "isSpotPreemptedRun",
+    "evaluateSilentHangState",
+    "extractNodeIdentifierFromRunOrLog",
+    "detectStragglerWorkers",
+    "searchWorkerLogLines",
+    "computeEffectiveJobBudget",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -1061,12 +1068,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=6`, `/app.js?v=24`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=25`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
-      fetch(`${BASE_URL}/style.css?v=6`),
-      fetch(`${BASE_URL}/app.js?v=24`),
+      fetch(`${BASE_URL}/style.css?v=7`),
+      fetch(`${BASE_URL}/app.js?v=25`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1074,7 +1081,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=24"), true, "라이브 index.html이 최신 캐시버전 app.js?v=24을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=25"), true, "라이브 index.html이 최신 캐시버전 app.js?v=25을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -1234,5 +1241,178 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       true,
       "사이트 전환(N9 <-> N6) 시 이전 사이트의 빠른 로그 프리뷰 창을 닫아야 함"
     );
+  });
+
+  test("TC-45: [Feature 1] `evaluateSilentHangState` 조용한 먹통(Silent Hang) 감지 및 로그 변화 시 즉시 해제 검증", () => {
+    const t0 = Date.parse("2026-11-23T08:00:00.000Z");
+    const startIso = "2026-11-23T07:50:00.000Z";
+
+    // Initial scan: records signature, stalledMinutes = 0
+    const s1 = srv.evaluateSilentHangState(null, "Step 10/100 loss=0.45\n", startIso, t0, 45);
+    assert.equal(s1.isSilentHang, false);
+    assert.equal(s1.stalledMinutes, 0);
+
+    // 20m later with identical log -> stalledMinutes = 20 (< 45m), NOT silent hang yet
+    const s2 = srv.evaluateSilentHangState(s1, "Step 10/100 loss=0.45\n", startIso, t0 + 20 * 60_000, 45);
+    assert.equal(s2.stalledMinutes, 20);
+    assert.equal(s2.isSilentHang, false);
+
+    // 50m later with identical log -> stalledMinutes = 50 (>= 45m) -> IS silent hang!
+    const s3 = srv.evaluateSilentHangState(s2, "Step 10/100 loss=0.45\n", startIso, t0 + 50 * 60_000, 45);
+    assert.equal(s3.stalledMinutes, 50);
+    assert.equal(s3.isSilentHang, true);
+
+    // New log line arrives at 51m -> immediately resets `isSilentHang = false` and `stalledMinutes = 0`!
+    const s4 = srv.evaluateSilentHangState(s3, "Step 10/100 loss=0.45\nStep 11/100 loss=0.42\n", startIso, t0 + 51 * 60_000, 45);
+    assert.equal(s4.stalledMinutes, 0);
+    assert.equal(s4.isSilentHang, false);
+  });
+
+  test("TC-46: [Feature 2] `computeEffectiveJobBudget` 무중단 세대교체(Graceful Drain) 및 후속 실험 큐 슬롯 인계 검증", () => {
+    const jobV8 = {
+      id: "job-v8",
+      name: "v8",
+      enabled: true,
+      draining: true,
+      drainNextJobId: "job-v9",
+      drainSharedCap: 50,
+      minConcurrentRuns: 50,
+      targetPendingRuns: 6,
+    };
+    const jobV9 = {
+      id: "job-v9",
+      name: "v9",
+      enabled: true,
+      draining: false,
+      minConcurrentRuns: 50,
+      targetPendingRuns: 4,
+    };
+    const allJobs = [jobV8, jobV9];
+
+    // Step A: v8 still has 50 Running -> v8 stops new spawns (effectiveMinConcurrent=50, pending=0), v9 waits at 0
+    const bV8_50 = srv.computeEffectiveJobBudget(jobV8, allJobs, { "job-v8": 50, "job-v9": 0 });
+    const bV9_50 = srv.computeEffectiveJobBudget(jobV9, allJobs, { "job-v8": 50, "job-v9": 0 });
+    assert.equal(bV8_50.isDraining, true);
+    assert.equal(bV8_50.drainCompleted, false);
+    assert.equal(bV8_50.effectiveTargetPending, 0);
+    assert.equal(bV9_50.waitingOnDrainJobId, "job-v8");
+    assert.equal(bV9_50.effectiveMinConcurrent, 0, "선행 규칙이 50개 전부 가동 중일 때 후속 규칙은 총 한도를 넘지 않고 대기해야 함");
+
+    // Step B: 12 v8 workers finish naturally (v8=38 Running) -> v9 automatically gets 12 slots!
+    const bV9_38 = srv.computeEffectiveJobBudget(jobV9, allJobs, { "job-v8": 38, "job-v9": 5 });
+    assert.equal(bV9_38.effectiveMinConcurrent, 12, "반납된 12개 슬롯만큼 후속 규칙 v9가 즉시 인계받아야 함");
+    assert.equal(bV9_38.effectiveTargetPending, 4);
+
+    // Step C: All v8 workers finish (v8=0 Running) -> v8 drainCompleted=true, v9 gets full 50 slots!
+    const bV8_0 = srv.computeEffectiveJobBudget(jobV8, allJobs, { "job-v8": 0, "job-v9": 38 });
+    const bV9_0 = srv.computeEffectiveJobBudget(jobV9, allJobs, { "job-v8": 0, "job-v9": 38 });
+    assert.equal(bV8_0.drainCompleted, true);
+    assert.equal(bV9_0.effectiveMinConcurrent, 50);
+  });
+
+  test("TC-47: [Feature 3] 원클릭 북마클릿(`bookmarkletSyncKey` & `POST /api/tokens/bookmarklet-sync`) 인증 및 보안 검증", async (t) => {
+    assert.equal(indexHtmlSrc.includes('id="spaceTokenBookmarkletLink"'), true);
+    assert.equal(appJsSrc.includes("handleIncomingBookmarkletHashSync"), true);
+
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 북마클릿 엔드포인트 스킵");
+
+    // Invalid syncKey must be rejected with 401
+    const badRes = await fetch(`${BASE_URL}/api/tokens/bookmarklet-sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ syncKey: "wrong-key", accessToken: "dummy" }),
+    });
+    assert.equal(badRes.status, 401, "잘못된 syncKey 요청은 401로 차단되어야 함");
+
+    // Authenticated `/api/state` must expose `config.bookmarkletSyncKey` (28-char hex)
+    const stRes = await fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } });
+    const stJson = await stRes.json();
+    assert.equal(typeof stJson.config?.bookmarkletSyncKey, "string");
+    assert.equal(stJson.config.bookmarkletSyncKey.length, 28);
+  });
+
+  test("TC-48: [Feature 4] `searchWorkerLogLines` 및 `POST /api/space/runs/log-grep` 전체 워커 로그 통합 검색 검증", async (t) => {
+    const sampleLog = [
+      "[2026-11-23 19:00:01] Starting on gpu-node-h100-07",
+      "Epoch 1/5 | Step 100/500 | loss=0.3120 | 2.40 it/s",
+      "Saved checkpoint to /user-volume/offpolicy-misranking/ckpt/step_100.pt",
+      "Epoch 1/5 | Step 200/500 | loss=0.2810 | 2.45 it/s",
+    ].join("\n");
+
+    const plainHit = srv.searchWorkerLogLines(sampleLog, { query: "saved checkpoint", isRegex: false, caseSensitive: false });
+    assert.equal(plainHit.matchCount, 1);
+    assert.equal(plainHit.matches[0].lineNumber, 3);
+
+    const regexHit = srv.searchWorkerLogLines(sampleLog, { query: "loss=0\\.(31|28)", isRegex: true });
+    assert.equal(regexHit.matchCount, 2);
+
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 로그 검색 API 스킵");
+
+    // Invalid regex must safely return 400 (never 500 crash)
+    const invalidRxRes = await fetch(`${BASE_URL}/api/space/runs/log-grep`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Password": ADMIN_PW },
+      body: JSON.stringify({ query: "[unclosed-regex", isRegex: true }),
+    });
+    assert.equal(invalidRxRes.status, 400);
+  });
+
+  test("TC-49: [Feature 5] `detectStragglerWorkers` 느린 노드(Straggler) 감지, 처리량 합산 및 노드 호스트명 추출 검증", () => {
+    assert.equal(
+      srv.extractNodeIdentifierFromRunOrLog({}, "[SPACE Worker] Starting on n9-h100-dgx-14 (Slot: 2/50)"),
+      "n9-h100-dgx-14"
+    );
+    assert.equal(
+      srv.extractNodeIdentifierFromRunOrLog({ nodeName: "k8s-gpu-node-03" }, ""),
+      "k8s-gpu-node-03"
+    );
+
+    const workers = [
+      { id: "1", progress: { speedVal: 4.0, speedUnit: "it/s", loss: "0.20", isStraggler: false } },
+      { id: "2", progress: { speedVal: 4.2, speedUnit: "it/s", loss: "0.22", isStraggler: false } },
+      { id: "3", progress: { speedVal: 3.8, speedUnit: "it/s", loss: "0.18", isStraggler: false } },
+      { id: "4", progress: { speedVal: 1.2, speedUnit: "it/s", loss: "0.24", isStraggler: false } }, // 0.3x of median 4.0 -> straggler!
+    ];
+    const summary = srv.detectStragglerWorkers(workers, 0.55);
+    assert.equal(summary.stragglerCount, 1);
+    assert.equal(summary.speedUnit, "it/s");
+    assert.equal(summary.totalThroughput, 13.2);
+    assert.equal(summary.avgLoss, 0.21);
+    assert.equal(workers[3].progress.isStraggler, true);
+    assert.equal(workers[3].progress.speedRatio, 0.31);
+    assert.equal(workers[0].progress.isStraggler, false);
+  });
+
+  test("TC-50: [Feature 6] `isSpotPreemptedRun` 스팟 회수 감지 및 Slack/Discord/Telegram 다채널 웹훅 포맷 검증", () => {
+    const recentTerm = new Map([["5001", Date.now()]]);
+    assert.equal(srv.isSpotPreemptedRun({ id: "5001", status: "PREEMPTED" }, recentTerm), false, "직접 종료한 런은 스팟 회수로 집계하면 안 됨");
+    assert.equal(srv.isSpotPreemptedRun({ id: "5002", status: "PREEMPTED" }, recentTerm), true);
+    assert.equal(srv.isSpotPreemptedRun({ id: "5003", status: "STOPPED", reason: "Spot node evicted" }, recentTerm), true);
+    assert.equal(srv.isSpotPreemptedRun({ id: "5004", status: "SUCCEEDED" }, recentTerm), false);
+
+    const tg = srv.formatWebhookPayload("https://api.telegram.org/bot12345:ABC/sendMessage?chat_id=987654", {
+      level: "warn",
+      title: "스팟 회수 알림",
+      message: "테스트 메시지",
+    });
+    assert.equal(tg.channel, "telegram");
+    assert.equal(tg.body.chat_id, "987654");
+    assert.equal(tg.body.text.includes("스팟 회수 알림"), true);
+
+    const dc = srv.formatWebhookPayload("https://discord.com/api/webhooks/111/222", {
+      level: "success",
+      title: "목표 달성",
+      message: "100워커 가동",
+    });
+    assert.equal(dc.channel, "discord");
+    assert.equal(typeof dc.body.content, "string");
+
+    const sl = srv.formatWebhookPayload("https://hooks.slack.com/services/T00/B00/XXX", {
+      level: "info",
+      title: "일일 리포트",
+      message: "정상 가동 중",
+    });
+    assert.equal(sl.channel, "slack");
+    assert.equal(typeof sl.body.text, "string");
   });
 });

@@ -14,7 +14,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="/style.css?v=6" />
+  <link rel="stylesheet" href="/style.css?v=7" />
 </head>
 <body>
   <!-- Password Gate Modal -->
@@ -180,7 +180,38 @@
             </table>
           </div>
 
-          <div style="margin-top:24px;">
+          <!-- Feature 4: 전체 가동 워커 로그 통합 검색 (Multi-Run Log Grep) -->
+          <div id="logGrepPanel" class="card-subtle" style="margin-top:20px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+              <div>
+                <span style="font-size:13.5px; font-weight:600; color:var(--text);">전체 가동 워커 로그 통합 검색</span>
+                <span class="hint" style="margin-left:8px;">Running 워커 전체의 최근 로그에서 키워드·에러·체크포인트를 한 번에 검색합니다.</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:1; justify-content:flex-end; min-width:300px;">
+                <input
+                  type="text"
+                  id="logGrepQueryInput"
+                  class="mono"
+                  placeholder="검색어 또는 정규식 (예: checkpoint, error, loss, host)"
+                  onkeydown="if(event.key==='Enter'){ event.preventDefault(); executeMultiWorkerLogGrep(); }"
+                  style="max-width:320px; flex:1; min-width:180px;"
+                />
+                <select id="logGrepTailSelect" class="mono" style="width:94px;" title="워커당 검색할 최근 로그 줄 수">
+                  <option value="50">최근 50줄</option>
+                  <option value="100" selected>최근 100줄</option>
+                  <option value="200">최근 200줄</option>
+                </select>
+                <label style="display:inline-flex; align-items:center; gap:5px; font-size:12px; color:var(--text-secondary); cursor:pointer; margin:0; white-space:nowrap;">
+                  <input type="checkbox" id="logGrepRegexCheck" style="width:14px; height:14px; margin:0;" /> 정규식
+                </label>
+                <button type="button" class="sm" id="btnRunLogGrep" onclick="executeMultiWorkerLogGrep()">통합 검색</button>
+                <button type="button" class="secondary sm" id="btnClearLogGrep" style="display:none;" onclick="clearMultiWorkerLogGrep()">초기화</button>
+              </div>
+            </div>
+            <div id="logGrepResultsBox" style="display:none; margin-top:14px;"></div>
+          </div>
+
+          <div style="margin-top:20px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
               <label id="logViewerTitle" style="font-size:13.5px;">컨테이너 실시간 로그</label>
               <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">로그 새로고침</button>
@@ -571,6 +602,20 @@
             2) 브라우저 개발자 도구(<code>F12</code> → Console)에 아래 추출 코드를 복사해 실행하거나, <code>Session Storage</code>의 <code>access_token</code> 값을 복사합니다.
           </div>
 
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-top:12px; padding:12px 14px; border-radius:9px; background:var(--panel); border:1px solid var(--accent-border);">
+            <div style="font-size:12.5px; color:var(--text-secondary); line-height:1.55;">
+              <b style="color:var(--text);">원클릭 북마클릿 (권장 · F12 불필요)</b><br/>
+              우측 버튼을 브라우저 <b>북마크 바(즐겨찾기 바)</b>로 끌어다 놓으세요. 이후 SPACE 콘솔 탭에서 클릭 한 번만으로 새 토큰이 이 서버에 자동 전송됩니다.
+            </div>
+            <a
+              id="spaceTokenBookmarkletLink"
+              href="javascript:void(0)"
+              class="bookmarklet-pill"
+              onclick="event.preventDefault(); showToast('이 버튼을 클릭하지 말고 마우스로 브라우저 상단 북마크 바(즐겨찾기 바)로 끌어다 놓으세요!');"
+              title="마우스로 드래그하여 브라우저 북마크 바에 놓으세요"
+            >⚡ SPACE 토큰 원클릭 전송</a>
+          </div>
+
           <div style="display:flex; gap:8px; margin-top:12px; align-items:center;">
             <input type="text" id="devtoolsSnippetInput" readonly value='copy(JSON.stringify({accessToken:sessionStorage.access_token||localStorage.access_token,refreshToken:sessionStorage.refresh_token||localStorage.refresh_token,groupId:localStorage.group_id||sessionStorage.group_id}))' class="mono" onclick="this.select(); copyDevtoolsExtractor();" style="flex:1; font-size:12px; cursor:pointer;" title="클릭하면 복사됩니다" />
             <button type="button" class="secondary sm" onclick="copyDevtoolsExtractor()" style="flex-shrink:0;">추출 코드 복사</button>
@@ -741,6 +786,18 @@
               </label>
               <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
                 <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                  <input type="checkbox" id="cfgSilentHangDetectEnabled" checked /> 조용한 먹통(Silent Hang · 무응답) 감지
+                </label>
+                <div style="display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted);">
+                  <span>기준(분)</span>
+                  <input type="number" id="cfgSilentHangTimeoutMin" value="45" min="5" max="1440" class="mono" style="width:64px;" />
+                  <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0; font-size:12px; color:var(--text-secondary);">
+                    <input type="checkbox" id="cfgSilentHangAutoRestart" /> 자동 재시작
+                  </label>
+                </div>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
                   <input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 즉시 실패(불량 노드) 쿨다운 보호
                 </label>
                 <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
@@ -788,13 +845,19 @@
             </div>
 
             <div class="form-group full">
-              <label>알림 설정 (브라우저 알림 및 Slack / Discord Webhook)</label>
+              <label>알림 설정 (브라우저 알림 및 Slack / Discord / Telegram Webhook)</label>
               <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <input type="text" id="cfgWebhookUrl" placeholder="https://hooks.slack.com/... (선택)" class="mono" style="flex:1; min-width:220px;" />
-                <label style="display:flex; align-items:center; gap:6px; margin:0; white-space:nowrap;">
-                  <input type="checkbox" id="cfgBrowserNotifyEnabled" checked /> 브라우저 데스크톱 알림
+                <input type="text" id="cfgWebhookUrl" placeholder="Slack / Discord 웹훅 또는 https://api.telegram.org/bot.../sendMessage?chat_id=..." class="mono" style="flex:1; min-width:240px;" />
+                <label style="display:inline-flex; align-items:center; gap:6px; margin:0; white-space:nowrap;">
+                  <input type="checkbox" id="cfgBrowserNotifyEnabled" checked /> 브라우저 알림
                 </label>
+                <label style="display:inline-flex; align-items:center; gap:6px; margin:0; white-space:nowrap;">
+                  <input type="checkbox" id="cfgDailyDigestEnabled" /> 매일 요약 리포트
+                </label>
+                <input type="number" id="cfgDailyDigestHourKst" value="9" min="0" max="23" class="mono" style="width:58px;" title="매일 요약 발송 시각 (KST 0~23시)" />
+                <span class="txt-muted" style="font-size:12px;">시(KST)</span>
                 <button type="button" class="secondary sm" onclick="testAlertNotification()">알림 테스트</button>
+                <button type="button" class="soft-success sm" onclick="sendDigestReportNow()">요약 리포트 발송</button>
               </div>
             </div>
           </div>
@@ -807,7 +870,31 @@
     </section>
   </div>
 
+  <!-- Feature 2: 무중단 세대교체(Graceful Drain) & 예약 실험 큐 설정 모달 -->
+  <div id="drainModalOverlay" class="lock-overlay hidden" style="display:none; z-index:9500;">
+    <div class="lock-card" style="max-width:480px; text-align:left;">
+      <h2 style="margin:0 0 8px; font-size:17px;">무중단 드레이닝 · 세대교체 설정</h2>
+      <p id="drainModalDesc" style="margin:0 0 16px; font-size:13px; color:var(--text-secondary); line-height:1.6;">
+        현재 가동 중인 Running 워커는 강제 종료하지 않고 자연 종료될 때까지 유지하며, 반납되는 슬롯을 후속 규칙으로 자동 인계하거나 전원 종료 후 규칙을 정지합니다.
+      </p>
+      <input type="hidden" id="drainModalJobId" value="" />
+      <div class="form-group" style="margin-bottom:14px;">
+        <label>슬롯 반납 시 전환할 후속 규칙 (예약 실험 큐)</label>
+        <select id="drainModalNextJobSelect">
+          <option value="">-- 후속 규칙 없음 (전원 자연 종료 후 자동 정지) --</option>
+        </select>
+      </div>
+      <label style="display:flex; align-items:center; gap:7px; cursor:pointer; font-size:12.5px; color:var(--text-secondary); margin-bottom:20px;">
+        <input type="checkbox" id="drainModalCancelPending" checked /> 아직 시작되지 않은 Pending 대기열은 즉시 취소하여 슬롯을 바로 비움
+      </label>
+      <div style="display:flex; justify-content:flex-end; gap:8px;">
+        <button type="button" class="secondary" onclick="closeDrainModal()">취소</button>
+        <button type="button" class="success" onclick="confirmStartJobDrain()">드레이닝 시작</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=24"></script>
+  <script src="/app.js?v=25"></script>
 </body>
 </html>

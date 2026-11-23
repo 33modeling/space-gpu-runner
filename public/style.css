@@ -970,3 +970,26 @@ details.clean-details > summary:hover {
 .txt-purple { color: var(--purple-text); }
 .txt-muted { color: var(--muted); }
 .txt-secondary { color: var(--text-secondary); }
+
+/* Draggable Bookmarklet Pill */
+.bookmarklet-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  border: 1px dashed var(--accent);
+  color: var(--accent-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: grab;
+  white-space: nowrap;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.bookmarklet-pill:hover {
+  background: var(--accent);
+  color: #ffffff;
+  text-decoration: none;
+}
