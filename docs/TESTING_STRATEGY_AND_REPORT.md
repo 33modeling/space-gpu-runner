@@ -1,10 +1,10 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.6.0`
+- **문서 버전**: `v2.7.0`
 - **최종 검증일**: `2026-11-26`
-- **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **52개** 케이스)
+- **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **54개** 케이스)
 
 ---
 
@@ -158,6 +158,8 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-50** | Suite 6 (스팟회수/다채널웹훅) | `isSpotPreemptedRun` & `formatWebhookPayload` | 수동 종료를 제외한 실제 Spot 회수 판별 및 Slack·Discord·Telegram 메시지 포맷 자동 변환 검증 | ✅ PASS |
 | **TC-51** | Suite 6 (회수중복집계방지) | `isEligibleNewPreemptionEvent` | 2시간 경과 이력 및 워터마크 이하 구형 Run ID 재집계 차단 검증 | ✅ PASS |
 | **TC-52** | Suite 6 (폴백5xx오발동방지) | `shouldTriggerHybridPoolFallback` | 게이트웨이 `502/503` 및 타임아웃 발생 시 Spot 규칙이 Standard로 잘못 폴백되지 않음을 검증 | ✅ PASS |
+| **TC-53** | Suite 6 (통합GPU상한/우선순위) | `computeGlobalCapWorkerLimit` | 복수 규칙(`v9` 1순위 · `v8` 2순위) 동시 가동 시 사이트 통합 GPU 상한(`globalMaxGpus`) 내에서 후순위 규칙이 자동 양보하는지 검증 | ✅ PASS |
+| **TC-54** | Suite 6 (멀티규칙바/서비스스크립트) | `visibleMultiJobs` & `manage-service.sh` | 다중 활성 규칙 요약 바 바인딩 및 `systemd` 유저 서비스 스크립트(`bash -n`) 무결성 검증 | ✅ PASS |
 
 ---
 

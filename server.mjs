@@ -100,6 +100,7 @@ const DEFAULT_STATE = {
     silentHangAutoRestart: false,
     dailyDigestEnabled: false,
     dailyDigestHourKst: 9,
+    globalMaxGpus: 0,
   },
   jobs: [
     {
@@ -261,6 +262,7 @@ const SITE_SCOPED_CONFIG_KEYS = new Set([
   "userName",
   "schedulerEnabled",
   "autoApprovalScope",
+  "globalMaxGpus",
 ]);
 
 function normalizeSiteId(val) {
@@ -3766,6 +3768,31 @@ function computeEffectiveJobBudget(job, allJobs = [], runningCountsByJobId = {})
   };
 }
 
+function computeGlobalCapWorkerLimit(job, allJobs = [], activeGpusByJobId = {}, globalMaxGpus = 0) {
+  const maxGpus = toSafeInt(globalMaxGpus, 0, 0, 999999);
+  if (maxGpus <= 0 || !job || typeof job !== "object") {
+    return null;
+  }
+  const coreCount = Math.max(1, Number(job.coreCount || 1));
+  const jobsList = Array.isArray(allJobs) ? allJobs : [];
+  const sortedEnabled = jobsList
+    .map((j, idx) => ({ j, idx }))
+    .filter((item) => item.j && item.j.enabled)
+    .sort((a, b) => {
+      const pa = Number(a.j.priority ?? 10);
+      const pb = Number(b.j.priority ?? 10);
+      return pa !== pb ? pa - pb : a.idx - b.idx;
+    });
+
+  let higherPriorityActiveGpus = 0;
+  for (const item of sortedEnabled) {
+    if (String(item.j.id) === String(job.id)) break;
+    higherPriorityActiveGpus += Math.max(0, Number(activeGpusByJobId?.[item.j.id] ?? 0));
+  }
+  const remainingGpuBudget = Math.max(0, maxGpus - higherPriorityActiveGpus);
+  return Math.max(0, Math.floor(remainingGpuBudget / coreCount));
+}
+
 /**
  * Feature 1, 2, 3, 6: Round-Robin Live Worker Log Scanner, Progress Parser,
  * Goal Completion / Stage-2 Pipeline Detector & Hardware Bad-Node Detector.
@@ -4874,15 +4901,18 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
   );
   const matchedActiveRunIds = new Set();
   const runningCountsByJobId = {};
+  const activeGpusByJobId = {};
   for (const jItem of state.jobs) {
-    const jRunning = runsList.filter(
-      (r) =>
-        doesRunMatchJob(r, jItem, state.jobs) &&
-        classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
-        String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+    const jActiveRuns = runsList.filter(
+      (r) => doesRunMatchJob(r, jItem, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+    );
+    const jRunning = jActiveRuns.filter((r) =>
+      String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
     ).length;
     runningCountsByJobId[jItem.id] = jRunning;
+    activeGpusByJobId[jItem.id] = jActiveRuns.length * Math.max(1, Number(jItem.coreCount || 1));
   }
+  const globalMaxGpus = toSafeInt(state.config.globalMaxGpus, 0, 0, 999999);
 
   const jobFleetList = state.jobs.map((job, jobIdx) => {
     const matchingRuns = runsList.filter((r) => doesRunMatchJob(r, job, state.jobs));
@@ -4911,11 +4941,18 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     const runningCount = runningRuns.length;
     const pendingCount = pendingRuns.length;
     const drainBudget = computeEffectiveJobBudget(job, state.jobs, runningCountsByJobId);
+    const globalCapWorkers = computeGlobalCapWorkerLimit(job, state.jobs, activeGpusByJobId, globalMaxGpus);
+    const baseAllowedMin = drainBudget.waitingOnDrainJobId ? drainBudget.effectiveMinConcurrent : rawMinConcurrent;
+    const effectiveCappedMin =
+      globalCapWorkers !== null ? Math.min(baseAllowedMin, globalCapWorkers) : baseAllowedMin;
+    const isGlobalGpuCapped = globalCapWorkers !== null && globalCapWorkers < rawMinConcurrent;
     const metrics =
-      drainBudget.isDraining || (drainBudget.waitingOnDrainJobId && drainBudget.effectiveMinConcurrent === 0)
+      drainBudget.isDraining ||
+      (drainBudget.waitingOnDrainJobId && drainBudget.effectiveMinConcurrent === 0) ||
+      (globalCapWorkers !== null && effectiveCappedMin === 0)
         ? {
             ...computeJobTargetMetrics({
-              minConcurrentRuns: Math.max(1, drainBudget.effectiveMinConcurrent || rawMinConcurrent),
+              minConcurrentRuns: Math.max(1, effectiveCappedMin || rawMinConcurrent),
               targetPendingRuns: 0,
               coreCount: job.coreCount,
               runningCount,
@@ -4932,14 +4969,20 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
             excessActiveGpuCount: 0,
             excessPendingCount: drainBudget.isDraining ? pendingCount : 0,
           }
-        : computeJobTargetMetrics({
-            minConcurrentRuns: drainBudget.waitingOnDrainJobId ? drainBudget.effectiveMinConcurrent : rawMinConcurrent,
-            targetPendingRuns: drainBudget.waitingOnDrainJobId ? drainBudget.effectiveTargetPending : targetPendingCount,
-            coreCount: job.coreCount,
-            runningCount,
-            pendingCount,
-            inFlightCount: 0,
-          });
+        : {
+            ...computeJobTargetMetrics({
+              minConcurrentRuns: effectiveCappedMin,
+              targetPendingRuns: drainBudget.waitingOnDrainJobId
+                ? Math.min(drainBudget.effectiveTargetPending, effectiveCappedMin)
+                : Math.min(targetPendingCount, effectiveCappedMin),
+              coreCount: job.coreCount,
+              runningCount,
+              pendingCount,
+              inFlightCount: 0,
+            }),
+            targetCount: rawMinConcurrent,
+            targetGpuCount: rawMinConcurrent * Math.max(1, Number(job.coreCount || 1)),
+          };
     const {
       targetCount,
       effectiveTargetPending,
@@ -5080,13 +5123,16 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     return {
       jobId: job.id,
       jobName: job.name,
+      priority: Number(job.priority ?? 10),
       enabled: Boolean(job.enabled),
       draining: Boolean(job.draining),
       drainNextJobId: drainBudget.drainNextJobId || "",
       drainNextJobName: drainBudget.drainNextJobName || "",
       waitingOnDrainJobId: drainBudget.waitingOnDrainJobId || "",
       waitingOnDrainJobName: drainBudget.waitingOnDrainJobName || "",
-      effectiveHandoverCap: drainBudget.effectiveMinConcurrent,
+      effectiveHandoverCap: effectiveCappedMin,
+      isGlobalGpuCapped,
+      globalCapWorkers,
       silentHangCount,
       stragglerCount: throughputSummary.stragglerCount,
       throughputSummary,
@@ -5416,15 +5462,19 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
   }
 
   const runningCountsByJobId = {};
+  const activeGpusByJobId = {};
   for (const jItem of state.jobs) {
-    runningCountsByJobId[jItem.id] = allRuns.filter(
-      (r) =>
-        doesRunMatchJob(r, jItem, state.jobs) &&
-        classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
-        String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
+    const jActiveRuns = allRuns.filter(
+      (r) => doesRunMatchJob(r, jItem, state.jobs) && classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE"
+    );
+    runningCountsByJobId[jItem.id] = jActiveRuns.filter((r) =>
+      String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
     ).length;
+    activeGpusByJobId[jItem.id] = jActiveRuns.length * Math.max(1, Number(jItem.coreCount || 1));
   }
   const drainBudget = computeEffectiveJobBudget(job, state.jobs, runningCountsByJobId);
+  const globalMaxGpus = toSafeInt(state.config.globalMaxGpus, 0, 0, 999999);
+  const globalCapWorkers = computeGlobalCapWorkerLimit(job, state.jobs, activeGpusByJobId, globalMaxGpus);
 
   if (!forceTrigger && drainBudget.isDraining) {
     if (pendingJobRuns.length > 0) {
@@ -5471,12 +5521,21 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
     return { triggered: false, reason: job.lastStatus };
   }
 
+  if (!forceTrigger && globalCapWorkers !== null && globalCapWorkers <= 0) {
+    job.lastStatus = `⏸️ 사이트 통합 GPU 상한(${globalMaxGpus}GPU) 도달 — 상위 우선순위 규칙이 가용 GPU를 사용 중입니다 (여유 발생 시 자동 재개)`;
+    saveState();
+    return { triggered: false, reason: job.lastStatus };
+  }
+
   const rawMinConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
   const configuredTargetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
-  const minConcurrent =
+  const baseMinConcurrent =
     !forceTrigger && drainBudget.waitingOnDrainJobId ? drainBudget.effectiveMinConcurrent : rawMinConcurrent;
-  const targetPending =
+  const minConcurrent =
+    !forceTrigger && globalCapWorkers !== null ? Math.min(baseMinConcurrent, globalCapWorkers) : baseMinConcurrent;
+  const baseTargetPending =
     !forceTrigger && drainBudget.waitingOnDrainJobId ? drainBudget.effectiveTargetPending : configuredTargetPending;
+  const targetPending = Math.min(baseTargetPending, minConcurrent);
   const coreCountPerWorker = Math.max(1, Number(job.coreCount || 1));
   const targetGpuTotal = minConcurrent * coreCountPerWorker;
   const loadStatus = computeServerLoadStatus(allRuns);
@@ -5958,7 +6017,9 @@ async function runSchedulerTick(manual = false, options = {}) {
       approvalTickResult = await processPendingApprovals().catch((e) => ({ error: e.message }));
     }
 
-    const enabledJobs = state.jobs.filter((j) => j.enabled);
+    const enabledJobs = state.jobs
+      .filter((j) => j.enabled)
+      .sort((a, b) => Number(a.priority ?? 10) - Number(b.priority ?? 10));
     if (manual || enabledJobs.length > 0 || state.config.watchdogEnabled !== false) {
       let allRuns = await fetchCurrentRuns();
 
@@ -6242,7 +6303,9 @@ setInterval(() => {
           return;
         }
         const configuredSchedSec = Math.max(1, Number(state.config.checkIntervalSec || 15));
-        const enabledJobs = state.jobs.filter((j) => j.enabled);
+        const enabledJobs = state.jobs
+      .filter((j) => j.enabled)
+      .sort((a, b) => Number(a.priority ?? 10) - Number(b.priority ?? 10));
         const enabledJobIntervals = enabledJobs.map((j) => Math.max(1, Number(j.cooldownSec || configuredSchedSec)));
         let effectiveSchedSec =
           enabledJobIntervals.length > 0 ? Math.min(configuredSchedSec, ...enabledJobIntervals) : configuredSchedSec;
@@ -7030,6 +7093,9 @@ const server = http.createServer(async (req, res) => {
         ...(body.dailyDigestEnabled !== undefined ? { dailyDigestEnabled: Boolean(body.dailyDigestEnabled) } : {}),
         ...(body.dailyDigestHourKst !== undefined
           ? { dailyDigestHourKst: toSafeInt(body.dailyDigestHourKst, state.config.dailyDigestHourKst ?? 9, 0, 23) }
+          : {}),
+        ...(body.globalMaxGpus !== undefined
+          ? { globalMaxGpus: toSafeInt(body.globalMaxGpus, state.config.globalMaxGpus ?? 0, 0, 999999) }
           : {}),
       };
       // Smart JWT classification & dead refresh-token cleanup on config save
@@ -7905,6 +7971,7 @@ const server = http.createServer(async (req, res) => {
         maxPendingTimeoutMin: [120, 3, 10080],
         silentHangTimeoutMin: [45, 5, 1440],
         dailyDigestHourKst: [9, 0, 23],
+        globalMaxGpus: [0, 0, 999999],
         dayTargetWorkers: [20, 1, 9999],
         nightTargetWorkers: [48, 1, 9999],
         weekendTargetWorkers: [64, 1, 9999],
@@ -8388,6 +8455,7 @@ const server = http.createServer(async (req, res) => {
         id: body.id || `job-${Date.now()}`,
         siteId: normalizeSiteId(body.siteId || existingJob?.siteId || getCurrentSiteId()),
         name: String(body.name || "group-vol-worker").trim(),
+        priority: toSafeInt(body.priority, existingJob?.priority ?? 10, 1, 999),
         enabled: Boolean(body.enabled),
         mode: body.mode || "ensure_running",
         useSpecId: String(body.useSpecId || "").trim(),

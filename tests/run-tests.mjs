@@ -86,6 +86,7 @@ function createServerLogicSandbox() {
     "detectStragglerWorkers",
     "searchWorkerLogLines",
     "computeEffectiveJobBudget",
+    "computeGlobalCapWorkerLimit",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -1070,12 +1071,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=25`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=26`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=7`),
-      fetch(`${BASE_URL}/app.js?v=25`),
+      fetch(`${BASE_URL}/app.js?v=26`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1083,7 +1084,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=25"), true, "라이브 index.html이 최신 캐시버전 app.js?v=25을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=26"), true, "라이브 index.html이 최신 캐시버전 app.js?v=26을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -1469,5 +1470,36 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       true,
       "실제 풀/쿼터 부족 오류(400/409/422)에서는 하이브리드 폴백이 정상 동작해야 함"
     );
+  });
+
+  test("TC-53: `computeGlobalCapWorkerLimit` 사이트 통합 GPU 상한(`globalMaxGpus`) 및 우선순위(`priority`) 자동 양보 검증", () => {
+    const jobV9 = { id: "job-v9", name: "v9", priority: 1, enabled: true, coreCount: 4, minConcurrentRuns: 80 };
+    const jobV8 = { id: "job-v8", name: "v8", priority: 2, enabled: true, coreCount: 4, minConcurrentRuns: 30 };
+    const allJobs = [jobV8, jobV9];
+
+    // 1. globalMaxGpus = 0 -> unlimited (null)
+    assert.equal(srv.computeGlobalCapWorkerLimit(jobV8, allJobs, { "job-v9": 92 }, 0), null);
+
+    // 2. globalMaxGpus = 320G, v9(1순위) currently uses 92G (23W) -> v9 gets up to 80W, v8(2순위) gets floor((320-92)/4) = 57W
+    assert.equal(srv.computeGlobalCapWorkerLimit(jobV9, allJobs, { "job-v9": 92, "job-v8": 24 }, 320), 80);
+    assert.equal(srv.computeGlobalCapWorkerLimit(jobV8, allJobs, { "job-v9": 92, "job-v8": 24 }, 320), 57);
+
+    // 3. v9 scales up to 280G (70W) -> v8 automatically yields to floor((320-280)/4) = 10W!
+    assert.equal(srv.computeGlobalCapWorkerLimit(jobV8, allJobs, { "job-v9": 280, "job-v8": 40 }, 320), 10);
+
+    // 4. v9 reaches full 320G (80W) -> v8 pauses new spawns (0W) without exceeding 320G!
+    assert.equal(srv.computeGlobalCapWorkerLimit(jobV8, allJobs, { "job-v9": 320, "job-v8": 0 }, 320), 0);
+  });
+
+  test("TC-54: 멀티 규칙 활성 요약 바(`visibleMultiJobs`) 및 `systemd` 자동 재기동 스크립트(`scripts/manage-service.sh`) 검증", () => {
+    assert.equal(appJsSrc.includes("활성 규칙 현황:"), true, "다중 규칙 동시 가동 시 모니터링 상단 요약 칩 바가 제공되어야 함");
+    assert.equal(indexHtmlSrc.includes('id="cfgGlobalMaxGpus"'), true);
+    assert.equal(indexHtmlSrc.includes('id="jobPriority"'), true);
+
+    const svcScriptPath = path.join(ROOT_DIR, "scripts", "manage-service.sh");
+    assert.equal(fs.existsSync(svcScriptPath), true, "systemd 관리 스크립트가 존재해야 함");
+    assert.doesNotThrow(() => {
+      execFileSync("bash", ["-n", svcScriptPath], { encoding: "utf-8" });
+    });
   });
 });

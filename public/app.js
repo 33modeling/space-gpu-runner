@@ -1436,6 +1436,10 @@ function renderWorkerFleetBoard(fleet, options = {}) {
     statusBadgeClass = "info";
     statusBadgeLabel = `인계 대기 (${jf.effectiveHandoverCap || 0}/${targetCnt})`;
     statusHeadline = `선행 규칙 <b>[${escapeHtml(jf.waitingOnDrainJobName)}]</b> 슬롯 반납에 맞춰 무중단 투입 중 (현재 허용 <b>${jf.effectiveHandoverCap || 0}개</b> / 최종 목표 ${targetCnt}개)`;
+  } else if (jf.isGlobalGpuCapped && (jf.effectiveHandoverCap || 0) < targetCnt) {
+    statusBadgeClass = "info";
+    statusBadgeLabel = `통합 상한 적용 (${jf.effectiveHandoverCap || 0}/${targetCnt})`;
+    statusHeadline = `상위 우선순위 규칙에 GPU를 우선 배분 중 (현재 이 규칙 허용 한도 <b>${jf.effectiveHandoverCap || 0}워커</b> / 기본 목표 ${targetCnt}워커)`;
   } else if (excessActiveCnt > 0) {
     statusBadgeClass = "warn";
     statusBadgeLabel = `목표 초과 (${activeCnt}/${targetCnt})`;
@@ -1490,8 +1494,36 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         </select>`
       : `<span class="badge mono" style="font-size:12.5px; padding:5px 11px;">규칙: <b>${escapeHtml(jf.jobName || "기본")}</b></span>`;
 
-  const headlineSig = `${jf.jobId}|${jf.enabled}|${jf.draining ? 1 : 0}|${jf.drainNextJobName || ""}|${jf.waitingOnDrainJobName || ""}|${jf.effectiveHandoverCap || 0}|${fleet.jobs.length}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${remainingCnt}|${excessActiveCnt}|${isAutoOn}|${intervalSec}`;
+  // Multi-rule side-by-side overview strip (shown cleanly ONLY when 2+ rules are active or enabled!)
+  const visibleMultiJobs = (fleet.jobs || []).filter((item) => item.enabled || (item.activeCount || 0) > 0);
+  const multiRuleStripHtml =
+    visibleMultiJobs.length >= 2
+      ? `<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
+          <span class="txt-muted" style="font-size:12px; font-weight:600;">활성 규칙 현황:</span>
+          ${visibleMultiJobs
+            .map((item) => {
+              const isFocus = String(item.jobId) === String(jf.jobId);
+              const pTag = item.pendingCount > 0 ? ` · 대기 ${item.pendingCount}` : "";
+              return `<button type="button" class="chip-btn mono" onclick="selectFleetJobTab('${escapeJsStr(item.jobId)}')"
+                style="padding:5px 11px; font-size:12px; ${
+                  isFocus
+                    ? "background:var(--accent-soft); border-color:var(--accent); color:var(--accent-text); font-weight:600;"
+                    : ""
+                }">
+                <span style="color:${item.enabled ? "var(--success-text)" : "var(--muted)"};">${item.enabled ? "●" : "○"}</span>
+                <b>${escapeHtml(item.jobName)}</b>: ${item.runningCount || 0}/${item.targetCount} 가동${pTag} (${item.activeGpuCount || 0}/${item.targetGpuCount || 0}G)
+              </button>`;
+            })
+            .join("")}
+        </div>`
+      : "";
+
+  const multiStripSig = visibleMultiJobs
+    .map((m) => `${m.jobId}:${m.enabled}:${m.runningCount}:${m.pendingCount}:${m.targetCount}`)
+    .join(",");
+  const headlineSig = `${jf.jobId}|${jf.enabled}|${jf.draining ? 1 : 0}|${jf.isGlobalGpuCapped ? 1 : 0}|${jf.drainNextJobName || ""}|${jf.waitingOnDrainJobName || ""}|${jf.effectiveHandoverCap || 0}|${multiStripSig}|${fleet.jobs.length}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${remainingCnt}|${excessActiveCnt}|${isAutoOn}|${intervalSec}`;
   const headlineHtml = `
+    ${multiRuleStripHtml}
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:16px; margin-bottom:22px; padding-bottom:18px; border-bottom:1px solid var(--border);">
       <div>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -2177,6 +2209,9 @@ function renderConfig(cfg, loopStats = null) {
   if (activeId !== "cfgMaxPendingWorkers" && document.getElementById("cfgMaxPendingWorkers")) {
     document.getElementById("cfgMaxPendingWorkers").value = cfg.maxPendingWorkers ?? 2;
   }
+  if (activeId !== "cfgGlobalMaxGpus" && document.getElementById("cfgGlobalMaxGpus")) {
+    document.getElementById("cfgGlobalMaxGpus").value = cfg.globalMaxGpus ?? 0;
+  }
   if (activeId !== "cfgApiLatencyWarnMs" && document.getElementById("cfgApiLatencyWarnMs")) {
     document.getElementById("cfgApiLatencyWarnMs").value = cfg.apiLatencyWarnMs ?? 1800;
   }
@@ -2365,6 +2400,7 @@ async function saveConfig(overrideSiteId = "") {
         ? document.getElementById("cfgSmartLoadGuardEnabled").checked
         : true,
       maxPendingWorkers: Number(document.getElementById("cfgMaxPendingWorkers")?.value || 2),
+      globalMaxGpus: Math.max(0, Number(document.getElementById("cfgGlobalMaxGpus")?.value || 0)),
       apiLatencyWarnMs: Number(document.getElementById("cfgApiLatencyWarnMs")?.value || 1800),
       apiLatencyCriticalMs: Number(document.getElementById("cfgApiLatencyCriticalMs")?.value || 3500),
       stepByStepRunningCheck: document.getElementById("cfgStepByStepRunningCheck")
@@ -3548,6 +3584,8 @@ function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   }
   document.getElementById("jobId").value = j.id;
   document.getElementById("jobName").value = j.name || "group-vol-worker";
+  const prioEl = document.getElementById("jobPriority");
+  if (prioEl) prioEl.value = Number(j.priority ?? 10);
   document.getElementById("jobMode").value = j.mode || "ensure_running";
   document.getElementById("jobUseSpecId").value = j.useSpecId || "";
   document.getElementById("jobMinConcurrent").value = j.minConcurrentRuns || 1;
@@ -3651,6 +3689,7 @@ function collectJobFormPayload() {
   return {
     id: document.getElementById("jobId").value || "job-" + Date.now(),
     name: (document.getElementById("jobName").value || "group-vol-worker").trim(),
+    priority: Math.max(1, Number(document.getElementById("jobPriority")?.value || 10)),
     mode: document.getElementById("jobMode").value,
     useSpecId: document.getElementById("jobUseSpecId").value,
     minConcurrentRuns,

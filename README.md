@@ -9,8 +9,8 @@
 | 문서 | 설명 |
 | :--- | :--- |
 | 📘 **[소프트웨어 구성 및 상세 설계 명세서 (`docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md`)](./docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md)** | 시스템 기능/비기능 요구사항(SRS), 핵심 설계 지침, 4페이지 역할 분리 대시보드 아키텍처, 무중단 드레이닝·먹통 감지·로그 통합 검색·북마클릿 설계 및 전체 REST API 명세 |
-| 🧪 **[테스트 구성 전략 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./docs/TESTING_STRATEGY_AND_REPORT.md)** | 5계층 비파괴 검증 아키텍처, `node:vm` 기반 프로덕션 함수 직접 추출 자동화 테스트(`TC-01`~`TC-52`), 시나리오 통합 검증 및 장기 실전 클러스터(`33,966+ H100 GPU-Hours`) Soak Test & 버그 감사 리포트 |
-| ⚙️ **[자동화 검증 테스트 스위트 (`tests/run-tests.mjs`)](./tests/run-tests.mjs)** | 외부 패키지 없이 `npm test`로 즉시 실행 가능한 6개 스위트 · **52개** 자동 검증 스크립트 |
+| 🧪 **[테스트 구성 전략 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./docs/TESTING_STRATEGY_AND_REPORT.md)** | 5계층 비파괴 검증 아키텍처, `node:vm` 기반 프로덕션 함수 직접 추출 자동화 테스트(`TC-01`~`TC-54`), 시나리오 통합 검증 및 장기 실전 클러스터(`33,966+ H100 GPU-Hours`) Soak Test & 버그 감사 리포트 |
+| ⚙️ **[자동화 검증 테스트 스위트 (`tests/run-tests.mjs`)](./tests/run-tests.mjs)** | 외부 패키지 없이 `npm test`로 즉시 실행 가능한 6개 스위트 · **54개** 자동 검증 스크립트 |
 
 ---
 
@@ -37,12 +37,12 @@
 
 외부 `npm` 패키지 의존성이 전혀 없는 **순수 Node.js(`>= 20.0.0`)** 애플리케이션입니다.
 
-### 1. 서버 실행
+### 1. 서버 실행 (직접 기동 또는 호스트 재부팅 대비 `systemd` 등록)
 ```bash
 cd /home/kms/dev/space-gpu-runner
 npm start
-# 또는 환경 변수 지정 실행:
-PORT=4300 ADMIN_PASSWORD=cycy node server.mjs
+# 또는 호스트 재부팅 시에도 자동 기동되도록 유저 레벨 systemd 등록:
+npm run service:install
 ```
 
 ### 2. 구문 검사 및 자동화 테스트 실행
@@ -50,7 +50,7 @@ PORT=4300 ADMIN_PASSWORD=cycy node server.mjs
 # 백엔드 + 프론트엔드 구문 무결성 검사
 npm run check
 
-# 전체 자동화 검증 테스트 스위트 실행 (6개 스위트 · 52개 케이스)
+# 전체 자동화 검증 테스트 스위트 실행 (6개 스위트 · 54개 케이스)
 npm test
 ```
 
