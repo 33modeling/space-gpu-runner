@@ -1504,6 +1504,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
             .map((item) => {
               const isFocus = String(item.jobId) === String(jf.jobId);
               const pTag = item.pendingCount > 0 ? ` · 대기 ${item.pendingCount}` : "";
+              const ghTag = Number(item.gpuHoursTotal || 0) > 0 ? ` · ${item.gpuHoursTotal} GPU-h` : "";
               return `<button type="button" class="chip-btn mono" onclick="selectFleetJobTab('${escapeJsStr(item.jobId)}')"
                 style="padding:5px 11px; font-size:12px; ${
                   isFocus
@@ -1511,7 +1512,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
                     : ""
                 }">
                 <span style="color:${item.enabled ? "var(--success-text)" : "var(--muted)"};">${item.enabled ? "●" : "○"}</span>
-                <b>${escapeHtml(item.jobName)}</b>: ${item.runningCount || 0}/${item.targetCount} 가동${pTag} (${item.activeGpuCount || 0}/${item.targetGpuCount || 0}G)
+                <b>${escapeHtml(item.jobName)}</b>: ${item.runningCount || 0}/${item.targetCount} 가동${pTag} (${item.activeGpuCount || 0}/${item.targetGpuCount || 0}G${ghTag})
               </button>`;
             })
             .join("")}
@@ -1559,7 +1560,15 @@ function renderWorkerFleetBoard(fleet, options = {}) {
 
   // 2. 4 Spacious KPI & Instant-Override Cards (Zero preset chip clutter)
   const presetIntervals = [15, 30, 60, 120, 180, 300, 600, 900, 1800];
-  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${targetPendingCnt}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}|${runningPct}|${pendingPct}|${recon?.mySpaceActiveWorkers ?? ""}|${recon?.spaceTotalActiveWorkers ?? ""}`;
+  const qv = fleet.queueVelocity || null;
+  const qvLineHtml = qv
+    ? `<br/><span class="txt-muted">최근 1시간 배정 <b>${qv.promotionsLast1h || 0}건</b>${
+        qv.medianWaitSec !== null && qv.medianWaitSec !== undefined
+          ? ` · 대기 중앙값 <b>${formatDurationSecCompact(qv.medianWaitSec)}</b>`
+          : ""
+      }</span>`
+    : "";
+  const metricSig = `${jf.jobId}|${runningCnt}|${pendingCnt}|${activeCnt}|${targetCnt}|${targetGpus}|${targetPendingCnt}|${remainingCnt}|${excessActiveCnt}|${excessPendingCnt}|${gpusPerWorker}|${intervalSec}|${runningPct}|${pendingPct}|${recon?.mySpaceActiveWorkers ?? ""}|${recon?.spaceTotalActiveWorkers ?? ""}|${qv?.promotionsLast1h ?? ""}|${qv?.medianWaitSec ?? ""}`;
   const metricHtml = `
     <div class="kpi-grid">
       <!-- Card 1: Running Workers / Target + Progress Bar -->
@@ -1607,8 +1616,8 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         <div class="kpi-sub">
           ${
             recon
-              ? `내 계정(${escapeHtml(recon.currentUserName || "me")}) <b>${recon.mySpaceRunningWorkers}</b> 가동 · <b>${recon.mySpacePendingWorkers}</b> 대기<br/>클러스터 그룹 전체 <b>${recon.spaceTotalRunningWorkers}</b> 가동 (${recon.spaceTotalRunningGpus} GPU)`
-              : `신청 완료 워크로드는 유휴 노드 확보 시 자동으로 Running 전환됩니다.`
+              ? `내 계정(${escapeHtml(recon.currentUserName || "me")}) <b>${recon.mySpaceRunningWorkers}</b> 가동 · <b>${recon.mySpacePendingWorkers}</b> 대기<br/>클러스터 그룹 전체 <b>${recon.spaceTotalRunningWorkers}</b> 가동 (${recon.spaceTotalRunningGpus} GPU)${qvLineHtml}`
+              : `신청 완료 워크로드는 유휴 노드 확보 시 자동으로 Running 전환됩니다.${qvLineHtml}`
           }
         </div>
       </div>
@@ -3419,6 +3428,13 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
             <td>${badge}</td>
             <td class="mono" style="cursor:pointer;" onclick="selectAndEditJobRule('${escapeJsStr(j.id)}', false)" title="클릭하면 이 규칙을 선택합니다">
               <b>${escapeHtml(j.name)}</b>
+              ${
+                Number(jf?.gpuHoursTotal || 0) > 0
+                  ? `<div class="txt-muted" style="font-size:10.5px;">누적 ${jf.gpuHoursTotal} GPU-h${
+                      Number(jf.gpuHoursToday || 0) > 0 ? ` · 오늘 +${jf.gpuHoursToday}` : ""
+                    }</div>`
+                  : ""
+              }
               ${isSelected ? `<div class="txt-accent" style="font-size:10.5px; font-weight:600;">편집 중</div>` : ""}
             </td>
             <td>${fleetBadges}</td>
@@ -4561,6 +4577,8 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
     return;
   }
 
+  renderFailurePostMortems(fleetObj?.watchdog?.failurePostMortems || []);
+
   if (!displayList.length) {
     updateHtmlIfSigChanged(
       tbody,
@@ -5275,6 +5293,163 @@ async function sendDigestReportNow() {
     await loadServerState();
   } catch (e) {
     alert("요약 리포트 발송 실패: " + e.message);
+  }
+}
+
+// =========================================================================
+// Batch 4: Pre-Flight Validator, Failure Post-Mortems, CRLF Sanitizer & Config Backup
+// =========================================================================
+function formatDurationSecCompact(sec) {
+  const s = Math.max(0, Math.round(Number(sec || 0)));
+  if (s < 60) return `${s}초`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return remS > 0 ? `${m}분 ${remS}초` : `${m}분`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM > 0 ? `${h}시간 ${remM}분` : `${h}시간`;
+}
+
+function renderFailurePostMortems(items = []) {
+  const panel = document.getElementById("failurePostMortemPanel");
+  if (!panel) return;
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) {
+    panel.style.display = "none";
+    panel.innerHTML = "";
+    panel.removeAttribute("data-render-sig");
+    return;
+  }
+  const sig = list.map((it) => `${it.runId}:${it.category}`).join("|");
+  if (panel.getAttribute("data-render-sig") === sig) return;
+  panel.setAttribute("data-render-sig", sig);
+  panel.style.display = "block";
+  panel.innerHTML = `
+    <details class="clean-details">
+      <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <span style="color:var(--warn-text);">최근 실패 워커 자동 원인 부검 (Post-Mortem · ${list.length}건)</span>
+        <button type="button" class="secondary sm" onclick="event.preventDefault(); event.stopPropagation(); refreshFailurePostMortems()">원인 재스캔</button>
+      </summary>
+      <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px; max-height:280px; overflow-y:auto;">
+        ${list
+          .map(
+            (it) => `
+          <div onclick="viewRunLog('${escapeJsStr(String(it.runId))}', '${escapeJsStr(it.runName)}')"
+            style="cursor:pointer; padding:10px 12px; border-radius:8px; background:var(--panel); border:1px solid var(--border);">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:5px; font-size:12px;">
+              <span class="mono">
+                <b>${escapeHtml(it.runName)}</b>
+                <span class="txt-muted">(#${escapeHtml(String(it.runId))}${it.nodeName ? ` · 노드 ${escapeHtml(it.nodeName)}` : ""}${
+                  it.durationSec !== null && it.durationSec !== undefined ? ` · 실행 ${it.durationSec}초` : ""
+                })</span>
+              </span>
+              <span class="badge err">${escapeHtml(it.label || it.category || "비정상 종료")}</span>
+            </div>
+            <div class="mono" style="font-size:11.5px; color:var(--danger-text); word-break:break-all;">${escapeHtml(it.headline || "")}</div>
+          </div>
+        `
+          )
+          .join("")}
+      </div>
+    </details>
+  `;
+}
+
+async function refreshFailurePostMortems() {
+  try {
+    const res = await api("/api/space/runs/postmortem");
+    renderFailurePostMortems(res.items || []);
+    showToast(`🩺 최근 실패 워커 ${res.items?.length || 0}건의 종료 원인 분석을 갱신했습니다.`);
+  } catch (e) {
+    showToast("실패 원인 스캔 실패: " + e.message);
+  }
+}
+
+async function runJobPreflightCheck() {
+  const box = document.getElementById("jobPreflightResultBox");
+  const cmd = document.getElementById("jobExecutionCommand")?.value || "";
+  if (box) {
+    box.style.display = "block";
+    box.innerHTML = `<div class="card-subtle hint">출발 전 스크립트 경로·개행(CRLF)·Bash 문법 및 인증 상태를 점검하고 있습니다...</div>`;
+  }
+  try {
+    const res = await api("/api/jobs/preflight", {
+      method: "POST",
+      body: JSON.stringify({ executionCommand: cmd }),
+    });
+    const checks = Array.isArray(res.checks) ? res.checks : [];
+    if (!box) return;
+    const headerBadge = res.hasErrors
+      ? `<span class="badge err">오류 ${res.errorCount}건 발견</span>`
+      : res.warnCount > 0
+      ? `<span class="badge warn">주의 ${res.warnCount}건 (실행 가능)</span>`
+      : `<span class="badge ok">모든 사전 점검 통과</span>`;
+    box.innerHTML = `
+      <div class="card-subtle" style="border-color:${res.hasErrors ? "var(--danger-border)" : res.warnCount > 0 ? "var(--warn-border)" : "var(--success-border)"};">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <b style="font-size:13px;">사전 점검(Pre-Flight) 결과</b>
+          <div style="display:flex; align-items:center; gap:8px;">
+            ${headerBadge}
+            <button type="button" class="secondary sm" onclick="document.getElementById('jobPreflightResultBox').style.display='none'">닫기</button>
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; font-size:12.5px;">
+          ${checks
+            .map((c) => {
+              const cls = c.severity === "error" ? "txt-err" : c.severity === "warn" ? "txt-warn" : "txt-ok";
+              const mark = c.severity === "error" ? "✕" : c.severity === "warn" ? "!" : "✓";
+              return `<div><b class="${cls}">[${mark}] ${escapeHtml(c.title)}</b> — <span class="txt-secondary">${escapeHtml(c.detail)}</span></div>`;
+            })
+            .join("")}
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    if (box) {
+      box.innerHTML = `<div class="card-subtle txt-err">사전 점검 실패: ${escapeHtml(e.message)}</div>`;
+    }
+  }
+}
+
+function normalizeEditorScriptLineEndings() {
+  const ta = document.getElementById("sfmEditorTextarea");
+  if (!ta) return;
+  const before = ta.value || "";
+  const cleaned = before.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  ta.value = cleaned;
+  showToast(
+    before !== cleaned
+      ? "✅ Windows CRLF(\\r\\n) 및 UTF-8 BOM을 리눅스 표준 LF로 정리했습니다! [저장]을 눌러 반영하세요."
+      : "✓ 이미 리눅스 표준 LF 개행 상태입니다 (CRLF 없음)."
+  );
+}
+
+function exportBackupSnapshot() {
+  const pw = encodeURIComponent(sessionPassword || "");
+  window.open(`/api/backup/export?includeTokens=0&pw=${pw}`, "_blank");
+  showToast("📥 인증 토큰을 제외한 안전한 설정·규칙·프리셋 백업 파일을 다운로드합니다.");
+}
+
+async function importBackupSnapshotFile(fileInput) {
+  const file = fileInput?.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const ok = confirm(
+      `백업 파일(${file.name})에서 실행 규칙(${parsed.jobs?.length || 0}건) 및 프리셋(${parsed.presets?.length || 0}건)을 복원하시겠습니까?\n(현재 클러스터 인증 토큰과 누적 GPU-Hours 통계는 안전하게 유지되며, 새로 복원되는 규칙은 오작동 방지를 위해 일시정지 상태로 병합됩니다.)`
+    );
+    if (!ok) return;
+    const res = await api("/api/backup/import", {
+      method: "POST",
+      body: JSON.stringify({ snapshot: parsed, keepEnabled: false }),
+    });
+    showToast(`📦 백업 복원 완료! (규칙 ${res.restoredJobsCount || 0}건 · 프리셋 ${res.restoredPresetsCount || 0}건)`);
+    await loadServerState();
+  } catch (e) {
+    alert("백업 파일 복원 실패: " + e.message);
+  } finally {
+    fileInput.value = "";
   }
 }
 

@@ -5,6 +5,7 @@
  */
 
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
@@ -197,6 +198,7 @@ const DEFAULT_STATE = {
     totalGpuHours: 0,
     dailyGpuHours: {},
     jobGpuHours: {},
+    dailyJobGpuHours: {},
     timeSeries: [],
     lastAccountingAtMs: 0,
     lastSampleAtMs: 0,
@@ -403,6 +405,7 @@ function loadState() {
         totalGpuHours: Number(tObj.totalGpuHours || 0),
         dailyGpuHours: tObj.dailyGpuHours || {},
         jobGpuHours: tObj.jobGpuHours || {},
+        dailyJobGpuHours: tObj.dailyJobGpuHours && typeof tObj.dailyJobGpuHours === "object" ? tObj.dailyJobGpuHours : {},
         timeSeries: Array.isArray(tObj.timeSeries) ? tObj.timeSeries.slice(-60) : [],
         lastAccountingAtMs: Number(tObj.lastAccountingAtMs || 0),
         lastSampleAtMs: Number(tObj.lastSampleAtMs || 0),
@@ -1253,6 +1256,8 @@ function getSiteRuntime(siteId = getCurrentSiteId()) {
         silentHangRestartedCount: 0,
         lastActionMessage: null,
         workerLogSnippets: {},
+        failurePostMortems: [],
+        seenPostMortemIds: new Set(),
         roundRobinIndex: 0,
       },
       hybridFallbackStats: {
@@ -3336,7 +3341,8 @@ function updateGpuTelemetry(
   totalPendingWorkers = 0,
   totalRunningGpus = 0,
   totalTargetGpus = 0,
-  avgApiMs = 0
+  avgApiMs = 0,
+  perJobRunningGpus = {}
 ) {
   const siteTel = getSiteTelemetryObject();
   const now = Date.now();
@@ -3344,6 +3350,12 @@ function updateGpuTelemetry(
   const kstDate = new Date(now + 9 * 60 * 60 * 1000);
   const dateKey = kstDate.toISOString().slice(0, 10);
   const timeLabel = kstDate.toISOString().slice(11, 19);
+
+  if (!siteTel.jobGpuHours || typeof siteTel.jobGpuHours !== "object") siteTel.jobGpuHours = {};
+  if (!siteTel.dailyJobGpuHours || typeof siteTel.dailyJobGpuHours !== "object") siteTel.dailyJobGpuHours = {};
+  if (!siteTel.dailyJobGpuHours[dateKey] || typeof siteTel.dailyJobGpuHours[dateKey] !== "object") {
+    siteTel.dailyJobGpuHours[dateKey] = {};
+  }
 
   if (prevMs > 0 && now > prevMs) {
     const elapsedSec = Math.min(300, (now - prevMs) / 1000);
@@ -3353,6 +3365,19 @@ function updateGpuTelemetry(
       if (!siteTel.dailyGpuHours) siteTel.dailyGpuHours = {};
       siteTel.dailyGpuHours[dateKey] =
         Math.round((Number(siteTel.dailyGpuHours[dateKey] || 0) + addedGpuHours) * 10000) / 10000;
+
+      if (perJobRunningGpus && typeof perJobRunningGpus === "object") {
+        for (const [jName, runGpus] of Object.entries(perJobRunningGpus)) {
+          const g = Number(runGpus || 0);
+          if (jName && g > 0) {
+            const jAdd = (g * elapsedSec) / 3600;
+            siteTel.jobGpuHours[jName] =
+              Math.round((Number(siteTel.jobGpuHours[jName] || 0) + jAdd) * 10000) / 10000;
+            siteTel.dailyJobGpuHours[dateKey][jName] =
+              Math.round((Number(siteTel.dailyJobGpuHours[dateKey][jName] || 0) + jAdd) * 10000) / 10000;
+          }
+        }
+      }
     }
   }
   siteTel.lastAccountingAtMs = now;
@@ -3376,11 +3401,22 @@ function updateGpuTelemetry(
     siteTel.lastSampleAtMs = now;
   }
 
+  const roundedJobGpuHours = {};
+  for (const [jn, val] of Object.entries(siteTel.jobGpuHours || {})) {
+    roundedJobGpuHours[jn] = Math.round(Number(val || 0) * 100) / 100;
+  }
+  const roundedTodayJobGpuHours = {};
+  for (const [jn, val] of Object.entries(siteTel.dailyJobGpuHours?.[dateKey] || {})) {
+    roundedTodayJobGpuHours[jn] = Math.round(Number(val || 0) * 100) / 100;
+  }
+
   return {
     totalGpuHours: Math.round(Number(siteTel.totalGpuHours || 0) * 100) / 100,
     todayGpuHours: Math.round(Number(siteTel.dailyGpuHours?.[dateKey] || 0) * 100) / 100,
     todayDate: dateKey,
     dailyGpuHours: siteTel.dailyGpuHours || {},
+    jobGpuHours: roundedJobGpuHours,
+    todayJobGpuHours: roundedTodayJobGpuHours,
     timeSeries: siteTel.timeSeries || [],
     preemptions: getSpotPreemptionSummary(siteTel, now),
   };
@@ -3791,6 +3827,291 @@ function computeGlobalCapWorkerLimit(job, allJobs = [], activeGpusByJobId = {}, 
   }
   const remainingGpuBudget = Math.max(0, maxGpus - higherPriorityActiveGpus);
   return Math.max(0, Math.floor(remainingGpuBudget / coreCount));
+}
+
+function extractScriptPathsFromCommand(executionCommand = "") {
+  const cmd = String(executionCommand || "");
+  if (!cmd) return [];
+  const matches = [...cmd.matchAll(/(\/(?:user|group)-volume\/[A-Za-z0-9._/-]+\.(?:sh|py|bash))\b/g)];
+  const unique = [];
+  const seen = new Set();
+  for (const m of matches) {
+    const p = m[1];
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      unique.push(p);
+    }
+  }
+  return unique;
+}
+
+function analyzeShellScriptIssues(content = "", executionCommand = "", scriptPath = "") {
+  const raw = String(content ?? "");
+  const issues = [];
+  const hasUtf8Bom = raw.length > 0 && raw.charCodeAt(0) === 0xfeff;
+  const hasCrlf = /\r\n/.test(raw);
+  const trimmed = raw.trim();
+
+  if (!trimmed) {
+    issues.push({
+      severity: "error",
+      code: "EMPTY_SCRIPT",
+      message: `${scriptPath || "스크립트"} 파일 내용이 비어 있습니다.`,
+    });
+    return { ok: false, hasCrlf, hasUtf8Bom, issues };
+  }
+  if (hasCrlf) {
+    issues.push({
+      severity: "error",
+      code: "CRLF_LINE_ENDINGS",
+      message: `${scriptPath || "스크립트"}에 Windows 개행문자(CRLF \\r\\n)가 포함되어 있어 리눅스 컨테이너 시작 직후 'bad interpreter' 오류로 실패합니다.`,
+    });
+  }
+  if (hasUtf8Bom) {
+    issues.push({
+      severity: "warn",
+      code: "UTF8_BOM",
+      message: `${scriptPath || "스크립트"} 맨 앞에 UTF-8 BOM 문자가 포함되어 있어 셸 헤더(#!) 인식이 실패할 수 있습니다.`,
+    });
+  }
+
+  const isShellPath = !scriptPath || /\.(sh|bash)$/i.test(scriptPath);
+  const cmdStr = String(executionCommand || "");
+  const invokedViaPlainSh =
+    isShellPath &&
+    (scriptPath
+      ? new RegExp(`(?:^|;|&&|\\|\\|)\\s*sh\\s+["']?${scriptPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(cmdStr)
+      : /(?:^|;|&&|\|\|)\s*sh\s+/.test(cmdStr));
+  if (invokedViaPlainSh) {
+    const hasBashisms =
+      /\[\[\s/.test(raw) ||
+      /\bset\s+-o\s+pipefail\b/.test(raw) ||
+      /(?:^|\n)\s*source\s+\S+/m.test(raw) ||
+      /\bfunction\s+[A-Za-z_]\w*\s*\(/.test(raw);
+    if (hasBashisms) {
+      issues.push({
+        severity: "warn",
+        code: "SH_WITH_BASHISMS",
+        message: `'sh ${scriptPath || "..."}'로 실행 중이지만 스크립트 내부에 Bash 전용 문법(pipefail / [[ ]] / source 등)이 있어 기본 셸이 dash인 컨테이너에서 즉시 종료될 수 있습니다. 'bash ${scriptPath || "..."}' 사용을 권장합니다.`,
+      });
+    }
+  }
+
+  return {
+    ok: !issues.some((i) => i.severity === "error"),
+    hasCrlf,
+    hasUtf8Bom,
+    issues,
+  };
+}
+
+function computeQueueAllocationVelocity(runsList = [], jobs = [], nowMs = Date.now()) {
+  const runs = Array.isArray(runsList) ? runsList : [];
+  const jobList = Array.isArray(jobs) ? jobs : [];
+  const waitSecs = [];
+  let promotionsLast1h = 0;
+
+  for (const r of runs) {
+    if (!r || !r.startTime) continue;
+    if (jobList.length > 0 && !jobList.some((j) => doesRunMatchJob(r, j, jobList))) continue;
+    const startMs = new Date(r.startTime).getTime();
+    if (Number.isNaN(startMs) || startMs <= 0) continue;
+    if (nowMs - startMs <= 3600 * 1000 && nowMs >= startMs) {
+      promotionsLast1h += 1;
+      const regIso = r.registerTime || r.createdAt || null;
+      if (regIso) {
+        const regMs = new Date(regIso).getTime();
+        if (!Number.isNaN(regMs) && regMs > 0 && startMs >= regMs) {
+          waitSecs.push(Math.round((startMs - regMs) / 1000));
+        }
+      }
+    }
+  }
+
+  let avgWaitSec = null;
+  let medianWaitSec = null;
+  if (waitSecs.length > 0) {
+    const sum = waitSecs.reduce((a, b) => a + b, 0);
+    avgWaitSec = Math.round(sum / waitSecs.length);
+    const sorted = [...waitSecs].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    medianWaitSec = sorted.length % 2 === 0 ? Math.round((sorted[mid - 1] + sorted[mid]) / 2) : sorted[mid];
+  }
+
+  return {
+    promotionsLast1h,
+    sampleCount: waitSecs.length,
+    avgWaitSec,
+    medianWaitSec,
+  };
+}
+
+function classifyFailureRootCause(logText = "", run = {}) {
+  const raw = String(logText || "");
+  const combined = `${raw}\n${run?.reason || ""} ${run?.message || ""} ${run?.exitReason || ""}`;
+  const lower = combined.toLowerCase();
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const tailExcerpt = lines.slice(-6);
+
+  let category = "UNKNOWN_EXIT";
+  let label = "비정상 종료";
+  if (
+    lower.includes("cuda out of memory") ||
+    lower.includes("outofmemoryerror") ||
+    lower.includes("oomkilled") ||
+    lower.includes("allocate memory")
+  ) {
+    category = "OOM_VRAM";
+    label = "GPU/시스템 메모리 부족 (OOM)";
+  } else if (
+    lower.includes("xid") ||
+    lower.includes("ecc error") ||
+    lower.includes("cuda initialization error") ||
+    lower.includes("no cuda-capable device") ||
+    lower.includes("nvml")
+  ) {
+    category = "CUDA_HW";
+    label = "GPU 노드 하드웨어·드라이버 오류";
+  } else if (
+    lower.includes("nccl error") ||
+    lower.includes("collective operation timeout") ||
+    lower.includes("nccl") && lower.includes("timeout")
+  ) {
+    category = "NCCL_COMM";
+    label = "분산 통신(NCCL) 타임아웃·오류";
+  } else if (
+    lower.includes("bad interpreter") ||
+    lower.includes("no such file or directory") ||
+    lower.includes("filenotfounderror") ||
+    lower.includes("permission denied")
+  ) {
+    category = "FILE_OR_MOUNT";
+    label = "스크립트·파일 경로 누락 또는 개행/권한 오류";
+  } else if (
+    lower.includes("syntaxerror") ||
+    lower.includes("syntax error") ||
+    lower.includes("command not found") ||
+    lower.includes("unrecognized arguments")
+  ) {
+    category = "SYNTAX_OR_CMD";
+    label = "스크립트 구문 또는 실행 인자 오류";
+  } else if (
+    lower.includes("traceback (most recent call last)") ||
+    /\b(runtimeerror|valueerror|keyerror|typeerror|assertionerror|importerror|modulenotfounderror)\s*:/i.test(raw)
+  ) {
+    category = "PYTHON_EXCEPTION";
+    label = "Python 런타임 예외 발생";
+  }
+
+  const keyErrLine =
+    [...lines]
+      .reverse()
+      .find((l) =>
+        /(error|exception|failed|killed|not found|bad interpreter|timeout|assert|oom)/i.test(l)
+      ) ||
+    lines[lines.length - 1] ||
+    String(run?.reason || run?.status || "종료 원인 로그 없음");
+
+  return {
+    category,
+    label,
+    headline: keyErrLine.slice(0, 220),
+    tailExcerpt,
+  };
+}
+
+function isTransientGatewayCreateError(err) {
+  if (!err) return false;
+  if (err.name === "TimeoutError" || err.name === "AbortError") return true;
+  const msg = String(err.message || err || "");
+  const m = msg.match(/\[(\d{3})\]/) || msg.match(/\bHTTP\s+(\d{3})\b/i);
+  if (m) {
+    const code = Number(m[1]);
+    if (code === 502 || code === 503 || code === 504) return true;
+  }
+  const lower = msg.toLowerCase();
+  return lower.includes("invalid response was received from the upstream") || lower.includes("bad gateway");
+}
+
+function sanitizeStateForBackup(rawStateObj, { includeTokens = false } = {}) {
+  const src = rawStateObj && typeof rawStateObj === "object" ? rawStateObj : {};
+  const cleanConfig = { ...(src.config || {}) };
+  if (!includeTokens) {
+    delete cleanConfig.accessToken;
+    delete cleanConfig.refreshToken;
+  }
+  const cleanSites = {};
+  for (const [sid, prof] of Object.entries(src.sites || {})) {
+    if (!prof || typeof prof !== "object") continue;
+    cleanSites[sid] = { ...prof };
+    if (!includeTokens) {
+      cleanSites[sid].accessToken = "";
+      cleanSites[sid].refreshToken = "";
+    }
+  }
+  const cleanJobs = (Array.isArray(src.jobs) ? src.jobs : []).map((j) => {
+    const copy = { ...j };
+    delete copy._knownPendingRunIds;
+    delete copy._incompletePendingBatchRetryAtMs;
+    delete copy._pendingRefillImmediate;
+    return copy;
+  });
+  return {
+    backupFormat: "space-gpu-runner-v2.8",
+    exportedAt: new Date().toISOString(),
+    includeTokens: Boolean(includeTokens),
+    activeSiteId: src.activeSiteId || "n9",
+    config: cleanConfig,
+    sites: cleanSites,
+    jobs: cleanJobs,
+    presets: Array.isArray(src.presets) ? src.presets : [],
+    scriptFiles: src.scriptFiles && typeof src.scriptFiles === "object" ? src.scriptFiles : {},
+  };
+}
+
+async function captureFailurePostMortem(failedRun, jobName = "") {
+  const fId = String(failedRun?.id ?? failedRun?.runId ?? "").trim();
+  if (!fId) return null;
+  if (!watchdogStats.seenPostMortemIds) watchdogStats.seenPostMortemIds = new Set();
+  if (!Array.isArray(watchdogStats.failurePostMortems)) watchdogStats.failurePostMortems = [];
+  if (watchdogStats.seenPostMortemIds.has(fId)) {
+    return watchdogStats.failurePostMortems.find((p) => String(p.runId) === fId) || null;
+  }
+  watchdogStats.seenPostMortemIds.add(fId);
+  while (watchdogStats.seenPostMortemIds.size > 200) {
+    const oldest = watchdogStats.seenPostMortemIds.values().next().value;
+    if (oldest === undefined) break;
+    watchdogStats.seenPostMortemIds.delete(oldest);
+  }
+  let logText = "";
+  try {
+    const rawLog = await spaceApi.getRunLog(fId, { tailLines: 40 }, { timeoutMs: 3000, skipTelemetry: true });
+    logText = typeof rawLog === "string" ? rawLog : JSON.stringify(rawLog || "");
+  } catch {
+    // ignore log fetch failure
+  }
+  const diagnosis = classifyFailureRootCause(logText, failedRun);
+  const startMs = failedRun.startTime ? new Date(failedRun.startTime).getTime() : 0;
+  const endMs = failedRun.endTime ? new Date(failedRun.endTime).getTime() : Date.now();
+  const durationSec = startMs > 0 && endMs >= startMs ? Math.round((endMs - startMs) / 1000) : null;
+  const entry = {
+    runId: fId,
+    runName: failedRun.containerName || failedRun.name || `#${fId}`,
+    jobName: jobName || "",
+    status: String(failedRun.status || failedRun.state || "FAILED"),
+    nodeName: extractNodeIdentifierFromRunOrLog(failedRun, logText),
+    durationSec,
+    failedAt: failedRun.endTime || new Date().toISOString(),
+    ...diagnosis,
+  };
+  watchdogStats.failurePostMortems.unshift(entry);
+  if (watchdogStats.failurePostMortems.length > 25) {
+    watchdogStats.failurePostMortems = watchdogStats.failurePostMortems.slice(0, 25);
+  }
+  return entry;
 }
 
 /**
@@ -5264,14 +5585,26 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
   };
 
   const timeScaleStatus = computeTimeScaleStatus();
+  const perJobRunningGpus = {};
+  for (const jfItem of jobFleetList) {
+    if (jfItem.jobName) {
+      perJobRunningGpus[jfItem.jobName] = Number(jfItem.runningGpuCount || 0);
+    }
+  }
   const telemetryStatus = updateGpuTelemetry(
     runsList,
     totalRunningWorkers,
     totalPendingWorkers,
     totalRunningGpus,
     totalTargetGpus,
-    loadStatus?.api?.avgLatencyMs || 0
+    loadStatus?.api?.avgLatencyMs || 0,
+    perJobRunningGpus
   );
+  for (const jfItem of jobFleetList) {
+    jfItem.gpuHoursTotal = Number(telemetryStatus.jobGpuHours?.[jfItem.jobName] || 0);
+    jfItem.gpuHoursToday = Number(telemetryStatus.todayJobGpuHours?.[jfItem.jobName] || 0);
+  }
+  const queueVelocity = computeQueueAllocationVelocity(runsList, state.jobs, now);
   const badNodeCooldownRemainingSec =
     badNodeStats.cooldownUntilMs > now ? Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000) : 0;
 
@@ -5295,6 +5628,7 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     totalTargetGpus,
     totalRemainingGpus,
     nextSpawnInSec: globalNextSpawnInSec,
+    queueVelocity,
     spaceReconciliation,
     jobs: jobFleetList,
     autoApprovalTimeline: timelineList.slice(0, 40),
@@ -5315,6 +5649,7 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       silentHangRestartedCount: watchdogStats.silentHangRestartedCount || 0,
       lastActionMessage: watchdogStats.lastActionMessage,
       workerLogSnippets: watchdogStats.workerLogSnippets,
+      failurePostMortems: (watchdogStats.failurePostMortems || []).slice(0, 20),
     },
     timeScale: timeScaleStatus,
     hybridFallback: {
@@ -5557,6 +5892,9 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       }
       const startMs = fr.startTime ? new Date(fr.startTime).getTime() : 0;
       const endMs = fr.endTime ? new Date(fr.endTime).getTime() : now;
+      if (now - endMs < 30 * 60 * 1000) {
+        captureFailurePostMortem(fr, job.name).catch(() => {});
+      }
       const runDurSec = startMs > 0 ? Math.max(0, Math.floor((endMs - startMs) / 1000)) : 9999;
       if (runDurSec <= rapidSecLimit && now - endMs < 180000) {
         badNodeStats.rapidFailCount += 1;
@@ -5805,12 +6143,28 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       }
     );
 
-    // Feature 4: Spot ↔ Standard / Fallback Core Auto-Retry on genuine pool/resource `createRun` failure (never on 5xx gateway blips!)
+    // Feature 4 & Batch 4: Idempotent 502/503/504 Gateway Retry + Spot ↔ Standard Fallback on genuine pool/resource failure
     let createRes = null;
     try {
       createRes = await spaceApi.createRun(payload);
     } catch (primaryErr) {
-      if (state.config.hybridFallbackEnabled !== false && shouldTriggerHybridPoolFallback(primaryErr)) {
+      if (isTransientGatewayCreateError(primaryErr)) {
+        await sleep(1500);
+        const verifyRuns = await fetchCurrentRuns(true).catch(() => []);
+        const alreadyCreated = verifyRuns.find(
+          (r) => String(r.containerName || r.name || "") === String(payload.containerName)
+        );
+        if (alreadyCreated) {
+          createRes = alreadyCreated;
+          addLog(
+            "info",
+            `🛡️ [게이트웨이 5xx 멱등 복구] ${payload.containerName} 생성 응답은 지연/오류였으나 클러스터에 정상 등록됨을 확인하여 중복 없이 인수했습니다.`
+          );
+        } else {
+          createRes = await spaceApi.createRun(payload);
+          addLog("info", `🔄 [게이트웨이 일시 오류 자동 재시도 성공] ${payload.containerName} 재요청으로 정상 생성 완료`);
+        }
+      } else if (state.config.hybridFallbackEnabled !== false && shouldTriggerHybridPoolFallback(primaryErr)) {
         const altAllowSpot = !payload.allowSpot;
         const altCoreId = state.config.fallbackCoreId ? Number(state.config.fallbackCoreId) : undefined;
         const fallbackLabel = altAllowSpot ? "Standard ➔ Spot" : "Spot ➔ Standard";
@@ -8137,6 +8491,167 @@ const server = http.createServer(async (req, res) => {
         totalMatches,
         elapsedMs: Date.now() - startMs,
         results: matchedResults,
+      });
+    }
+
+    // 8-A3d. Batch 4 - Feature 4: Automated Failure Post-Mortem Inspector (`GET /api/space/runs/postmortem`)
+    if (pathname === "/api/space/runs/postmortem" && req.method === "GET") {
+      const myUser = resolveCurrentUserName();
+      const recentTermMap = getSiteRuntime().recentlyTerminatedRunsMap;
+      const allRuns = getSiteKnownRuns();
+      const recentFailed = allRuns
+        .filter((r) => isRunOwnedByUser(r, myUser) && isGenuineBadNodeFailureRun(r, recentTermMap))
+        .slice(0, 6);
+      for (const fr of recentFailed) {
+        const matchedJob = state.jobs.find((j) => doesRunMatchJob(rOrFr(fr), j, state.jobs));
+        await captureFailurePostMortem(fr, matchedJob?.name || "");
+      }
+      function rOrFr(x) {
+        return x;
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        items: (watchdogStats.failurePostMortems || []).slice(0, 25),
+      });
+    }
+
+    // 8-A3e. Batch 4 - Feature 1: Pre-Flight Script & Syntax Validator (`POST /api/jobs/preflight`)
+    if (pathname === "/api/jobs/preflight" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const executionCommand = String(body.executionCommand || "").trim();
+      const checks = [];
+      let hasErrors = false;
+      const pushCheck = (severity, title, detail, extra = {}) => {
+        if (severity === "error") hasErrors = true;
+        checks.push({ severity, title, detail, ...extra });
+      };
+
+      // 1. Auth & Group check
+      const jwt = decodeJwtPayload(state.config.accessToken);
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (!state.config.accessToken) {
+        pushCheck("error", "인증 토큰 미설정", "현재 사이트의 SPACE Access Token이 설정되어 있지 않습니다.");
+      } else if (jwt?.exp && jwt.exp <= nowSec && !state.config.refreshToken) {
+        pushCheck("error", "인증 토큰 만료", "Access Token이 만료되었으며 Refresh Token이 없습니다.");
+      } else {
+        pushCheck("ok", "클러스터 인증 정상", `계정 ${resolveCurrentUserName()} · 그룹 ${state.config.groupId || "자동"}`);
+      }
+
+      // 2. Command & Script file checks (`/user-volume/...` & `/group-volume/...`)
+      if (!executionCommand) {
+        pushCheck("error", "실행 명령어 비어 있음", "컨테이너 시작 시 실행할 명령어를 입력해 주세요.");
+      } else {
+        const scriptPaths = extractScriptPathsFromCommand(executionCommand);
+        if (scriptPaths.length === 0) {
+          pushCheck("ok", "인라인 실행 명령어 확인", `볼륨 스크립트 파일 참조 없음 (${executionCommand.slice(0, 80)})`);
+        }
+        for (const sp of scriptPaths) {
+          let content = null;
+          let sourceLabel = "SFM 원격 스토리지";
+          if (state.scriptFiles && typeof state.scriptFiles[sp] === "string") {
+            content = state.scriptFiles[sp];
+            sourceLabel = "웹 에디터 동기화 캐시";
+          } else if (state.config.accessToken) {
+            try {
+              const sfmRes = await readSfmFile(sp);
+              content = sfmRes?.content ?? "";
+            } catch (sfmErr) {
+              pushCheck(
+                "error",
+                `스크립트 파일 조회 실패 (${sp})`,
+                `스토리지에서 파일을 읽을 수 없습니다 (${sfmErr.message}). 경로 오타 여부를 확인해 주세요.`,
+                { scriptPath: sp }
+              );
+              continue;
+            }
+          }
+          if (content !== null) {
+            const analysis = analyzeShellScriptIssues(content, executionCommand, sp);
+            for (const iss of analysis.issues) {
+              pushCheck(iss.severity, `스크립트 점검 (${sp})`, iss.message, { code: iss.code, scriptPath: sp });
+            }
+            if (/\.sh$/i.test(sp) && content.trim()) {
+              try {
+                const lfClean = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+                execFileSync("bash", ["-n"], { input: lfClean, encoding: "utf-8", timeout: 3000 });
+                if (analysis.issues.length === 0) {
+                  pushCheck("ok", `셸 구문 검사 통과 (${sp})`, `${sourceLabel} 확인 완료 (${lfClean.split("\n").length}줄 · bash -n 이상 없음)`);
+                }
+              } catch (syntaxErr) {
+                const stderrMsg = String(syntaxErr.stderr || syntaxErr.message || "").trim().slice(0, 240);
+                pushCheck("error", `Bash 문법 오류 감지 (${sp})`, stderrMsg || "bash -n 구문 검사 실패", {
+                  code: "BASH_SYNTAX_ERROR",
+                  scriptPath: sp,
+                });
+              }
+            } else if (analysis.issues.length === 0) {
+              pushCheck("ok", `스크립트 확인 완료 (${sp})`, `${sourceLabel} (${content.split(/\r?\n/).length}줄)`);
+            }
+          }
+        }
+      }
+
+      return sendJson(res, 200, {
+        ok: !hasErrors,
+        hasErrors,
+        warnCount: checks.filter((c) => c.severity === "warn").length,
+        errorCount: checks.filter((c) => c.severity === "error").length,
+        checks,
+      });
+    }
+
+    // 8-A3f. Batch 4 - Feature 5: Config / Rules / Presets Snapshot Backup & Restore (`GET /api/backup/export`, `POST /api/backup/import`)
+    if (pathname === "/api/backup/export" && req.method === "GET") {
+      const includeTokens = parsedUrl.searchParams.get("includeTokens") === "1";
+      const snapshot = sanitizeStateForBackup(rawState, { includeTokens });
+      const dateStr = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="space-gpu-runner-backup-${dateStr}.json"`,
+        "Cache-Control": "no-store",
+      });
+      return res.end(JSON.stringify(snapshot, null, 2));
+    }
+
+    if (pathname === "/api/backup/import" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const snap = body?.snapshot && typeof body.snapshot === "object" ? body.snapshot : body;
+      if (!snap || typeof snap !== "object" || (!Array.isArray(snap.jobs) && !Array.isArray(snap.presets))) {
+        return sendJson(res, 400, { error: "유효한 백업 JSON 형식이 아닙니다 (jobs 또는 presets 배열 필요)." });
+      }
+      let restoredJobsCount = 0;
+      let restoredPresetsCount = 0;
+      if (Array.isArray(snap.jobs)) {
+        const byId = new Map((rawState.jobs || []).map((j) => [String(j.id), j]));
+        for (const jb of snap.jobs) {
+          if (!jb || typeof jb !== "object" || !jb.id || !jb.name) continue;
+          // Restore safely with `enabled: false` by default unless `keepEnabled === true` so imported rules never unexpectedly mass-spawn!
+          const prev = byId.get(String(jb.id));
+          byId.set(String(jb.id), {
+            ...(prev || {}),
+            ...jb,
+            enabled: body.keepEnabled === true ? Boolean(jb.enabled) : Boolean(prev?.enabled ?? false),
+          });
+          restoredJobsCount += 1;
+        }
+        rawState.jobs = [...byId.values()];
+      }
+      if (Array.isArray(snap.presets)) {
+        rawState.presets = snap.presets.slice(0, 50);
+        restoredPresetsCount = rawState.presets.length;
+      }
+      if (snap.scriptFiles && typeof snap.scriptFiles === "object") {
+        rawState.scriptFiles = { ...(rawState.scriptFiles || {}), ...snap.scriptFiles };
+      }
+      saveState();
+      addLog("info", `📦 [설정·규칙 백업 복원] 규칙 ${restoredJobsCount}건 · 프리셋 ${restoredPresetsCount}건 병합 복원 완료`);
+      return sendJson(res, 200, {
+        ok: true,
+        restoredJobsCount,
+        restoredPresetsCount,
+        jobs: state.jobs,
+        presets: state.presets,
+        workerFleet: computeWorkerFleetStats(getSiteKnownRuns()),
       });
     }
 

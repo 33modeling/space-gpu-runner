@@ -1,10 +1,10 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.7.0`
+- **문서 버전**: `v2.8.0`
 - **최종 검증일**: `2026-11-26`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **54개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **60개** 케이스)
 
 ---
 
@@ -160,6 +160,12 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-52** | Suite 6 (폴백5xx오발동방지) | `shouldTriggerHybridPoolFallback` | 게이트웨이 `502/503` 및 타임아웃 발생 시 Spot 규칙이 Standard로 잘못 폴백되지 않음을 검증 | ✅ PASS |
 | **TC-53** | Suite 6 (통합GPU상한/우선순위) | `computeGlobalCapWorkerLimit` | 복수 규칙(`v9` 1순위 · `v8` 2순위) 동시 가동 시 사이트 통합 GPU 상한(`globalMaxGpus`) 내에서 후순위 규칙이 자동 양보하는지 검증 | ✅ PASS |
 | **TC-54** | Suite 6 (멀티규칙바/서비스스크립트) | `visibleMultiJobs` & `manage-service.sh` | 다중 활성 규칙 요약 바 바인딩 및 `systemd` 유저 서비스 스크립트(`bash -n`) 무결성 검증 | ✅ PASS |
+| **TC-55** | Suite 6 (출발전사전점검기) | `analyzeShellScriptIssues` & `/preflight` | 스크립트 경로 추출, Windows CRLF(`\r\n`), `sh`+Bashism 경고 및 라이브 사전 점검 API 검증 | ✅ PASS |
+| **TC-56** | Suite 6 (대기열소화속도) | `computeQueueAllocationVelocity` | 최근 1시간 `Pending➔Running` 배정 건수 및 대기 시간 평균·중앙값 계산 검증 | ✅ PASS |
+| **TC-57** | Suite 6 (실패원인자동부검) | `classifyFailureRootCause` & `/postmortem` | OOM·NCCL·경로/개행·Python 예외 자동 분류 및 라이브 부검 API 검증 | ✅ PASS |
+| **TC-58** | Suite 6 (안전백업스냅샷) | `sanitizeStateForBackup` & `/backup/export` | 토큰 마스킹·임시 상태 제거 스냅샷 생성 및 라이브 백업 다운로드 검증 | ✅ PASS |
+| **TC-59** | Suite 6 (5xx생성멱등재시도) | `isTransientGatewayCreateError` | `createRun` `502/503/504`/타임아웃 일시 장애 판별 및 4xx 배제 검증 | ✅ PASS |
+| **TC-60** | Suite 6 (규칙별GPU시간정산) | `jobGpuHours` / `dailyJobGpuHours` | 규칙별 독립 누적·금일 `GPU-Hours` 적산 및 프론트엔드 표시 바인딩 검증 | ✅ PASS |
 
 ---
 

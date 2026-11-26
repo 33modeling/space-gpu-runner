@@ -87,6 +87,12 @@ function createServerLogicSandbox() {
     "searchWorkerLogLines",
     "computeEffectiveJobBudget",
     "computeGlobalCapWorkerLimit",
+    "extractScriptPathsFromCommand",
+    "analyzeShellScriptIssues",
+    "computeQueueAllocationVelocity",
+    "classifyFailureRootCause",
+    "isTransientGatewayCreateError",
+    "sanitizeStateForBackup",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -1071,12 +1077,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=26`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=27`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=7`),
-      fetch(`${BASE_URL}/app.js?v=26`),
+      fetch(`${BASE_URL}/app.js?v=27`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1084,7 +1090,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=26"), true, "라이브 index.html이 최신 캐시버전 app.js?v=26을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=27"), true, "라이브 index.html이 최신 캐시버전 app.js?v=27을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -1501,5 +1507,142 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.doesNotThrow(() => {
       execFileSync("bash", ["-n", svcScriptPath], { encoding: "utf-8" });
     });
+  });
+
+  test("TC-55: [Batch 4] `extractScriptPathsFromCommand` & `analyzeShellScriptIssues` 출발 전 스크립트 검증기(CRLF·BOM·Bashism) 검증", async (t) => {
+    const paths = srv.extractScriptPathsFromCommand(
+      "cd /user-volume/offpolicy-misranking && sh /user-volume/offpolicy-misranking/v9/run.sh && python3 /group-volume/eval.py"
+    );
+    assert.deepEqual([...paths], ["/user-volume/offpolicy-misranking/v9/run.sh", "/group-volume/eval.py"]);
+
+    // CRLF detection (fatal on Linux containers)
+    const crlfRes = srv.analyzeShellScriptIssues("#!/bin/bash\r\necho hello\r\n", "bash /group-volume/run.sh", "/group-volume/run.sh");
+    assert.equal(crlfRes.ok, false);
+    assert.equal(crlfRes.hasCrlf, true);
+    assert.equal(crlfRes.issues.some((i) => i.code === "CRLF_LINE_ENDINGS"), true);
+
+    // `sh` + bashism (`set -o pipefail` / `[[ ]]`) warning
+    const bashismRes = srv.analyzeShellScriptIssues(
+      "#!/usr/bin/env bash\nset -euo pipefail\nif [[ -f config.yaml ]]; then echo ok; fi\n",
+      "sh /user-volume/offpolicy-misranking/v9/run.sh",
+      "/user-volume/offpolicy-misranking/v9/run.sh"
+    );
+    assert.equal(bashismRes.ok, true);
+    assert.equal(bashismRes.issues.some((i) => i.code === "SH_WITH_BASHISMS"), true);
+
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 preflight API 스킵");
+    const pfRes = await fetch(`${BASE_URL}/api/jobs/preflight`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Password": ADMIN_PW },
+      body: JSON.stringify({ executionCommand: "echo preflight_ok" }),
+    });
+    assert.equal(pfRes.status, 200);
+    const pfJson = await pfRes.json();
+    assert.equal(Array.isArray(pfJson.checks), true);
+  });
+
+  test("TC-56: [Batch 4] `computeQueueAllocationVelocity` 최근 1시간 클러스터 노드 배정 속도 및 대기 중앙값 산출 검증", () => {
+    const nowMs = Date.parse("2026-11-26T08:00:00.000Z");
+    const jobs = [{ id: "j-v9", name: "v9", executionCommand: "sh /user-volume/v9/run.sh" }];
+    const runs = [
+      // Promoted 10m ago after 120s queue wait
+      {
+        id: "1",
+        containerName: "v9-s01-1126",
+        registerTime: "2026-11-26T07:48:00.000Z",
+        startTime: "2026-11-26T07:50:00.000Z",
+      },
+      // Promoted 20m ago after 300s queue wait
+      {
+        id: "2",
+        containerName: "v9-s02-1126",
+        registerTime: "2026-11-26T07:35:00.000Z",
+        startTime: "2026-11-26T07:40:00.000Z",
+      },
+      // Promoted 3 hours ago -> excluded from 1h velocity
+      {
+        id: "3",
+        containerName: "v9-s03-1126",
+        registerTime: "2026-11-26T04:50:00.000Z",
+        startTime: "2026-11-26T05:00:00.000Z",
+      },
+    ];
+    const vel = srv.computeQueueAllocationVelocity(runs, jobs, nowMs);
+    assert.equal(vel.promotionsLast1h, 2);
+    assert.equal(vel.avgWaitSec, 210);
+    assert.equal(vel.medianWaitSec, 210);
+  });
+
+  test("TC-57: [Batch 4] `classifyFailureRootCause` 컨테이너 실패 원인 자동 부검 분류기(OOM·NCCL·경로·Python) 검증", async (t) => {
+    assert.equal(
+      srv.classifyFailureRootCause("torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB").category,
+      "OOM_VRAM"
+    );
+    assert.equal(
+      srv.classifyFailureRootCause("[E ProcessGroupNCCL.cpp:915] Watchdog caught collective operation timeout").category,
+      "NCCL_COMM"
+    );
+    assert.equal(
+      srv.classifyFailureRootCause("sh: /user-volume/v9/run.sh: /bin/bash^M: bad interpreter: No such file or directory").category,
+      "FILE_OR_MOUNT"
+    );
+    assert.equal(
+      srv.classifyFailureRootCause("Traceback (most recent call last):\n  File 'train.py', line 42\nKeyError: 'reward'").category,
+      "PYTHON_EXCEPTION"
+    );
+
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 postmortem API 스킵");
+    const pmRes = await fetch(`${BASE_URL}/api/space/runs/postmortem`, {
+      headers: { "X-Admin-Password": ADMIN_PW },
+    });
+    assert.equal(pmRes.status, 200);
+    const pmJson = await pmRes.json();
+    assert.equal(Array.isArray(pmJson.items), true);
+  });
+
+  test("TC-58: [Batch 4] `sanitizeStateForBackup` 토큰 마스킹 백업 스냅샷 생성 및 라이브 내보내기 검증", async (t) => {
+    const sampleState = {
+      activeSiteId: "n9",
+      config: { accessToken: "secret-jwt", refreshToken: "secret-rt", checkIntervalSec: 15 },
+      sites: { n9: { id: "n9", accessToken: "site-jwt", refreshToken: "site-rt", groupId: "SR-Coredata" } },
+      jobs: [{ id: "j1", name: "v9", minConcurrentRuns: 80, _knownPendingRunIds: ["1", "2"] }],
+      presets: [{ id: "p1", name: "preset-80" }],
+      scriptFiles: { "/user-volume/v9/run.sh": "echo hi" },
+    };
+    const snap = srv.sanitizeStateForBackup(sampleState, { includeTokens: false });
+    assert.equal(snap.config.accessToken, undefined, "기본 백업에서는 accessToken이 제거되어야 함");
+    assert.equal(snap.sites.n9.accessToken, "", "사이트 프로필에서도 토큰이 비워져야 함");
+    assert.equal(snap.jobs[0]._knownPendingRunIds, undefined, "임시 런타임 배열은 백업에서 정리되어야 함");
+    assert.equal(snap.jobs[0].minConcurrentRuns, 80);
+
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 backup API 스킵");
+    const bkRes = await fetch(`${BASE_URL}/api/backup/export?includeTokens=0`, {
+      headers: { "X-Admin-Password": ADMIN_PW },
+    });
+    assert.equal(bkRes.status, 200);
+    const bkJson = await bkRes.json();
+    assert.equal(bkJson.backupFormat, "space-gpu-runner-v2.8");
+    assert.equal(bkJson.config?.accessToken, undefined);
+  });
+
+  test("TC-59: [Batch 4] `isTransientGatewayCreateError` 502/503/504 일시 게이트웨이 오류 판별 검증", () => {
+    assert.equal(
+      srv.isTransientGatewayCreateError(
+        new Error("SPACE API Error [502] /api/wlm/v2/runs: An invalid response was received from the upstream server")
+      ),
+      true
+    );
+    assert.equal(srv.isTransientGatewayCreateError(new Error("SPACE API Error [503] Service Unavailable")), true);
+    assert.equal(
+      srv.isTransientGatewayCreateError(Object.assign(new Error("aborted"), { name: "TimeoutError" })),
+      true
+    );
+    assert.equal(srv.isTransientGatewayCreateError(new Error("SPACE API Error [400] Bad Request")), false);
+  });
+
+  test("TC-60: [Batch 4] 규칙별 독립 GPU-Hours 적산(`jobGpuHours` / `dailyJobGpuHours`) 및 프론트엔드 표시 바인딩 검증", () => {
+    assert.equal(serverSrc.includes("siteTel.dailyJobGpuHours[dateKey][jName]"), true);
+    assert.equal(serverSrc.includes("jfItem.gpuHoursTotal = Number(telemetryStatus.jobGpuHours?.[jfItem.jobName] || 0)"), true);
+    assert.equal(appJsSrc.includes("jf.gpuHoursTotal"), true);
   });
 });
