@@ -79,6 +79,8 @@ function createServerLogicSandbox() {
     "parseWorkerLogProgress",
     "formatWebhookPayload",
     "isSpotPreemptedRun",
+    "isEligibleNewPreemptionEvent",
+    "shouldTriggerHybridPoolFallback",
     "evaluateSilentHangState",
     "extractNodeIdentifierFromRunOrLog",
     "detectStragglerWorkers",
@@ -1414,5 +1416,58 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     });
     assert.equal(sl.channel, "slack");
     assert.equal(typeof sl.body.text, "string");
+  });
+
+  test("TC-51: `isEligibleNewPreemptionEvent` 과거 이력 재집계 차단(2시간 이내 & 워터마크) 검증", () => {
+    const nowMs = Date.parse("2026-11-26T01:20:00.000Z");
+    const seen = new Set(["373421"]);
+
+    // 1. Fresh preemption (5m ago) not yet seen -> eligible
+    assert.equal(
+      srv.isEligibleNewPreemptionEvent(
+        { id: "373430", status: "Preempted", endTime: "2026-11-26T01:15:00.000Z" },
+        { seenSet: seen, minWatermarkId: 371000, nowMs }
+      ),
+      true
+    );
+    // 2. Historical preemption from 2 days ago -> rejected so sliding window never re-counts old runs
+    assert.equal(
+      srv.isEligibleNewPreemptionEvent(
+        { id: "370900", status: "Preempted", endTime: "2026-11-24T01:15:00.000Z" },
+        { seenSet: seen, minWatermarkId: 371000, nowMs }
+      ),
+      false
+    );
+    // 3. Below watermark ID -> rejected even if endTime is missing
+    assert.equal(
+      srv.isEligibleNewPreemptionEvent(
+        { id: "370500", status: "Preempted" },
+        { seenSet: seen, minWatermarkId: 371000, nowMs }
+      ),
+      false
+    );
+  });
+
+  test("TC-52: `shouldTriggerHybridPoolFallback` 게이트웨이 502/503/타임아웃 시 Spot➔Standard 오발동 차단 검증", () => {
+    assert.equal(
+      srv.shouldTriggerHybridPoolFallback(
+        new Error("SPACE API Error [502] /api/wlm/v2/runs: An invalid response was received from the upstream server")
+      ),
+      false,
+      "502 게이트웨이 오류 시 Spot 규칙을 Standard(On-Demand)로 폴백하면 안 됨"
+    );
+    assert.equal(
+      srv.shouldTriggerHybridPoolFallback(new Error("SPACE API Error [503] /api/wlm/v2/runs: Service Unavailable")),
+      false
+    );
+    assert.equal(
+      srv.shouldTriggerHybridPoolFallback(Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" })),
+      false
+    );
+    assert.equal(
+      srv.shouldTriggerHybridPoolFallback(new Error("SPACE API Error [400] /api/wlm/v2/runs: insufficient spot quota")),
+      true,
+      "실제 풀/쿼터 부족 오류(400/409/422)에서는 하이브리드 폴백이 정상 동작해야 함"
+    );
   });
 });

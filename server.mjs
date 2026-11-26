@@ -407,7 +407,8 @@ function loadState() {
         preemptionTotal: Number(tObj.preemptionTotal || 0),
         dailyPreemptions: tObj.dailyPreemptions && typeof tObj.dailyPreemptions === "object" ? tObj.dailyPreemptions : {},
         recentPreemptions: Array.isArray(tObj.recentPreemptions) ? tObj.recentPreemptions.slice(0, 60) : [],
-        seenPreemptedRunIds: Array.isArray(tObj.seenPreemptedRunIds) ? tObj.seenPreemptedRunIds.slice(-500) : [],
+        seenPreemptedRunIds: Array.isArray(tObj.seenPreemptedRunIds) ? tObj.seenPreemptedRunIds.slice(-2000) : [],
+        minPreemptWatermarkId: Number(tObj.minPreemptWatermarkId || 0),
         lastDigestDate: String(tObj.lastDigestDate || ""),
       });
       const rawTelemetry =
@@ -3413,6 +3414,28 @@ function getSpotPreemptionSummary(siteTel = getSiteTelemetryObject(), nowMs = Da
   };
 }
 
+function isEligibleNewPreemptionEvent(
+  run,
+  { seenSet = new Set(), minWatermarkId = 0, recentlyTerminatedMap = null, nowMs = Date.now() } = {}
+) {
+  if (!isSpotPreemptedRun(run, recentlyTerminatedMap)) return false;
+  const rId = String(run.id ?? run.runId ?? "").trim();
+  if (!rId || seenSet.has(rId)) return false;
+  const numId = Number(rId);
+  if (Number.isFinite(numId) && minWatermarkId > 0 && numId <= minWatermarkId) {
+    return false;
+  }
+  const basisIso = run.endTime || run.updatedAt || run.startTime || run.registerTime || null;
+  if (basisIso) {
+    const evMs = new Date(basisIso).getTime();
+    // Ignore historical runs older than 2 hours so older runs never re-trigger or inflate counters across ticks
+    if (!Number.isNaN(evMs) && nowMs - evMs > 2 * 3600 * 1000) {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function recordSpotPreemptionsFromRuns(allRuns = getSiteKnownRuns(), nowMs = Date.now()) {
   const runsList = Array.isArray(allRuns) ? allRuns : [];
   if (runsList.length === 0) return getSpotPreemptionSummary(getSiteTelemetryObject(), nowMs);
@@ -3425,19 +3448,27 @@ async function recordSpotPreemptionsFromRuns(allRuns = getSiteKnownRuns(), nowMs
   const recentTermMap = getSiteRuntime().recentlyTerminatedRunsMap;
   const kstDate = new Date(nowMs + 9 * 60 * 60 * 1000);
   const todayKey = kstDate.toISOString().slice(0, 10);
+  let minWatermarkId = Number(siteTel.minPreemptWatermarkId || 0);
   let newlyRecorded = 0;
 
   for (const r of runsList) {
-    if (!isSpotPreemptedRun(r, recentTermMap)) continue;
+    if (!isEligibleNewPreemptionEvent(r, { seenSet, minWatermarkId, recentlyTerminatedMap: recentTermMap, nowMs })) {
+      continue;
+    }
     const matchedJob = state.jobs.find((j) => doesRunMatchJob(r, j, state.jobs));
     if (!matchedJob) continue;
     const rId = String(r.id ?? r.runId ?? "").trim();
-    if (!rId || seenSet.has(rId)) continue;
 
     seenSet.add(rId);
     siteTel.seenPreemptedRunIds.push(rId);
-    if (siteTel.seenPreemptedRunIds.length > 500) {
-      siteTel.seenPreemptedRunIds = siteTel.seenPreemptedRunIds.slice(-500);
+    if (siteTel.seenPreemptedRunIds.length > 2000) {
+      const evictedIds = siteTel.seenPreemptedRunIds.slice(0, siteTel.seenPreemptedRunIds.length - 2000);
+      for (const oldId of evictedIds) {
+        const n = Number(oldId);
+        if (Number.isFinite(n) && n > minWatermarkId) minWatermarkId = n;
+      }
+      siteTel.seenPreemptedRunIds = siteTel.seenPreemptedRunIds.slice(-2000);
+      siteTel.minPreemptWatermarkId = minWatermarkId;
     }
     const evTime = r.endTime || new Date(nowMs).toISOString();
     const evDateKey = new Date(new Date(evTime).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10) || todayKey;
@@ -5292,6 +5323,32 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
   };
 }
 
+function shouldTriggerHybridPoolFallback(err) {
+  if (!err) return false;
+  if (err.name === "TimeoutError" || err.name === "AbortError") return false;
+  const msg = String(err.message || err || "");
+  const statusMatch = msg.match(/\[(\d{3})\]/) || msg.match(/\bHTTP\s+(\d{3})\b/i);
+  if (statusMatch) {
+    const code = Number(statusMatch[1]);
+    // Never flip Spot -> Standard on auth errors, rate limits, or 5xx gateway errors (500/502/503/504)!
+    if (code === 401 || code === 403 || code === 429 || code >= 500) {
+      return false;
+    }
+  }
+  const lower = msg.toLowerCase();
+  if (
+    lower.includes("fetch failed") ||
+    lower.includes("aborted due to timeout") ||
+    lower.includes("upstream connect error") ||
+    lower.includes("invalid response was received from the upstream") ||
+    lower.includes("bad gateway") ||
+    lower.includes("service unavailable")
+  ) {
+    return false;
+  }
+  return true;
+}
+
 async function checkPoolGpuAvailable(groupPoolId, coreId, requiredCount) {
   try {
     const statusList = await spaceApi.getGroupPoolsStatus(state.config.groupId);
@@ -5689,12 +5746,12 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       }
     );
 
-    // Feature 4: Spot ↔ Standard / Fallback Core Auto-Retry on `createRun` failure
+    // Feature 4: Spot ↔ Standard / Fallback Core Auto-Retry on genuine pool/resource `createRun` failure (never on 5xx gateway blips!)
     let createRes = null;
     try {
       createRes = await spaceApi.createRun(payload);
     } catch (primaryErr) {
-      if (state.config.hybridFallbackEnabled !== false) {
+      if (state.config.hybridFallbackEnabled !== false && shouldTriggerHybridPoolFallback(primaryErr)) {
         const altAllowSpot = !payload.allowSpot;
         const altCoreId = state.config.fallbackCoreId ? Number(state.config.fallbackCoreId) : undefined;
         const fallbackLabel = altAllowSpot ? "Standard ➔ Spot" : "Spot ➔ Standard";
@@ -8865,14 +8922,18 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: "Not Found" });
     } catch (err) {
-      const statusCode =
-        Number.isInteger(err?.statusCode) && err.statusCode >= 400 && err.statusCode < 600
-          ? err.statusCode
-          : 500;
-      if (statusCode >= 500) {
+      const isUpstreamTimeout = err?.name === "TimeoutError" || err?.name === "AbortError";
+      const statusCode = isUpstreamTimeout
+        ? 504
+        : Number.isInteger(err?.statusCode) && err.statusCode >= 400 && err.statusCode < 600
+        ? err.statusCode
+        : 500;
+      if (statusCode >= 500 && !isUpstreamTimeout) {
         console.error("[API Error]", err);
       }
-      sendJson(res, statusCode, { error: err?.message || "Internal Server Error" });
+      sendJson(res, statusCode, {
+        error: isUpstreamTimeout ? "SPACE 서버 응답 시간 초과 (Gateway Timeout)" : err?.message || "Internal Server Error",
+      });
     }
     });
   } catch (outerErr) {

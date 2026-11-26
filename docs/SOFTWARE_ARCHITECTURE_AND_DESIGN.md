@@ -1,8 +1,8 @@
 # 📘 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 소프트웨어 구성 및 상세 설계 명세서 (SRS & SDD)
 
-- **문서 버전**: `v2.1.0`
-- **최종 갱신일**: `2026-11-13`
+- **문서 버전**: `v2.6.0`
+- **최종 갱신일**: `2026-11-26`
 - **대상 시스템**: `space-gpu-runner` (`server.mjs`, `public/index.html`, `public/app.js`, `public/style.css`)
 - **운영 대상 클러스터**: `SPACE N9 (NVIDIA H100)` · `SPACE N6 (NVIDIA A100)` · 사용자 추가 커스텀 SPACE 클러스터
 
@@ -77,8 +77,14 @@
 | **FR-11** | 노드보호 | 불량 노드 조기 실패 감지 (`Bad-Node Guard`) | 컨테이너 시작 후 `180초` 이내 실패 또는 `Xid`/`ECC`/`NVML`/`CUDA init` 치명 에러 감지 시 불량 노드 재할당 방지를 위한 스마트 쿨다운(`25초`)을 자동 적용해야 한다. | 높음(P1) |
 | **FR-12** | 자가치유 | Watchdog 좀비 청소 및 라운드로빈 로그 감시 | 장기 고착 비정상 런을 자동 정리(단, `targetPendingRuns > 0` 또는 장기 주기 정책 시 최소 360분 보호)하고, 러닝 워커 로그에서 진행률(`%`, `Epoch`, `Step`, `Loss`, `ETA`) 추출 및 에러/완료 키워드 감지를 수행해야 한다. | 높음(P1) |
 | **FR-13** | 폴백/스케일 | Spot↔On-Demand 하이브리드 폴백 및 시간대 스케일링 | Spot 반복 실패 시 대체 GPU 코어/표준 모드로 폴백하고, 주간·야간·주말 시간대별 목표 워커 수를 자동 조정하는 옵션을 제공해야 한다. | 보통(P2) |
-| **FR-14** | 배포편의 | `/group-volume` 웹 스크립트 에디터 & 롤링 배포 | 대시보드 내에서 `/group-volume/run.sh` 등 실행 스크립트를 직접 편집·저장하고 컨테이너 시작 시 Base64 동기화 주입 및 무중단 배치 롤링 재시작을 지원해야 한다. | 보통(P2) |
+| **FR-14** | 배포편의 | `/group-volume` · `/user-volume` 웹 스크립트 에디터 & 롤링 배포 | 대시보드 내에서 `/group-volume` 및 `/user-volume` 경로 실행 스크립트를 원본 경로 훼손 없이 편집·저장하고 컨테이너 시작 시 복수 스크립트 Base64 동기화 주입 및 무중단 배치 롤링 재시작을 지원해야 한다. | 보통(P2) |
 | **FR-15** | 운영리포트 | 실험 프리셋 북마크 및 사이트별 GPU-Hours 리포트 | 자주 쓰는 규칙 구성을 프리셋으로 원클릭 전환하고, 사이트별로 독립 적산된 `GPU-Hours` 시계열 차트 및 `CSV`/`JSON` 내보내기를 제공해야 한다. | 보통(P2) |
+| **FR-16** | 먹통감지 | 조용한 먹통(`Silent Hang`) 워커 감지 및 선택적 자동 교체 | `Running` 상태이나 데드락·네트워크 행으로 지정 시간(`기본 45분`) 이상 로그 출력 변화가 없는 워커를 감지해 배지/알림을 표시하고, 옵션 활성화 시 안전 상한(틱당 최대 2개) 내에서 자동 교체해야 한다. | 높음(P1) |
+| **FR-17** | 세대교체 | 무중단 드레이닝(`Graceful Drain`) 및 예약 실험 큐 | 선행 규칙(`v8`)의 `Running` 워커를 강제 종료하지 않고 자연 종료되는 슬롯마다 후속 예약 규칙(`v9`)에 총 GPU 한도 내에서 순차 인계하거나 전원 종료 시 자동 정지해야 한다. | 높음(P1) |
+| **FR-18** | 토큰편의 | 1-Click 브라우저 북마클릿(`Bookmarklet`) 토큰 전송 | 서명된 `BOOKMARKLET_SYNC_KEY`와 팝업 해시(`#tokenSync=`) 전달 방식을 통해 HTTPS SPACE 콘솔에서 HTTP 내부망 대시보드로 Mixed Content 차단 없이 원클릭 토큰 갱신을 수행해야 한다. | 높음(P1) |
+| **FR-19** | 로그검색 | 전체 가동 워커 실시간 로그 통합 검색 (`Multi-Run Log Grep`) | 가동 중인 전체 내 `Running` 워커의 최근 표준 출력 로그를 동시성 제한(`6개 병렬`)으로 고속 스캔하여 키워드·정규식 매칭 라인을 한눈에 집계·탐색해야 한다. | 보통(P2) |
+| **FR-20** | 노드분석 | 느린 노드(`Straggler`) 감지, 합산 처리량 및 문제 노드 이력 | 워커별 진행 속도(`it/s`, `tok/s`, `s/it` 역산 포함) 중앙값 대비 `0.55x` 미만 저속 슬롯을 표시하고, 호스트/노드 식별자를 추출해 반복 장애 노드를 집계해야 한다. | 보통(P2) |
+| **FR-21** | 회수/요약 | Spot 회수(`Preemption`) 추이 추적 및 다채널 요약 리포트 | 수동 종료를 제외한 실제 클러스터 Spot 회수 건수(금일/24h/10m 급증)를 기록하고, Slack·Discord·Telegram 포맷 자동 판별 웹훅으로 일일/즉시 운영 요약 리포트를 발송해야 한다. | 보통(P2) |
 
 ---
 
@@ -591,7 +597,11 @@ erDiagram
 | **프리셋/리포트** | `POST` | `/api/presets/apply` | `{ presetId, jobId, createAsNew, triggerImmediately }` | 선택한 프리셋을 현재 규칙에 덮어쓰거나 새 규칙으로 추가 후 선택적 즉시 실행 |
 | **프리셋/리포트** | `DELETE` | `/api/presets/:id` | - | 실험 프리셋 삭제 |
 | **프리셋/리포트** | `GET` | `/api/telemetry/export` | `?format=csv\|json&siteId=n9&pw=...` | 지정 사이트(`siteId`)의 누적 GPU-Hours 및 시계열 리포트 파일 다운로드 |
-| **알림** | `POST` | `/api/notifications/test` | `{ webhookUrl }` | 브라우저 알림 및 외부 Webhook 연동 테스트 메시지 발송 |
+| **알림** | `POST` | `/api/notifications/test` | `{ webhookUrl }` | 브라우저 알림 및 외부 Webhook(Slack/Discord/Telegram) 연동 테스트 메시지 발송 |
+| **알림** | `POST` | `/api/notifications/digest` | `{ webhookUrl }` | 현재 가동 현황, 누적/금일 GPU-h, Spot 회수 횟수, 토큰 상태를 요약 리포트로 즉시 발송 |
+| **인증/북마클릿** | `POST` | `/api/tokens/bookmarklet-sync` | `{ syncKey, accessToken, refreshToken, groupId, originUrl }` | 서명 키(`BOOKMARKLET_SYNC_KEY`) 검증 후 대상 사이트(N9/N6)를 자동 판별하여 토큰 원클릭 반영 |
+| **런/로그검색** | `POST` | `/api/space/runs/log-grep` | `{ query, isRegex, caseSensitive, tailLines, jobId }` | 내 계정 가동(`Running`) 워커 전체의 최근 로그를 병렬 스캔하여 키워드·정규식 매칭 결과 반환 |
+| **규칙/드레이닝** | `POST` | `/api/jobs/drain` | `{ action, jobId, nextJobId, cancelPending }` | 기존 `Running` 워커를 유지한 채 자연 종료 후 정지 또는 후속 규칙(`nextJobId`)으로 무중단 슬롯 인계 시작/해제 |
 
 ---
 
@@ -629,11 +639,11 @@ erDiagram
 # 1. 정적 구문 무결성 검사
 npm run check
 
-# 2. 비파괴 자동화 검증 테스트 실행 (23개 테스트 케이스)
+# 2. 비파괴 자동화 검증 테스트 실행 (52개 테스트 케이스)
 npm test
 
 # 3. 서버 기동
 PORT=4300 ADMIN_PASSWORD=cycy npm start
 ```
 
-> 🔗 **관련 문서**: 테스트 아키텍처, 자동화 검증 스위트 구성 및 40시간+ 실전 클러스터 검증 결과는 **[테스트 구성 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./TESTING_STRATEGY_AND_REPORT.md)** 를 참조하세요.
+> 🔗 **관련 문서**: 테스트 아키텍처, 자동화 검증 스위트 구성(`TC-01`~`TC-52`) 및 장기 실전 클러스터(`33,966+ GPU-Hours`) 검증 결과는 **[테스트 구성 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./TESTING_STRATEGY_AND_REPORT.md)** 를 참조하세요.

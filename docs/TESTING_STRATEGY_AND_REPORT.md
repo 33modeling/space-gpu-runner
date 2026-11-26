@@ -1,10 +1,10 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.3.0`
-- **최종 검증일**: `2026-11-17`
-- **검증 대상**: `server.mjs`, `public/index.html`, `public/app.js`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test`)
+- **문서 버전**: `v2.6.0`
+- **최종 검증일**: `2026-11-26`
+- **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, 라이브 데몬(`0.0.0.0:4300`)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **52개** 케이스)
 
 ---
 
@@ -88,7 +88,7 @@ flowchart TB
 # 1. 빠른 정적 구문 검사 (server.mjs + public/app.js)
 npm run check
 
-# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 35개 케이스)
+# 2. 전체 자동화 테스트 스위트 실행 (Suite 1 ~ Suite 6, 총 52개 케이스)
 npm test
 
 # (선택) 커스텀 포트 또는 비밀번호 사용 환경에서 실행 시
@@ -102,7 +102,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 
 ## 4. 자동화 테스트 스위트(`tests/run-tests.mjs`) 상세 구성 명세
 
-총 **6개 스위트, 35개 자동화 테스트 케이스(`TC-01` ~ `TC-35`)** 로 구성되어 있습니다.
+총 **6개 스위트, 52개 자동화 테스트 케이스(`TC-01` ~ `TC-52`)** 로 구성되어 있습니다.
 
 | 테스트 ID | 소속 스위트 | 검증 대상 함수 / 엔드포인트 | 테스트 조건 및 검증 내용 (Assertions) | 결과 |
 | :---: | :--- | :--- | :--- | :---: |
@@ -141,6 +141,23 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-33** | Suite 6 (무한틱방지/타임아웃) | `setInterval` & `refreshAccessToken` | `targetPendingRuns > 0`에서 총 목표(`minConcurrentRuns`) 도달 시 `deficit=0`으로 무한 1초 폴링 폭주가 차단되고 토큰 갱신에 타임아웃이 적용됨을 검증 | ✅ PASS |
 | **TC-34** | Suite 6 (프론트런타임무결성) | `public/app.js` 심볼/슬롯 | `loadSpaceRuns()`를 실패시키던 미정의 `renderSiteSelectorBar` 제거 및 언매칭 타유저 슬롯 `🔒보호` 배지 적용 검증 | ✅ PASS |
 | **TC-35** | Suite 6 (라이브라우트방어) | `DELETE /api/presets/%E0%A4%A` | 라이브 API 라우트에 깨진 URI 인코딩 및 잘못된 JSON 전송 시 `500` 스택트레이스 대신 `400`으로 안전 응답 검증 | ✅ PASS |
+| **TC-36** | Suite 6 (볼륨경로보존) | `resolveSfmFilePaths` & `buildRunPayload` | `/user-volume/...` 스크립트 경로가 `/group-volume/user-volume/...`으로 훼손되지 않고 복수 스크립트 자동 동기화가 적용되는지 검증 | ✅ PASS |
+| **TC-37** | Suite 6 (불량노드가드정밀화) | `isGenuineBadNodeFailureRun` | 수동 정지·취소·Spot 회수(`PREEMPTED`)는 배제하고 실제 런타임 조기 실패(`FAILED`, `ERROR`, `OOMKilled`)만 감지하는지 검증 | ✅ PASS |
+| **TC-38** | Suite 6 (사이트프로필보존) | `mergeSiteProfileUpdate` | 멀티 사이트 프로필 수정 시 기존 `schedulerEnabled`, `autoApprovalScope` 및 토큰 설정이 유실되지 않는지 검증 | ✅ PASS |
+| **TC-39** | Suite 6 (UI동기화/범위보호) | `public/app.js` 핸들러 | 슬롯 툴바 `stop_pending`/`stop_all`의 규칙 `jobId` 제한 및 `-1` 슬롯 삭제 시 목표 총 GPU 입력칸 동기화 검증 | ✅ PASS |
+| **TC-40** | Suite 6 (라이브정적에셋) | `/`, `/style.css?v=7`, `/app.js?v=25` | 라이브 웹서버의 최신 CSS/JS 에셋 및 `/api/state` 응답 무결성 검증 | ✅ PASS |
+| **TC-41** | Suite 6 (FIFO큐순번보호) | `shouldWatchdogTerminateNonRunningRun` | 정상 클러스터 대기열(`Pending`/`Queued`/`Approved`)은 장시간 대기 시에도 순번을 보존하고 `Creating` 먹통만 종료하는지 검증 | ✅ PASS |
+| **TC-42** | Suite 6 (토큰알림/백오프) | `shouldAlertAccessTokenExpiring` | Refresh Token 정상 시 15분 주기 만료 경고 스팸을 차단하고 5xx 게이트웨이 장애 시 토큰 갱신 지수 백오프가 동작하는지 검증 | ✅ PASS |
+| **TC-43** | Suite 6 (승인경계/상태보호) | `shouldAutoApproveItem` | 공유 그룹 내 유사 접두사(`v80-...`) 및 타유저 런 오승인 차단과 `processPendingApprovals`의 `job.lastStatus` 덮어쓰기 방지 검증 | ✅ PASS |
+| **TC-44** | Suite 6 (파이프라인/사이트UI) | `_stage2Transitioned` & `selectSpaceSite` | 실행 명령어 변경 시 Stage 2 플래그 초기화 및 클러스터 전환 시 빠른 로그 뷰어 초기화 검증 | ✅ PASS |
+| **TC-45** | Suite 6 (먹통워커감지) | `evaluateSilentHangState` | 로그 지문 미변화 지속 시 조용한 먹통(`isSilentHang`) 감지 및 새 로그 출력 시 즉시 해제 검증 | ✅ PASS |
+| **TC-46** | Suite 6 (무중단드레이닝) | `computeEffectiveJobBudget` | 선행 규칙(`v8`) 자연 종료 슬롯 수만큼 후속 예약 규칙(`v9`)으로 총 GPU 한도 내에서 무중단 인계되는지 검증 | ✅ PASS |
+| **TC-47** | Suite 6 (원클릭북마클릿) | `POST /api/tokens/bookmarklet-sync` | 서명 키(`bookmarkletSyncKey`) 검증, 잘못된 키 `401` 차단 및 해시 동기화 핸들러 존재 검증 | ✅ PASS |
+| **TC-48** | Suite 6 (통합로그검색) | `searchWorkerLogLines` & `/log-grep` | 키워드·정규식 매칭 정확성 및 잘못된 정규식 입력 시 라이브 API `400` 안전 방어 검증 | ✅ PASS |
+| **TC-49** | Suite 6 (저속노드/처리량) | `detectStragglerWorkers` | 중앙값 대비 `0.55x` 미만 저속 워커(`isStraggler`) 판별, 합산 처리량·평균 Loss 산출 및 노드명 추출 검증 | ✅ PASS |
+| **TC-50** | Suite 6 (스팟회수/다채널웹훅) | `isSpotPreemptedRun` & `formatWebhookPayload` | 수동 종료를 제외한 실제 Spot 회수 판별 및 Slack·Discord·Telegram 메시지 포맷 자동 변환 검증 | ✅ PASS |
+| **TC-51** | Suite 6 (회수중복집계방지) | `isEligibleNewPreemptionEvent` | 2시간 경과 이력 및 워터마크 이하 구형 Run ID 재집계 차단 검증 | ✅ PASS |
+| **TC-52** | Suite 6 (폴백5xx오발동방지) | `shouldTriggerHybridPoolFallback` | 게이트웨이 `502/503` 및 타임아웃 발생 시 Spot 규칙이 Standard로 잘못 폴백되지 않음을 검증 | ✅ PASS |
 
 ---
 
@@ -149,7 +166,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 테스트 및 검증은 **① 전수 정적 코드 감사 ➔ ② 자동화 단위·보안 테스트 구축 및 결함 교정 ➔ ③ 시나리오 기반 통합 검증 ➔ ④ 라이브 데몬 계약 검증 ➔ ⑤ 40시간+ 실전 운영 Soak 로그 대조**의 5단계 절차로 진행했습니다.
 
 ### 5.1 자동화 테스트 스위트 실행 결과
-라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 35개 테스트 전 항목 통과(`35 pass, 0 fail`, 소요 시간 `604.5ms`)** 를 확인했습니다.
+라이브 데몬(`Port 4300`)이 가동 중인 상태에서 `npm test`를 실행하여 **전체 6개 스위트, 52개 테스트 전 항목 통과(`52 pass, 0 fail`, 소요 시간 약 `600ms`)** 를 확인했습니다.
 
 ```text
 ▶ Suite 1: 정적 구문 및 코드베이스 무결성 검증 (Static & Structural Verification)
@@ -168,10 +185,10 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 ▶ Suite 5: 프론트엔드 인라인 핸들러 보안 이스케이프 및 URL 파서 검증
   ✔ TC-16 ~ TC-18, TC-27 전 항목 통과
 
-▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약, 원자적 복구 및 스캐너 생존성 검증
-  ✔ TC-19 ~ TC-23, TC-26, TC-28 ~ TC-35 전 항목 통과
+▶ Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약, 심화 운영 기능 및 생존성 검증
+  ✔ TC-19 ~ TC-23, TC-26, TC-28 ~ TC-52 전 항목 통과
 
-ℹ tests 35 | suites 6 | pass 35 | fail 0 | duration_ms 604.5ms
+ℹ tests 52 | suites 6 | pass 52 | fail 0
 ```
 
 ---
@@ -221,10 +238,10 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 실제 **SPACE N9 (H100 클러스터, `SR-Coredata` 그룹)** 상에서 약 40시간 이상 연속 가동하며 수집한 운영 텔레메트리 및 전수 코드 감사를 통해 확인된 지표와 해결된 결함 요약입니다.
 
 #### 실전 운영 검증 지표 (Production Soak Metrics)
-- **연속 무중단 가동**: 40시간 이상 크래시 `0회`, 런타임 `[ERROR]` 로그 `0건`
-- **실시간 플릿 유지 성능**: `v8` 규칙 기준 **20 Running (80 H100 GPUs) + 6 Pending (`targetPendingRuns: 6`) = 총 26개 내 워커** 정확히 상시 유지
-- **멀티테넌트 그룹 분리 실측**: 그룹 전체 활성 런 `29개` 중 내 규칙 워커 `26개`와 동료 연구자 런 `3개`를 오차 없이 분리 집계 (`sites.n9.activeWorkers === 26`, 타유저 간섭 `0건`)
-- **누적 연산량 적산**: **8,144.38 GPU-Hours** 무손실 누적 기록 및 영속 복원 확인
+- **연속 무중단 가동**: 수일간 연속 무중단 운영 중 프로세스 크래시 `0회`
+- **실시간 멀티 규칙 플릿 유지 성능**: `v8`(`30 목표 · Pending 6`) 및 `v9`(`80 목표 · Pending 6`) 규칙 동시 가동 환경에서 목표 `Pending` 대기열 상시 유지 및 `Pending ➔ Running` 승격 시 1~2초 내 무클릭 자동 보충·승인 완결 확인
+- **멀티테넌트 그룹 분리 실측**: `SR-Coredata` 공유 그룹 내 동료 연구자 워크로드 간섭 `0건`
+- **누적 연산량 적산**: **33,966.37+ H100 GPU-Hours** 무손실 누적 기록 및 영속 복원 확인
 
 #### 전수 감사 및 테스트로 발굴·해결 완료된 14건 결함 요약
 | 구분 | 결함 요약 | 조치 결과 |

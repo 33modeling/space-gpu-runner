@@ -8,9 +8,9 @@
 
 | 문서 | 설명 |
 | :--- | :--- |
-| 📘 **[소프트웨어 구성 및 상세 설계 명세서 (`docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md`)](./docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md)** | 시스템 기능/비기능 요구사항(SRS), 8대 핵심 설계 지침, 시스템/런타임/상태머신/ERD 아키텍처(Mermaid 다이어그램), 백엔드·프론트엔드 서브시스템 상세 설계 및 31개 전수 REST API 명세 |
-| 🧪 **[테스트 구성 전략 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./docs/TESTING_STRATEGY_AND_REPORT.md)** | 5계층 비파괴 검증 아키텍처, `node:vm` 기반 프로덕션 함수 직접 추출 자동화 테스트(`TC-01`~`TC-23`), 시나리오 통합 검증 및 40시간+ 실전 클러스터(80 H100 GPU) Soak Test & 버그 감사 리포트 |
-| ⚙️ **[자동화 검증 테스트 스위트 (`tests/run-tests.mjs`)](./tests/run-tests.mjs)** | 외부 패키지 없이 `npm test`로 즉시 실행 가능한 6개 스위트·23개 자동 검증 스크립트 |
+| 📘 **[소프트웨어 구성 및 상세 설계 명세서 (`docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md`)](./docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md)** | 시스템 기능/비기능 요구사항(SRS), 핵심 설계 지침, 4페이지 역할 분리 대시보드 아키텍처, 무중단 드레이닝·먹통 감지·로그 통합 검색·북마클릿 설계 및 전체 REST API 명세 |
+| 🧪 **[테스트 구성 전략 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./docs/TESTING_STRATEGY_AND_REPORT.md)** | 5계층 비파괴 검증 아키텍처, `node:vm` 기반 프로덕션 함수 직접 추출 자동화 테스트(`TC-01`~`TC-52`), 시나리오 통합 검증 및 장기 실전 클러스터(`33,966+ H100 GPU-Hours`) Soak Test & 버그 감사 리포트 |
+| ⚙️ **[자동화 검증 테스트 스위트 (`tests/run-tests.mjs`)](./tests/run-tests.mjs)** | 외부 패키지 없이 `npm test`로 즉시 실행 가능한 6개 스위트 · **52개** 자동 검증 스크립트 |
 
 ---
 
@@ -27,9 +27,9 @@
 4. **🛑 개별·범위 슬롯 즉시 Kill 및 영구 삭제(`🗑️ -1`) + 공유 그룹 타유저 3중 보호**
    - 슬롯 카드 원클릭, 체크박스 다중 선택, 슬롯 번호/범위 입력(`예: 1, 5, 58-62, #360146`)으로 즉시 강제 종료(`🛑 Kill`)하거나 목표 수량까지 함께 차감하는 영구 삭제(`🗑️ 삭제 -1`)를 지원합니다.
    - 공유 그룹(`SR-Coredata`) 내 동료 연구자의 워크로드는 UI(`🔒 타유저 보호`), 종료 API(`403 Forbidden`), 자동화 루프(`doesRunMatchSiteJobs`)의 3중 안전 장치로 완벽히 보호됩니다.
-5. **🖥️ 화면 깜빡임 없는(Flicker-Free) 실시간 모니터링 & 클러스터 보호 가드**
-   - 시그니처 비교(`data-render-sig`), 슬롯 카드 단위 증분 패치(`data-slot-key`), 마우스 호버 시 자동 갱신 일시정지(Hover-Freeze)로 5초 주기 새로고침 시에도 깜빡임 없이 조작할 수 있습니다.
-   - **Smart Load Guard**(API 지연 자동 백오프), **Bad-Node Guard**(180초 내 조기 실패 노드 회피), **Watchdog & 라운드로빈 로그 파서**(진행률 `%`/`Epoch`/`Loss`/`ETA` 실시간 추출), **`/group-volume` 웹 스크립트 에디터 & 무중단 롤링 배포**, **사이트별 GPU-Hours 차트 및 CSV/JSON 내보내기**를 내장하고 있습니다.
+5. **🖥️ 4페이지 역할 분리형 저채도 UI & 심화 운영 자동화**
+   - **역할 분리형 4탭 UI**: `모니터링`(실시간 슬롯 현황 및 목표 워커·총 GPU·주기·Pending 즉시 반영) · `워크로드 · 로그`(컨테이너 목록, 전체 워커 로그 통합 검색, 승인 내역) · `실행 규칙`(규칙 CRUD, 프리셋, `/group-volume` 및 `/user-volume` 스크립트 에디터) · `시스템 설정`(클러스터 토큰, 부하/장애 정책, 다크·라이트 테마)으로 분리하여 화면 피로도를 줄였습니다.
+   - **심화 무인 운영 기능**: **조용한 먹통(Silent Hang) 감지**, **무중단 세대교체(Graceful Drain) 및 후속 실험 큐(`v8 ➔ v9` 슬롯 순차 인계)**, **1-Click 브라우저 북마클릿 토큰 전송**, **전체 가동 워커 실시간 로그 통합 검색(Log Grep)**, **느린 노드(Straggler) 및 문제 노드 추적**, **Spot 회수(Preemption) 추이 집계 및 Slack/Discord/Telegram 요약 리포트**를 지원합니다.
 
 ---
 
@@ -50,7 +50,7 @@ PORT=4300 ADMIN_PASSWORD=cycy node server.mjs
 # 백엔드 + 프론트엔드 구문 무결성 검사
 npm run check
 
-# 전체 자동화 검증 테스트 스위트 실행 (6개 스위트 · 23개 케이스)
+# 전체 자동화 검증 테스트 스위트 실행 (6개 스위트 · 52개 케이스)
 npm test
 ```
 
