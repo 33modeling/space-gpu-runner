@@ -1,10 +1,10 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.9.0`
+- **문서 버전**: `v3.0.0`
 - **최종 검증일**: `2026-11-27`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **66개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **72개** 케이스)
 
 ---
 
@@ -172,6 +172,12 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-64** | Suite 6 (터미널CLI제어기) | `bin/gpu-ctl.mjs` | 구문 검사, `help` 출력 및 라이브 `:4300` `status` 연동 검증 | ✅ PASS |
 | **TC-65** | Suite 6 (가동시간/콘솔링크) | `computeWorkerUptimeSec` & `buildRunConsoleLinks` | 슬롯 가동 시간·큐 대기시간 분리 산출 및 SPACE 웹 콘솔 URL 생성 검증 | ✅ PASS |
 | **TC-66** | Suite 6 (24h클러스터날씨) | `computeHourlyClusterWeather` | KST 0~23시 시간대별 배정·대기·회수 히트맵 및 추천/혼잡 시간대 도출 검증 | ✅ PASS |
+| **TC-67** | Suite 6 (수명만료선제예열) | `computeTtlPreWarmAllowance` | `expectedRunTime`(`8h`) 만료 15분 전 감지 및 교체 대기열 예열 산출 검증 | ✅ PASS |
+| **TC-68** | Suite 6 (GPU예산상한제) | `evaluateJobBudgetCap` | 규칙별 `maxGpuHours` 80% 경보 및 100% 도달 시 드레이닝/정지 판정 검증 | ✅ PASS |
+| **TC-69** | Suite 6 (수렴스파크라인) | `appendMetricSeriesSample` & `renderSvgPolyline` | 실시간 평균 Loss · 처리량 시계열 적재 및 SVG 폴리라인 생성 검증 | ✅ PASS |
+| **TC-70** | Suite 6 (반복불량노드격리) | `evaluateProblemNodeQuarantine` | 동일 노드 반복 크래시 격리 판별 및 적응형 우회 쿨다운 확대 검증 | ✅ PASS |
+| **TC-71** | Suite 6 (볼륨결과미리보기) | `slicePreviewContent` | `.jsonl` 등 대용량 결과 텍스트 앞/뒤 줄 슬라이싱 및 바이트 절삭 검증 | ✅ PASS |
+| **TC-72** | Suite 6 (명령팔레트파서) | `parseQuickPaletteCommand` | `Ctrl+K` 명령창 단축 구문(`v9 30`, `v9 120g`, `log 5`, `grep`) 파싱 검증 | ✅ PASS |
 
 ---
 

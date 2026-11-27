@@ -102,6 +102,13 @@ function createServerLogicSandbox() {
     "computeWorkerUptimeSec",
     "buildRunConsoleLinks",
     "computeHourlyClusterWeather",
+    "parseExpectedRunTimeSec",
+    "computeWorkerRemainingTtlSec",
+    "computeTtlPreWarmAllowance",
+    "evaluateJobBudgetCap",
+    "appendMetricSeriesSample",
+    "evaluateProblemNodeQuarantine",
+    "slicePreviewContent",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -158,7 +165,14 @@ function createServerLogicSandbox() {
  * Build isolated VM sandbox with actual functions extracted from `public/app.js`.
  */
 function createFrontendLogicSandbox() {
-  const fnNames = ["escapeHtml", "escapeJsStr", "parseSlotSpecToRunIds", "classifyUiRunStatus"];
+  const fnNames = [
+    "escapeHtml",
+    "escapeJsStr",
+    "parseSlotSpecToRunIds",
+    "classifyUiRunStatus",
+    "parseQuickPaletteCommand",
+    "renderSvgPolyline",
+  ];
   const context = vm.createContext({
     Number,
     String,
@@ -1086,12 +1100,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=28`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=29`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=7`),
-      fetch(`${BASE_URL}/app.js?v=28`),
+      fetch(`${BASE_URL}/app.js?v=29`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1099,7 +1113,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=28"), true, "라이브 index.html이 최신 캐시버전 app.js?v=28을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=29"), true, "라이브 index.html이 최신 캐시버전 app.js?v=29를 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -1777,5 +1791,104 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(weather.hours[14].preemptions, 2, "KST 14시에 Spot 회수 2건이 집계되어야 함");
     assert.equal([...weather.bestHours].includes(3), true);
     assert.equal([...weather.busyHours].includes(14), true);
+  });
+
+  test("TC-67: [Batch 6 - Feature 1] `parseExpectedRunTimeSec` & `computeTtlPreWarmAllowance` 수명 만료(8h) 임박 감지 및 선제 예열 산출 검증", () => {
+    assert.equal(srv.parseExpectedRunTimeSec("8h"), 28800);
+    assert.equal(srv.parseExpectedRunTimeSec("168h"), 604800);
+    assert.equal(srv.parseExpectedRunTimeSec("1h30m"), 5400);
+
+    const nowMs = Date.parse("2026-11-27T08:00:00.000Z");
+    const runningRuns = [
+      // 7h 50m elapsed -> 10m left (< 15m lead) -> expiring soon!
+      { id: "1", status: "RUNNING", startTime: "2026-11-27T00:10:00.000Z" },
+      // 7h 52m elapsed -> 8m left (< 15m lead) -> expiring soon!
+      { id: "2", status: "RUNNING", startTime: "2026-11-27T00:08:00.000Z" },
+      // 2h elapsed -> 6h left -> healthy!
+      { id: "3", status: "RUNNING", startTime: "2026-11-27T06:00:00.000Z" },
+    ];
+    const ttl = srv.computeTtlPreWarmAllowance(runningRuns, "8h", 15, 4, nowMs);
+    assert.equal(ttl.expiringSoonCount, 2);
+    assert.equal(ttl.preWarmAllowance, 2);
+    assert.equal(ttl.minRemainingSec, 480);
+  });
+
+  test("TC-68: [Batch 6 - Feature 2] `evaluateJobBudgetCap` 규칙별 GPU-Hours 예산 80% 경보 및 100% 한도 도달 판정 검증", () => {
+    const unlimited = srv.evaluateJobBudgetCap({ maxGpuHours: 0 }, 9999);
+    assert.equal(unlimited.enabled, false);
+    assert.equal(unlimited.isExceeded, false);
+
+    const warn85 = srv.evaluateJobBudgetCap({ maxGpuHours: 1000, budgetCapAction: "drain" }, 850);
+    assert.equal(warn85.enabled, true);
+    assert.equal(warn85.usagePct, 85);
+    assert.equal(warn85.isWarn80, true);
+    assert.equal(warn85.isExceeded, false);
+    assert.equal(warn85.remainingGpuHours, 150);
+
+    const exceeded = srv.evaluateJobBudgetCap({ maxGpuHours: 1000, budgetCapAction: "stop" }, 1012.5);
+    assert.equal(exceeded.isExceeded, true);
+    assert.equal(exceeded.isWarn80, false);
+    assert.equal(exceeded.action, "stop");
+  });
+
+  test("TC-69: [Batch 6 - Feature 3] `appendMetricSeriesSample` & `renderSvgPolyline` 실시간 Loss · 처리량 스파크라인 시계열 검증", () => {
+    let series = [];
+    series = srv.appendMetricSeriesSample(series, { time: "15:00", avgLoss: 1.24, totalThroughput: 82.4, speedUnit: "step/s" }, 3);
+    series = srv.appendMetricSeriesSample(series, { time: "15:01", avgLoss: 0.98, totalThroughput: 85.1, speedUnit: "step/s" }, 3);
+    series = srv.appendMetricSeriesSample(series, { time: "15:02", avgLoss: 0.76, totalThroughput: 86.0, speedUnit: "step/s" }, 3);
+    series = srv.appendMetricSeriesSample(series, { time: "15:03", avgLoss: 0.65, totalThroughput: 87.2, speedUnit: "step/s" }, 3);
+    assert.equal(series.length, 3, "최대 보관 개수(maxPoints)로 자동 슬라이싱되어야 함");
+    assert.equal(series[2].avgLoss, 0.65);
+
+    const svg = ui.renderSvgPolyline([1.24, 0.98, 0.76, 0.65], 170, 36);
+    assert.equal(svg.includes("<svg") && svg.includes("<polyline"), true);
+  });
+
+  test("TC-70: [Batch 6 - Feature 4] `evaluateProblemNodeQuarantine` 반복 불량 노드 자동 격리 및 적응형 우회 쿨다운 확대 검증", () => {
+    const nowMs = Date.parse("2026-11-27T07:00:00.000Z");
+    const problemNodes = {
+      "dgx-h100-bad07": { count: 3, lastError: "Xid 79", lastSeenAt: "2026-11-27T06:55:00.000Z" },
+      "dgx-h100-old01": { count: 4, lastError: "ECC", lastSeenAt: "2026-11-26T00:00:00.000Z" }, // stale (>30m)
+    };
+    const q = srv.evaluateProblemNodeQuarantine(problemNodes, 1, nowMs, 25);
+    assert.equal(q.isQuarantineActive, true);
+    assert.equal(q.quarantinedNodes.length, 1);
+    assert.equal(q.highestRepeatNode, "dgx-h100-bad07");
+    assert.equal(q.escalatedCooldownSec > 25, true, "반복 장애 노드 감지 시 기본 25초보다 확대된 우회 쿨다운이 적용되어야 함");
+  });
+
+  test("TC-71: [Batch 6 - Feature 5] `slicePreviewContent` 볼륨 결과 파일(`.jsonl` 등) Head/Tail 슬라이싱 및 바이트 제한 검증", () => {
+    const lines = Array.from({ length: 250 }, (_, i) => `{"step": ${i + 1}, "score": 0.91}`).join("\n");
+    const tailRes = srv.slicePreviewContent(lines, { mode: "tail", maxLines: 50 });
+    assert.equal(tailRes.totalLines, 250);
+    assert.equal(tailRes.shownLines, 50);
+    assert.equal(tailRes.startLine, 201);
+    assert.equal(tailRes.truncated, true);
+    assert.equal(tailRes.previewText.includes('"step": 250'), true);
+    assert.equal(tailRes.previewText.includes('"step": 1,'), false);
+
+    const headRes = srv.slicePreviewContent(lines, { mode: "head", maxLines: 20 });
+    assert.equal(headRes.shownLines, 20);
+    assert.equal(headRes.previewText.includes('"step": 1,'), true);
+  });
+
+  test("TC-72: [Batch 6 - Feature 6] `parseQuickPaletteCommand` 빠른 키보드 명령 팔레트(`Ctrl+K`) 자연어 단축 명령 파서 검증", () => {
+    const jobs = [{ id: "job-v9", name: "v9" }, { id: "job-v8", name: "v8" }];
+    const c1 = ui.parseQuickPaletteCommand("v9 30", jobs);
+    assert.equal(c1.type, "set_workers");
+    assert.equal(c1.jobId, "job-v9");
+    assert.equal(c1.workers, 30);
+
+    const c2 = ui.parseQuickPaletteCommand("v9 120g", jobs);
+    assert.equal(c2.type, "set_gpus");
+    assert.equal(c2.gpus, 120);
+
+    const c3 = ui.parseQuickPaletteCommand("log 5", jobs);
+    assert.equal(c3.type, "log");
+    assert.equal(c3.target, "5");
+
+    const c4 = ui.parseQuickPaletteCommand("grep reward=", jobs);
+    assert.equal(c4.type, "grep");
+    assert.equal(c4.query, "reward=");
   });
 });

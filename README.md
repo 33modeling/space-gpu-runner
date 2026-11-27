@@ -9,8 +9,8 @@
 | 문서 | 설명 |
 | :--- | :--- |
 | 📘 **[소프트웨어 구성 및 상세 설계 명세서 (`docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md`)](./docs/SOFTWARE_ARCHITECTURE_AND_DESIGN.md)** | 시스템 기능/비기능 요구사항(SRS), 핵심 설계 지침, 4페이지 역할 분리 대시보드 아키텍처, 무중단 드레이닝·먹통 감지·로그 통합 검색·북마클릿 설계 및 전체 REST API 명세 |
-| 🧪 **[테스트 구성 전략 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./docs/TESTING_STRATEGY_AND_REPORT.md)** | 5계층 비파괴 검증 아키텍처, `node:vm` 기반 프로덕션 함수 직접 추출 자동화 테스트(`TC-01`~`TC-66`), 시나리오 통합 검증 및 장기 실전 클러스터(`35,062+ H100 GPU-Hours`) Soak Test & 버그 감사 리포트 |
-| ⚙️ **[자동화 검증 테스트 스위트 (`tests/run-tests.mjs`)](./tests/run-tests.mjs)** | 외부 패키지 없이 `npm test`로 즉시 실행 가능한 6개 스위트 · **66개** 자동 검증 스크립트 |
+| 🧪 **[테스트 구성 전략 및 수행 결과 보고서 (`docs/TESTING_STRATEGY_AND_REPORT.md`)](./docs/TESTING_STRATEGY_AND_REPORT.md)** | 5계층 비파괴 검증 아키텍처, `node:vm` 기반 프로덕션 함수 직접 추출 자동화 테스트(`TC-01`~`TC-72`), 시나리오 통합 검증 및 장기 실전 클러스터(`35,100+ H100 GPU-Hours`) Soak Test & 버그 감사 리포트 |
+| ⚙️ **[자동화 검증 테스트 스위트 (`tests/run-tests.mjs`)](./tests/run-tests.mjs)** | 외부 패키지 없이 `npm test`로 즉시 실행 가능한 6개 스위트 · **72개** 자동 검증 스크립트 |
 | 🖥️ **[터미널 전용 경량 CLI (`bin/gpu-ctl.mjs`)](./bin/gpu-ctl.mjs)** | 브라우저 없이 SSH 터미널/스크립트에서 상태 조회, 목표 스케일링, 로그 검색, 드레이닝을 즉시 수행하는 CLI |
 
 ---
@@ -51,7 +51,7 @@ npm run service:install
 # 백엔드 + 프론트엔드 구문 무결성 검사
 npm run check
 
-# 전체 자동화 검증 테스트 스위트 실행 (6개 스위트 · 66개 케이스)
+# 전체 자동화 검증 테스트 스위트 실행 (6개 스위트 · 72개 케이스)
 npm test
 
 # 터미널에서 즉시 상태 조회 및 제어 (CLI)

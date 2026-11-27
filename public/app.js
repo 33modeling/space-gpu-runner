@@ -1240,6 +1240,9 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       if (isNanDiv) {
         progParts.push(`💥 NaN 발산(${w.nanMatchedToken || "loss=nan"})`);
       }
+      if (isRun && w.remainingTtlSec !== null && w.remainingTtlSec !== undefined && w.remainingTtlSec <= 1800) {
+        progParts.push(`⏰ 만료 ${Math.max(1, Math.ceil(w.remainingTtlSec / 60))}분 전`);
+      }
       if (isSilentHang) {
         progParts.push(`⏸️ 무응답 ${stalledMin}분`);
       }
@@ -1381,21 +1384,29 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       ? ` · 합산 ${tp.totalThroughput} ${tp.speedUnit} (중앙값 ${tp.medianSpeed}${tp.avgLoss !== null ? ` · 평균 loss ${tp.avgLoss}` : ""})`
       : "";
   const probNodes = Array.isArray(fleet.badNodeGuard?.problemNodes) ? fleet.badNodeGuard.problemNodes : [];
+  const quarantine = fleet.badNodeGuard?.quarantine || null;
   const probNodesNote =
-    probNodes.length > 0
+    quarantine?.quarantinedNodes?.length > 0
+      ? ` · 격리 회피 노드: ${quarantine.quarantinedNodes
+          .slice(0, 2)
+          .map((n) => `${n.node}(${n.count}회→${quarantine.escalatedCooldownSec}s)`)
+          .join(", ")}`
+      : probNodes.length > 0
       ? ` · 주의 노드: ${probNodes
           .slice(0, 3)
           .map((n) => `${n.node}(${n.count})`)
           .join(", ")}`
       : "";
+  const sparklineHtml = buildMetricSparklineHtml(tel.metricSeries || []);
   const liveLogSummaryHtml =
-    workersWithLogs.length > 0
+    workersWithLogs.length > 0 || sparklineHtml
       ? `
       <details class="clean-details" style="margin-top:18px;">
         <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-          <span>가동 워커 진행률 및 최근 로그 요약 (${workersWithLogs.length}/${activeWorkers.length} 스캔${nanDivCnt > 0 ? ` · NaN발산 ${nanDivCnt}개` : ""}${silentHangCnt > 0 ? ` · 무응답 ${silentHangCnt}개` : ""}${stragglerCount > 0 ? ` · 저속 ${stragglerCount}개` : ""}${escapeHtml(tpBadgeText)})</span>
+          <span>가동 워커 진행률 · 수렴 추이 및 최근 로그 요약 (${workersWithLogs.length}/${activeWorkers.length} 스캔${nanDivCnt > 0 ? ` · NaN발산 ${nanDivCnt}개` : ""}${silentHangCnt > 0 ? ` · 무응답 ${silentHangCnt}개` : ""}${stragglerCount > 0 ? ` · 저속 ${stragglerCount}개` : ""}${escapeHtml(tpBadgeText)})</span>
           <span class="mono txt-muted" style="font-size:11.5px; font-weight:400;">Watchdog 교체 ${wd.zombieTerminatedCount || 0}건 · 오류 감지 ${wd.logErrorDetectedCount || 0}건${escapeHtml(probNodesNote)}</span>
         </summary>
+        ${sparklineHtml}
         <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:8px; max-height:150px; overflow-y:auto; margin-top:12px;">
           ${workersWithLogs
             .slice(0, 16)
@@ -1734,7 +1745,19 @@ function renderWorkerFleetBoard(fleet, options = {}) {
 
   const tq = jf.taskQueue || null;
   const ow = jf.outputWatch || null;
+  const bCap = jf.budgetCap || null;
   const extraInsightsParts = [];
+  if (jf.expiringSoonCount > 0) {
+    extraInsightsParts.push(
+      `<span class="badge warn mono">⏰ 수명 만료 임박 ${jf.expiringSoonCount}개 (교체 대기열 선제 예열 중)</span>`
+    );
+  }
+  if (bCap && bCap.enabled) {
+    const bCls = bCap.isExceeded ? "err" : bCap.isWarn80 ? "warn" : "info";
+    extraInsightsParts.push(
+      `<span class="badge ${bCls} mono">GPU 예산: ${bCap.consumedGpuHours} / ${bCap.maxGpuHours} GPU-h (${bCap.usagePct}%)</span>`
+    );
+  }
   if (tq && tq.enabled) {
     extraInsightsParts.push(
       `<span class="badge info mono">태스크 큐: 완료 ${tq.completedCount}/${tq.totalTasks} · 진행 ${tq.activeCount} · 대기 ${tq.remainingCount}</span>`
@@ -2322,6 +2345,11 @@ function renderConfig(cfg, loopStats = null) {
   if (nanGuardEl) nanGuardEl.checked = cfg.nanGuardEnabled !== false;
   const nanRestartEl = document.getElementById("cfgNanAutoRestart");
   if (nanRestartEl) nanRestartEl.checked = Boolean(cfg.nanAutoRestart);
+  const ttlPreEl = document.getElementById("cfgTtlPreWarmEnabled");
+  if (ttlPreEl) ttlPreEl.checked = cfg.ttlPreWarmEnabled !== false;
+  if (activeId !== "cfgTtlPreWarmLeadMin" && document.getElementById("cfgTtlPreWarmLeadMin")) {
+    document.getElementById("cfgTtlPreWarmLeadMin").value = cfg.ttlPreWarmLeadMin ?? 15;
+  }
   const digestEl = document.getElementById("cfgDailyDigestEnabled");
   if (digestEl) digestEl.checked = Boolean(cfg.dailyDigestEnabled);
   if (activeId !== "cfgDailyDigestHourKst" && document.getElementById("cfgDailyDigestHourKst")) {
@@ -2510,6 +2538,10 @@ async function saveConfig(overrideSiteId = "") {
       nanAutoRestart: document.getElementById("cfgNanAutoRestart")
         ? document.getElementById("cfgNanAutoRestart").checked
         : false,
+      ttlPreWarmEnabled: document.getElementById("cfgTtlPreWarmEnabled")
+        ? document.getElementById("cfgTtlPreWarmEnabled").checked
+        : true,
+      ttlPreWarmLeadMin: Number(document.getElementById("cfgTtlPreWarmLeadMin")?.value || 15),
       badNodeGuardEnabled: document.getElementById("cfgBadNodeGuardEnabled")
         ? document.getElementById("cfgBadNodeGuardEnabled").checked
         : true,
@@ -3340,13 +3372,19 @@ async function browseSfmFiles() {
           document.getElementById("sfmBrowsePath").value = containerPath;
           browseSfmFiles();
         } else {
-          const parentDir = containerPath.slice(0, containerPath.lastIndexOf("/")) || "/group-volume";
-          const cmd = name.endsWith(".py")
-            ? `cd ${parentDir} && python3 ${containerPath}`
-            : `cd ${parentDir} && bash ${containerPath}`;
-          document.getElementById("jobExecutionCommand").value = cmd;
-          openSfmScriptEditor(containerPath, { silent: true }).catch(() => {});
-          showToast(`✨ 실행 명령어가 [${cmd}] 로 설정되고 웹 에디터에 로드되었습니다.`);
+          const lowerName = String(name).toLowerCase();
+          const isScriptFile = /\.(sh|bash|zsh|py)$/i.test(lowerName);
+          if (isScriptFile) {
+            const parentDir = containerPath.slice(0, containerPath.lastIndexOf("/")) || "/group-volume";
+            const cmd = lowerName.endsWith(".py")
+              ? `cd ${parentDir} && python3 ${containerPath}`
+              : `cd ${parentDir} && bash ${containerPath}`;
+            document.getElementById("jobExecutionCommand").value = cmd;
+            openSfmScriptEditor(containerPath, { silent: true }).catch(() => {});
+            showToast(`✨ 실행 명령어가 [${cmd}] 로 설정되고 웹 에디터에 로드되었습니다.`);
+          } else {
+            previewSfmDataFile(containerPath, "tail");
+          }
         }
       };
       box.appendChild(pill);
@@ -3665,6 +3703,10 @@ function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   if (prioEl) prioEl.value = Number(j.priority ?? 10);
   const watchDirEl = document.getElementById("jobWatchOutputDir");
   if (watchDirEl) watchDirEl.value = j.watchOutputDir || "";
+  const maxGhEl = document.getElementById("jobMaxGpuHours");
+  if (maxGhEl) maxGhEl.value = Number(j.maxGpuHours || 0);
+  const bActEl = document.getElementById("jobBudgetCapAction");
+  if (bActEl) bActEl.value = j.budgetCapAction === "stop" ? "stop" : "drain";
   const tqTextEl = document.getElementById("jobTaskQueueText");
   if (tqTextEl) {
     tqTextEl.value = Array.isArray(j.taskQueueItems) ? j.taskQueueItems.join("\n") : "";
@@ -3788,6 +3830,8 @@ function collectJobFormPayload() {
     name: (document.getElementById("jobName").value || "group-vol-worker").trim(),
     priority: Math.max(1, Number(document.getElementById("jobPriority")?.value || 10)),
     watchOutputDir: (document.getElementById("jobWatchOutputDir")?.value || "").trim(),
+    maxGpuHours: Math.max(0, Number(document.getElementById("jobMaxGpuHours")?.value || 0)),
+    budgetCapAction: document.getElementById("jobBudgetCapAction")?.value === "stop" ? "stop" : "drain",
     taskQueueItems: document.getElementById("jobTaskQueueText")?.value || "",
     appendTaskArgsToCmd: document.getElementById("jobAppendTaskArgs")
       ? document.getElementById("jobAppendTaskArgs").checked
@@ -5654,6 +5698,352 @@ async function resetJobTaskQueueProgress() {
     alert("태스크 큐 초기화 실패: " + e.message);
   }
 }
+
+// =========================================================================
+// Batch 6 (v3.0): Live Metric SVG Sparkline, SFM Data File Preview/Download & Quick Command Palette (Ctrl+K)
+// =========================================================================
+let currentSfmPreviewPath = "";
+let currentPaletteItems = [];
+let currentPaletteActiveIdx = 0;
+
+function renderSvgPolyline(values = [], width = 220, height = 42, strokeColor = "var(--accent)") {
+  const nums = values.filter((v) => v !== null && v !== undefined && Number.isFinite(Number(v))).map(Number);
+  if (nums.length < 2) return "";
+  const minV = Math.min(...nums);
+  const maxV = Math.max(...nums);
+  const span = maxV - minV || 1;
+  const pts = nums
+    .map((v, idx) => {
+      const x = Math.round((idx / (nums.length - 1)) * (width - 8) + 4);
+      const y = Math.round(height - 5 - ((v - minV) / span) * (height - 10));
+      return `${x},${y}`;
+    })
+    .join(" ");
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="display:block; overflow:visible;">
+    <polyline fill="none" stroke="${strokeColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${pts}" />
+  </svg>`;
+}
+
+function buildMetricSparklineHtml(metricSeries = []) {
+  const list = Array.isArray(metricSeries) ? metricSeries : [];
+  if (list.length < 2) return "";
+  const lossVals = list.map((x) => x.avgLoss).filter((v) => v !== null && v !== undefined);
+  const tpVals = list.map((x) => x.totalThroughput).filter((v) => Number(v) > 0);
+  if (lossVals.length < 2 && tpVals.length < 2) return "";
+
+  const unit = list[list.length - 1]?.speedUnit || "";
+  const cards = [];
+  if (lossVals.length >= 2) {
+    const firstL = lossVals[0];
+    const lastL = lossVals[lossVals.length - 1];
+    const delta = Math.round((lastL - firstL) * 10000) / 10000;
+    const trendTxt = delta < 0 ? `▼ ${Math.abs(delta)} 수렴` : delta > 0 ? `▲ +${delta}` : "유지";
+    cards.push(`
+      <div class="card-subtle" style="padding:8px 12px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
+        <div>
+          <div style="font-size:11px; color:var(--muted);">평균 Loss 추이 (${lossVals.length}샘플)</div>
+          <div class="mono" style="font-size:13px; font-weight:600; color:var(--text);">${lastL} <span style="font-size:11px; color:${delta <= 0 ? "var(--success-text)" : "var(--warn-text)"};">(${trendTxt})</span></div>
+        </div>
+        ${renderSvgPolyline(lossVals, 170, 36, "var(--accent)")}
+      </div>
+    `);
+  }
+  if (tpVals.length >= 2) {
+    const lastTp = tpVals[tpVals.length - 1];
+    cards.push(`
+      <div class="card-subtle" style="padding:8px 12px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
+        <div>
+          <div style="font-size:11px; color:var(--muted);">합산 처리량 추이</div>
+          <div class="mono" style="font-size:13px; font-weight:600; color:var(--text);">${lastTp} ${escapeHtml(unit)}</div>
+        </div>
+        ${renderSvgPolyline(tpVals, 170, 36, "var(--success)")}
+      </div>
+    `);
+  }
+  return `<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:10px; margin-top:12px;">${cards.join("")}</div>`;
+}
+
+async function previewSfmDataFile(filePath, mode = "tail") {
+  const target = String(filePath || currentSfmPreviewPath || "").trim();
+  if (!target) return;
+  currentSfmPreviewPath = target;
+  const panel = document.getElementById("sfmQuickPreviewPanel");
+  const titleEl = document.getElementById("sfmPreviewTitle");
+  const metaEl = document.getElementById("sfmPreviewMeta");
+  const boxEl = document.getElementById("sfmPreviewContentBox");
+  if (!panel || !boxEl) return;
+  panel.style.display = "block";
+  if (titleEl) titleEl.textContent = target;
+  if (metaEl) metaEl.textContent = "불러오는 중...";
+  boxEl.textContent = "볼륨 파일을 읽는 중입니다...";
+  try {
+    const res = await api(
+      `/api/space/sfm-preview?path=${encodeURIComponent(target)}&mode=${encodeURIComponent(mode)}&lines=100`
+    );
+    if (metaEl) {
+      const kb = Math.round((Number(res.totalBytes || 0) / 1024) * 10) / 10;
+      metaEl.textContent = `${res.mode === "head" ? "앞" : "뒤"} ${res.shownLines}/${res.totalLines}줄 · ${kb}KB`;
+    }
+    boxEl.textContent = res.previewText || "(빈 파일)";
+  } catch (e) {
+    if (metaEl) metaEl.textContent = "조회 오류";
+    boxEl.textContent = "미리보기 실패: " + e.message;
+  }
+}
+
+async function downloadSfmDataFile(filePath) {
+  const target = String(filePath || currentSfmPreviewPath || "").trim();
+  if (!target) return;
+  try {
+    const res = await fetch(`/api/space/sfm-download?path=${encodeURIComponent(target)}`, {
+      headers: {
+        "X-Admin-Password": sessionPassword,
+        "X-Site-Id": currentSiteId,
+      },
+    });
+    if (!res.ok) {
+      const errTxt = await res.text();
+      throw new Error(errTxt || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = target.split("/").filter(Boolean).pop() || "download.txt";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`📥 다운로드 완료: ${a.download}`);
+  } catch (e) {
+    alert("파일 다운로드 실패: " + e.message);
+  }
+}
+
+function parseQuickPaletteCommand(rawInput = "", jobsList = []) {
+  const q = String(rawInput || "").trim();
+  if (!q) return null;
+  const jobs = Array.isArray(jobsList) ? jobsList : [];
+  const lower = q.toLowerCase();
+
+  // 1. `log <slotOr#runId>` or `#375033`
+  const logMatch = q.match(/^(?:log|로그)\s+#?(\d+)$/i) || q.match(/^#(\d{4,})$/);
+  if (logMatch) {
+    return { type: "log", target: logMatch[1] };
+  }
+  // 2. `grep <pattern>`
+  const grepMatch = q.match(/^(?:grep|search|검색)\s+(.+)$/i);
+  if (grepMatch) {
+    return { type: "grep", query: grepMatch[1].trim() };
+  }
+  // 3. `target <n>` / `workers <n>` / `gpus <n>` / `pending <n>`
+  const gpusMatch = q.match(/^(?:gpu|gpus)\s+(\d+)$/i);
+  if (gpusMatch) {
+    return { type: "set_gpus", gpus: Number(gpusMatch[1]), jobId: "" };
+  }
+  const pendMatch = q.match(/^(?:pending|pend|대기)\s+(\d+)$/i);
+  if (pendMatch) {
+    return { type: "set_pending", pending: Number(pendMatch[1]), jobId: "" };
+  }
+  const tgtMatch = q.match(/^(?:target|workers|목표)\s+(\d+)$/i);
+  if (tgtMatch) {
+    return { type: "set_workers", workers: Number(tgtMatch[1]), jobId: "" };
+  }
+  // 4. `<ruleName> <workers>` or `<ruleName> <gpus>g` (e.g. `v9 30` or `v9 120g`)
+  const ruleNumMatch = q.match(/^([a-zA-Z0-9_-]+)\s+(\d+)(g|gpu)?$/i);
+  if (ruleNumMatch) {
+    const rName = ruleNumMatch[1].toLowerCase();
+    const matchedJob = jobs.find((j) => String(j.name || j.jobName || "").toLowerCase() === rName);
+    if (matchedJob) {
+      const val = Number(ruleNumMatch[2]);
+      const isGpu = Boolean(ruleNumMatch[3]);
+      return isGpu
+        ? { type: "set_gpus", gpus: val, jobId: matchedJob.id || matchedJob.jobId, jobName: matchedJob.name || matchedJob.jobName }
+        : { type: "set_workers", workers: val, jobId: matchedJob.id || matchedJob.jobId, jobName: matchedJob.name || matchedJob.jobName };
+    }
+  }
+  if (lower === "preflight" || lower === "점검") {
+    return { type: "preflight" };
+  }
+  return null;
+}
+
+function openQuickCommandPalette() {
+  const overlay = document.getElementById("cmdPaletteOverlay");
+  const inp = document.getElementById("cmdPaletteInput");
+  if (!overlay || !inp) return;
+  overlay.style.display = "flex";
+  inp.value = "";
+  currentPaletteActiveIdx = 0;
+  renderQuickPaletteSuggestions("");
+  setTimeout(() => inp.focus(), 10);
+}
+
+function closeQuickCommandPalette() {
+  const overlay = document.getElementById("cmdPaletteOverlay");
+  if (overlay) overlay.style.display = "none";
+}
+
+function renderQuickPaletteSuggestions(rawText = "") {
+  const listEl = document.getElementById("cmdPaletteList");
+  if (!listEl) return;
+  const q = String(rawText || "").trim();
+  const qLower = q.toLowerCase();
+  const jobs = serverState?.jobs || [];
+  const items = [];
+
+  const parsed = parseQuickPaletteCommand(q, jobs);
+  if (parsed) {
+    if (parsed.type === "set_workers") {
+      items.push({
+        label: `⚡ ${parsed.jobName ? `[${parsed.jobName}] ` : ""}목표 워커 수를 ${parsed.workers}개로 즉시 변경`,
+        hint: "Enter 실행",
+        action: () => quickUpdateTargetWorkers(parsed.jobId || undefined, { absolute: parsed.workers }),
+      });
+    } else if (parsed.type === "set_gpus") {
+      items.push({
+        label: `⚡ ${parsed.jobName ? `[${parsed.jobName}] ` : ""}목표 총 GPU를 ${parsed.gpus}장으로 즉시 변경`,
+        hint: "Enter 실행",
+        action: () => quickUpdateTargetGpus(parsed.jobId || undefined, parsed.gpus),
+      });
+    } else if (parsed.type === "set_pending") {
+      items.push({
+        label: `⏳ 목표 Pending 대기열을 ${parsed.pending}개로 변경`,
+        hint: "Enter 실행",
+        action: () => quickUpdateTargetPending(undefined, parsed.pending),
+      });
+    } else if (parsed.type === "log") {
+      items.push({
+        label: `📄 슬롯 또는 컨테이너 #${parsed.target} 실시간 로그 열기`,
+        hint: "Enter 실행",
+        action: () => {
+          const jf = getFocusedMonitorJobFleet(latestWorkerFleet);
+          const num = Number(parsed.target);
+          const bySlot = (jf?.activeWorkers || []).find(
+            (w) => Number(w.assignedSlot) === num || Number(w.slotIndex) === num || String(w.id) === parsed.target
+          );
+          const rId = bySlot ? String(bySlot.id) : parsed.target;
+          viewRunLog(rId, bySlot?.name || "");
+        },
+      });
+    } else if (parsed.type === "grep") {
+      items.push({
+        label: `🔍 전체 Running 워커 로그에서 '${parsed.query}' 통합 검색`,
+        hint: "Enter 실행",
+        action: () => {
+          switchMainView("workloads");
+          const gInp = document.getElementById("logGrepQueryInput");
+          if (gInp) gInp.value = parsed.query;
+          executeMultiWorkerLogGrep();
+        },
+      });
+    } else if (parsed.type === "preflight") {
+      items.push({
+        label: `🧪 현재 규칙 출발 전 스크립트 사전 점검 실행`,
+        hint: "Enter 실행",
+        action: () => {
+          switchMainView("rules");
+          runJobPreflightCheck();
+        },
+      });
+    }
+  }
+
+  const baseCommands = [
+    { label: "페이지 이동: 모니터링", hint: "monitor", action: () => switchMainView("monitor") },
+    { label: "페이지 이동: 워크로드 · 로그", hint: "workloads", action: () => switchMainView("workloads") },
+    { label: "페이지 이동: 실행 규칙", hint: "rules", action: () => switchMainView("rules") },
+    { label: "페이지 이동: 시스템 설정", hint: "settings", action: () => switchMainView("settings") },
+    { label: "출발 전 스크립트 사전 점검 (Pre-Flight)", hint: "preflight", action: () => { switchMainView("rules"); runJobPreflightCheck(); } },
+    { label: "설정 · 규칙 JSON 백업 다운로드", hint: "backup", action: () => exportRunnerBackup(false) },
+  ];
+  for (const j of jobs) {
+    baseCommands.push({
+      label: `모니터링 포커스 전환: [${j.name}] (${j.enabled ? "ON" : "OFF"} · 목표 ${j.minConcurrentRuns}워커)`,
+      hint: j.name,
+      action: () => {
+        switchMainView("monitor");
+        selectMonitorFocusedRule(j.id);
+      },
+    });
+  }
+
+  for (const bc of baseCommands) {
+    if (!qLower || bc.label.toLowerCase().includes(qLower) || bc.hint.toLowerCase().includes(qLower)) {
+      items.push(bc);
+    }
+  }
+
+  currentPaletteItems = items.slice(0, 10);
+  if (currentPaletteActiveIdx >= currentPaletteItems.length) currentPaletteActiveIdx = 0;
+
+  if (currentPaletteItems.length === 0) {
+    listEl.innerHTML = `<div class="hint" style="padding:8px;">일치하는 명령이 없습니다. (예: <code>v9 30</code>, <code>gpus 120</code>, <code>log 3</code>, <code>grep loss=</code>)</div>`;
+    return;
+  }
+
+  listEl.innerHTML = currentPaletteItems
+    .map(
+      (it, idx) => `
+      <div onclick="executeQuickPaletteIdx(${idx})"
+        style="padding:8px 12px; border-radius:8px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; background:${
+          idx === currentPaletteActiveIdx ? "var(--accent-soft)" : "var(--panel-subtle)"
+        }; border:1px solid ${idx === currentPaletteActiveIdx ? "var(--accent-border)" : "var(--border)"}; font-size:12.5px;">
+        <span style="color:var(--text); font-weight:${idx === currentPaletteActiveIdx ? "600" : "400"};">${escapeHtml(it.label)}</span>
+        <span class="mono txt-muted" style="font-size:11px;">${escapeHtml(it.hint || "")}</span>
+      </div>
+    `
+    )
+    .join("");
+}
+
+function executeQuickPaletteIdx(idx) {
+  const item = currentPaletteItems[idx];
+  closeQuickCommandPalette();
+  if (item && typeof item.action === "function") {
+    item.action();
+  }
+}
+
+function handleQuickPaletteKeydown(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeQuickCommandPalette();
+  } else if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (currentPaletteItems.length > 0) {
+      currentPaletteActiveIdx = (currentPaletteActiveIdx + 1) % currentPaletteItems.length;
+      renderQuickPaletteSuggestions(e.target.value);
+    }
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (currentPaletteItems.length > 0) {
+      currentPaletteActiveIdx =
+        (currentPaletteActiveIdx - 1 + currentPaletteItems.length) % currentPaletteItems.length;
+      renderQuickPaletteSuggestions(e.target.value);
+    }
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    executeQuickPaletteIdx(currentPaletteActiveIdx);
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && String(e.key || "").toLowerCase() === "k") {
+    e.preventDefault();
+    const overlay = document.getElementById("cmdPaletteOverlay");
+    if (overlay && overlay.style.display === "flex") {
+      closeQuickCommandPalette();
+    } else {
+      openQuickCommandPalette();
+    }
+  } else if (e.key === "Escape") {
+    const overlay = document.getElementById("cmdPaletteOverlay");
+    if (overlay && overlay.style.display === "flex") {
+      closeQuickCommandPalette();
+    }
+  }
+});
 
 // Always start locked on every visit / page refresh (except 1-click Bookmarklet `#tokenSync=` popup!)
 window.addEventListener("DOMContentLoaded", async () => {

@@ -101,6 +101,8 @@ const DEFAULT_STATE = {
     silentHangAutoRestart: false,
     nanGuardEnabled: true,
     nanAutoRestart: false,
+    ttlPreWarmEnabled: true,
+    ttlPreWarmLeadMin: 15,
     dailyDigestEnabled: false,
     dailyDigestHourKst: 9,
     globalMaxGpus: 0,
@@ -203,6 +205,7 @@ const DEFAULT_STATE = {
     dailyJobGpuHours: {},
     hourlyWeather: {},
     seenWeatherRunIds: [],
+    metricSeries: [],
     timeSeries: [],
     lastAccountingAtMs: 0,
     lastSampleAtMs: 0,
@@ -412,6 +415,7 @@ function loadState() {
         dailyJobGpuHours: tObj.dailyJobGpuHours && typeof tObj.dailyJobGpuHours === "object" ? tObj.dailyJobGpuHours : {},
         hourlyWeather: tObj.hourlyWeather && typeof tObj.hourlyWeather === "object" ? tObj.hourlyWeather : {},
         seenWeatherRunIds: Array.isArray(tObj.seenWeatherRunIds) ? tObj.seenWeatherRunIds.slice(-2000) : [],
+        metricSeries: Array.isArray(tObj.metricSeries) ? tObj.metricSeries.slice(-80) : [],
         timeSeries: Array.isArray(tObj.timeSeries) ? tObj.timeSeries.slice(-60) : [],
         lastAccountingAtMs: Number(tObj.lastAccountingAtMs || 0),
         lastSampleAtMs: Number(tObj.lastSampleAtMs || 0),
@@ -3352,7 +3356,8 @@ function updateGpuTelemetry(
   totalRunningGpus = 0,
   totalTargetGpus = 0,
   avgApiMs = 0,
-  perJobRunningGpus = {}
+  perJobRunningGpus = {},
+  metricSnapshot = null
 ) {
   const siteTel = getSiteTelemetryObject();
   const now = Date.now();
@@ -3408,6 +3413,23 @@ function updateGpuTelemetry(
     if (siteTel.timeSeries.length > 60) {
       siteTel.timeSeries = siteTel.timeSeries.slice(-60);
     }
+    if (
+      metricSnapshot &&
+      (metricSnapshot.avgLoss !== null || (metricSnapshot.totalThroughput && metricSnapshot.totalThroughput > 0))
+    ) {
+      siteTel.metricSeries = appendMetricSeriesSample(
+        siteTel.metricSeries,
+        {
+          time: timeLabel,
+          isoTime: new Date(now).toISOString(),
+          avgLoss: metricSnapshot.avgLoss ?? null,
+          totalThroughput: metricSnapshot.totalThroughput ?? 0,
+          speedUnit: metricSnapshot.speedUnit || "",
+          runningWorkers: totalRunningWorkers,
+        },
+        80
+      );
+    }
     siteTel.lastSampleAtMs = now;
   }
 
@@ -3428,6 +3450,7 @@ function updateGpuTelemetry(
     jobGpuHours: roundedJobGpuHours,
     todayJobGpuHours: roundedTodayJobGpuHours,
     timeSeries: siteTel.timeSeries || [],
+    metricSeries: siteTel.metricSeries || [],
     preemptions: getSpotPreemptionSummary(siteTel, now),
   };
 }
@@ -4461,6 +4484,216 @@ async function pollWatchedOutputDirIfNeeded(job, force = false) {
     watchdogStats.outputWatchCache[dirPath] = errRecord;
     return errRecord;
   }
+}
+
+// =========================================================================
+// Batch 6 Helpers (v3.0): TTL Pre-Warm, Budget Cap, Metric Sparkline, Bad-Node Quarantine & SFM Preview
+// =========================================================================
+function parseExpectedRunTimeSec(expectedRunTime = "8h") {
+  const raw = String(expectedRunTime ?? "").trim().toLowerCase();
+  if (!raw) return 8 * 3600;
+  let totalSec = 0;
+  let matchedAny = false;
+  const rx = /(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|mins?|m|secs?|s)(?![a-z])/gi;
+  for (const m of raw.matchAll(rx)) {
+    matchedAny = true;
+    const val = Number(m[1]);
+    const u = m[2][0];
+    if (u === "d") totalSec += val * 86400;
+    else if (u === "h") totalSec += val * 3600;
+    else if (u === "m") totalSec += val * 60;
+    else totalSec += val;
+  }
+  if (matchedAny && totalSec > 0) return Math.round(totalSec);
+  const asHours = Number(raw);
+  if (Number.isFinite(asHours) && asHours > 0) return Math.round(asHours * 3600);
+  return 8 * 3600;
+}
+
+function computeWorkerRemainingTtlSec(run, expectedRunTime = "8h", leadMin = 15, nowMs = Date.now()) {
+  if (!run || typeof run !== "object") {
+    return { ttlTotalSec: null, remainingTtlSec: null, isExpiringSoon: false };
+  }
+  const stUpper = String(run.status || run.state || run.phase || "").toUpperCase();
+  if (!stUpper.includes("RUNNING") || !run.startTime) {
+    return { ttlTotalSec: parseExpectedRunTimeSec(expectedRunTime), remainingTtlSec: null, isExpiringSoon: false };
+  }
+  const startMs = new Date(run.startTime).getTime();
+  if (Number.isNaN(startMs) || startMs <= 0) {
+    return { ttlTotalSec: parseExpectedRunTimeSec(expectedRunTime), remainingTtlSec: null, isExpiringSoon: false };
+  }
+  const ttlTotalSec = parseExpectedRunTimeSec(expectedRunTime);
+  const elapsedSec = Math.max(0, Math.floor((nowMs - startMs) / 1000));
+  const remainingTtlSec = Math.max(0, ttlTotalSec - elapsedSec);
+  const leadSec = Math.max(60, Number(leadMin || 15) * 60);
+  const isExpiringSoon = remainingTtlSec <= leadSec;
+  return { ttlTotalSec, remainingTtlSec, isExpiringSoon };
+}
+
+function computeTtlPreWarmAllowance(
+  runningRuns = [],
+  expectedRunTime = "8h",
+  leadMin = 15,
+  maxExtra = 4,
+  nowMs = Date.now()
+) {
+  let expiringSoonCount = 0;
+  let minRemainingSec = null;
+  for (const r of Array.isArray(runningRuns) ? runningRuns : []) {
+    const info = computeWorkerRemainingTtlSec(r, expectedRunTime, leadMin, nowMs);
+    if (info.remainingTtlSec !== null) {
+      if (minRemainingSec === null || info.remainingTtlSec < minRemainingSec) {
+        minRemainingSec = info.remainingTtlSec;
+      }
+      if (info.isExpiringSoon) {
+        expiringSoonCount += 1;
+      }
+    }
+  }
+  const cap = Math.max(0, Math.min(16, Number(maxExtra ?? 4)));
+  return {
+    expiringSoonCount,
+    preWarmAllowance: Math.min(cap, expiringSoonCount),
+    minRemainingSec,
+  };
+}
+
+function evaluateJobBudgetCap(job, consumedGpuHours = 0) {
+  const maxGpuHours = Math.max(0, Number(job?.maxGpuHours || 0));
+  const consumed = Math.max(0, Math.round(Number(consumedGpuHours || 0) * 100) / 100);
+  if (maxGpuHours <= 0) {
+    return {
+      enabled: false,
+      maxGpuHours: 0,
+      consumedGpuHours: consumed,
+      usagePct: 0,
+      remainingGpuHours: null,
+      isWarn80: false,
+      isExceeded: false,
+      action: job?.budgetCapAction === "stop" ? "stop" : "drain",
+    };
+  }
+  const usagePct = Math.min(999, Math.round((consumed / maxGpuHours) * 1000) / 10);
+  const remainingGpuHours = Math.max(0, Math.round((maxGpuHours - consumed) * 100) / 100);
+  const isExceeded = consumed >= maxGpuHours;
+  const isWarn80 = !isExceeded && usagePct >= 80;
+  return {
+    enabled: true,
+    maxGpuHours,
+    consumedGpuHours: consumed,
+    usagePct,
+    remainingGpuHours,
+    isWarn80,
+    isExceeded,
+    action: job?.budgetCapAction === "stop" ? "stop" : "drain",
+  };
+}
+
+function appendMetricSeriesSample(existingSeries = [], sample = {}, maxPoints = 80) {
+  const arr = Array.isArray(existingSeries) ? [...existingSeries] : [];
+  const avgLoss =
+    sample.avgLoss !== null && sample.avgLoss !== undefined && Number.isFinite(Number(sample.avgLoss))
+      ? Math.round(Number(sample.avgLoss) * 10000) / 10000
+      : null;
+  const totalThroughput =
+    sample.totalThroughput !== null && sample.totalThroughput !== undefined && Number.isFinite(Number(sample.totalThroughput))
+      ? Math.round(Number(sample.totalThroughput) * 100) / 100
+      : 0;
+  if (avgLoss === null && totalThroughput <= 0) {
+    return arr.slice(-Math.max(1, maxPoints));
+  }
+  arr.push({
+    time: String(sample.time || ""),
+    isoTime: String(sample.isoTime || new Date().toISOString()),
+    avgLoss,
+    totalThroughput,
+    speedUnit: String(sample.speedUnit || ""),
+    runningWorkers: Number(sample.runningWorkers || 0),
+  });
+  return arr.slice(-Math.max(1, maxPoints));
+}
+
+function evaluateProblemNodeQuarantine(
+  problemNodesMap = {},
+  consecutiveRapidFails = 0,
+  nowMs = Date.now(),
+  baseCooldownSec = 25
+) {
+  const baseSec = Math.max(5, Number(baseCooldownSec || 25));
+  const quarantinedNodes = [];
+  let highestRepeatNode = null;
+  let maxCount = 0;
+
+  for (const [nodeName, info] of Object.entries(problemNodesMap || {})) {
+    if (!nodeName || !info || typeof info !== "object") continue;
+    const count = Number(info.count || 0);
+    const lastSeenMs = info.lastSeenAt ? new Date(info.lastSeenAt).getTime() : 0;
+    const isRecent = lastSeenMs > 0 && nowMs - lastSeenMs <= 30 * 60 * 1000;
+    if (isRecent && count >= 2) {
+      quarantinedNodes.push({
+        node: nodeName,
+        count,
+        lastError: info.lastError || "",
+        lastSeenAt: info.lastSeenAt || null,
+      });
+      if (count > maxCount) {
+        maxCount = count;
+        highestRepeatNode = nodeName;
+      }
+    }
+  }
+  quarantinedNodes.sort((a, b) => b.count - a.count);
+
+  const effectiveStreak = Math.max(Number(consecutiveRapidFails || 0), maxCount);
+  let multiplier = 1;
+  if (effectiveStreak >= 4) multiplier = 5;
+  else if (effectiveStreak === 3) multiplier = 3.5;
+  else if (effectiveStreak === 2) multiplier = 2;
+
+  const escalatedCooldownSec = Math.min(600, Math.round(baseSec * multiplier));
+  return {
+    isQuarantineActive: quarantinedNodes.length > 0 || effectiveStreak >= 2,
+    quarantinedNodes,
+    highestRepeatNode,
+    escalatedCooldownSec,
+  };
+}
+
+function slicePreviewContent(rawText = "", { mode = "tail", maxLines = 100, maxBytes = 65536 } = {}) {
+  const full = String(rawText ?? "");
+  const totalBytes = Buffer.byteLength(full, "utf-8");
+  const allLines = full.split(/\r?\n/);
+  const totalLines = allLines.length;
+  const lineLimit = Math.max(5, Math.min(500, Number(maxLines || 100)));
+
+  let slicedLines = [];
+  let startLine = 1;
+  if (totalLines <= lineLimit) {
+    slicedLines = allLines;
+    startLine = 1;
+  } else if (String(mode).toLowerCase() === "head") {
+    slicedLines = allLines.slice(0, lineLimit);
+    startLine = 1;
+  } else {
+    slicedLines = allLines.slice(-lineLimit);
+    startLine = totalLines - lineLimit + 1;
+  }
+
+  let previewText = slicedLines.join("\n");
+  let byteTruncated = false;
+  if (Buffer.byteLength(previewText, "utf-8") > maxBytes) {
+    previewText = previewText.slice(-maxBytes);
+    byteTruncated = true;
+  }
+  return {
+    mode: String(mode).toLowerCase() === "head" ? "head" : "tail",
+    totalLines,
+    shownLines: slicedLines.length,
+    startLine,
+    totalBytes,
+    truncated: totalLines > lineLimit || byteTruncated,
+    previewText,
+  };
 }
 
 /**
@@ -5798,6 +6031,12 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
       const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
       const { uptimeSec, queueWaitSec } = computeWorkerUptimeSec(r, now);
+      const ttlInfo = computeWorkerRemainingTtlSec(
+        r,
+        job.expectedRunTime || "8h",
+        Number(state.config.ttlPreWarmLeadMin || 15),
+        now
+      );
       const consoleLinks = buildRunConsoleLinks(r, getSiteProfile());
       const assignedTaskIdx = extractAssignedTaskIdxFromRun(r, job);
       const rawProgress = snippet?.progress ? { ...snippet.progress } : null;
@@ -5820,6 +6059,8 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
         elapsedSec,
         uptimeSec,
         queueWaitSec,
+        remainingTtlSec: ttlInfo.remainingTtlSec,
+        isExpiringSoon: ttlInfo.isExpiringSoon,
         portalRunUrl: consoleLinks.portalRunUrl,
         webConsoleUrl: consoleLinks.webConsoleUrl,
         approvalStatus: r.approvalStatus || tl?.approvalStatus || (isRunning ? "approved" : "pending"),
@@ -5846,6 +6087,13 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     const throughputSummary = detectStragglerWorkers(activeWorkers, 0.55);
     const silentHangCount = activeWorkers.filter((w) => w.isSilentHang).length;
     const nanDivergedCount = activeWorkers.filter((w) => w.isNanDiverged).length;
+    const ttlPreWarmInfo = computeTtlPreWarmAllowance(
+      runningRuns,
+      job.expectedRunTime || "8h",
+      Number(state.config.ttlPreWarmLeadMin || 15),
+      4,
+      now
+    );
     const taskQueueInfo = reconcileTaskQueueProgress(job, matchingRuns);
     const outputWatchInfo = job.watchOutputDir
       ? watchdogStats.outputWatchCache?.[String(job.watchOutputDir).trim()] || {
@@ -5891,6 +6139,10 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       globalCapWorkers,
       silentHangCount,
       nanDivergedCount,
+      expiringSoonCount: ttlPreWarmInfo.expiringSoonCount,
+      ttlPreWarm: ttlPreWarmInfo,
+      maxGpuHours: Number(job.maxGpuHours || 0),
+      budgetCapAction: job.budgetCapAction === "stop" ? "stop" : "drain",
       stragglerCount: throughputSummary.stragglerCount,
       throughputSummary,
       taskQueue: taskQueueInfo.enabled
@@ -6034,6 +6286,17 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
 
   const timeScaleStatus = computeTimeScaleStatus();
   const perJobRunningGpus = {};
+  const primaryActiveFleet =
+    jobFleetList.find((jfItem) => jfItem.enabled && jfItem.runningCount > 0) ||
+    jobFleetList.find((jfItem) => jfItem.runningCount > 0) ||
+    null;
+  const metricSnapshot = primaryActiveFleet?.throughputSummary
+    ? {
+        avgLoss: primaryActiveFleet.throughputSummary.avgLoss ?? null,
+        totalThroughput: primaryActiveFleet.throughputSummary.totalThroughput ?? 0,
+        speedUnit: primaryActiveFleet.throughputSummary.speedUnit || "",
+      }
+    : null;
   for (const jfItem of jobFleetList) {
     if (jfItem.jobName) {
       perJobRunningGpus[jfItem.jobName] = Number(jfItem.runningGpuCount || 0);
@@ -6046,16 +6309,25 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     totalRunningGpus,
     totalTargetGpus,
     loadStatus?.api?.avgLatencyMs || 0,
-    perJobRunningGpus
+    perJobRunningGpus,
+    metricSnapshot
   );
   for (const jfItem of jobFleetList) {
     jfItem.gpuHoursTotal = Number(telemetryStatus.jobGpuHours?.[jfItem.jobName] || 0);
     jfItem.gpuHoursToday = Number(telemetryStatus.todayJobGpuHours?.[jfItem.jobName] || 0);
+    const matchingJobObj = state.jobs.find((j) => j.id === jfItem.jobId) || null;
+    jfItem.budgetCap = evaluateJobBudgetCap(matchingJobObj, jfItem.gpuHoursTotal);
   }
   const queueVelocity = computeQueueAllocationVelocity(runsList, state.jobs, now);
   const clusterWeather = computeHourlyClusterWeather(runsList, getSiteTelemetryObject(), state.jobs);
   const badNodeCooldownRemainingSec =
     badNodeStats.cooldownUntilMs > now ? Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000) : 0;
+  const quarantineInfo = evaluateProblemNodeQuarantine(
+    badNodeStats.problemNodes,
+    badNodeStats.consecutiveRapidFails,
+    now,
+    Number(state.config.badNodeCooldownSec || 25)
+  );
 
   return {
     siteId: getCurrentSiteId(),
@@ -6142,6 +6414,7 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       problemNodes: Object.values(badNodeStats.problemNodes || {})
         .sort((a, b) => Number(b.count || 0) - Number(a.count || 0))
         .slice(0, 10),
+      quarantine: quarantineInfo,
     },
     pipeline: {
       autoStopOnComplete: state.config.autoStopOnComplete !== false,
@@ -6316,6 +6589,44 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
     return { triggered: false, reason: job.lastStatus };
   }
 
+  // Batch 6 - Feature 2: Per-Job GPU-Hours Auto-Budget Cap (`maxGpuHours`)
+  const consumedJobGpuHours = Number(getSiteTelemetryObject()?.jobGpuHours?.[job.name] || 0);
+  const budgetCapStatus = evaluateJobBudgetCap(job, consumedJobGpuHours);
+  if (!forceTrigger && budgetCapStatus.enabled) {
+    if (budgetCapStatus.isWarn80 && !job._budgetWarn80Sent) {
+      job._budgetWarn80Sent = true;
+      saveState();
+      addLog(
+        "warn",
+        `⚠️ [GPU 예산 80% 도달] [${job.name}] 누적 ${budgetCapStatus.consumedGpuHours} / ${budgetCapStatus.maxGpuHours} GPU-h (${budgetCapStatus.usagePct}%) 사용됨`
+      );
+      pushAlertNotification(
+        "warn",
+        `⚠️ [${job.name}] GPU-Hours 예산 ${budgetCapStatus.usagePct}% 도달`,
+        `규칙 [${job.name}]이(가) 설정된 예산(${budgetCapStatus.maxGpuHours} GPU-h) 중 ${budgetCapStatus.consumedGpuHours} GPU-h를 소진했습니다.`,
+        { jobId: job.id, dedupeKey: `budget80-${job.id}-${budgetCapStatus.maxGpuHours}` }
+      ).catch(() => {});
+    }
+    if (budgetCapStatus.isExceeded) {
+      if (budgetCapStatus.action === "drain" && runningRuns.length > 0) {
+        job.draining = true;
+        job.lastStatus = `🏁 GPU 예산 한도(${budgetCapStatus.consumedGpuHours}/${budgetCapStatus.maxGpuHours} GPU-h) 도달 — 무중단 드레이닝 자동 전환됨`;
+      } else {
+        job.enabled = false;
+        job.lastStatus = `🏁 GPU 예산 한도(${budgetCapStatus.consumedGpuHours}/${budgetCapStatus.maxGpuHours} GPU-h) 도달 — 신규 자동생성 정지됨`;
+      }
+      saveState();
+      addLog("warn", `🏁 [GPU 예산 상한 도달] [${job.name}] ${job.lastStatus}`);
+      await pushAlertNotification(
+        "warn",
+        `🏁 [${job.name}] GPU-Hours 예산 한도 도달 (${budgetCapStatus.maxGpuHours} GPU-h)`,
+        job.lastStatus,
+        { jobId: job.id, dedupeKey: `budget100-${job.id}-${budgetCapStatus.maxGpuHours}` }
+      );
+      return { triggered: false, reason: job.lastStatus };
+    }
+  }
+
   const rawMinConcurrent = Math.max(1, Number(job.minConcurrentRuns || 1));
   const configuredTargetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
   const baseMinConcurrent =
@@ -6368,10 +6679,10 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
   const targetGpuTotal = minConcurrent * coreCountPerWorker;
   const loadStatus = computeServerLoadStatus(allRuns);
 
-  // Batch 2 - Feature 6: Detect Rapid-Fail runs (`FAILED` within `< badNodeRapidFailSec` seconds) & trigger Bad-Node Cooldown
+  // Batch 2 - Feature 6 & Batch 6 - Feature 4: Detect Rapid-Fail runs & Adaptive Problem-Node Quarantine
   if (state.config.badNodeGuardEnabled !== false) {
     const rapidSecLimit = Math.max(20, Number(state.config.badNodeRapidFailSec || 180));
-    const cooldownSec = Math.max(5, Number(state.config.badNodeCooldownSec || 25));
+    const baseCooldownSec = Math.max(5, Number(state.config.badNodeCooldownSec || 25));
     const recentTermMap = getSiteRuntime().recentlyTerminatedRunsMap;
     const failedRuns = matchingRuns.filter((r) => isGenuineBadNodeFailureRun(r, recentTermMap));
     for (const fr of failedRuns.slice(0, 5)) {
@@ -6392,19 +6703,37 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       if (runDurSec <= rapidSecLimit && now - endMs < 180000) {
         badNodeStats.rapidFailCount += 1;
         badNodeStats.consecutiveRapidFails += 1;
-        // Base cooldown on the actual failure timestamp (`endMs + cooldownSec * 1000`) so old failures discovered on a 3m/10m tick don't block the tick!
+        const failedNodeName = extractNodeIdentifierFromRunOrLog(fr, "");
+        if (failedNodeName) {
+          recordProblemNodeEvent(failedNodeName, `초기 크래시(${runDurSec}s)`, fId);
+        }
+        const qEval = evaluateProblemNodeQuarantine(
+          badNodeStats.problemNodes,
+          badNodeStats.consecutiveRapidFails,
+          now,
+          baseCooldownSec
+        );
+        const cooldownSec = qEval.escalatedCooldownSec;
         const candidateCooldownUntilMs = (fr.endTime ? endMs : now) + cooldownSec * 1000;
         if (candidateCooldownUntilMs > now) {
           badNodeStats.cooldownUntilMs = Math.max(badNodeStats.cooldownUntilMs, candidateCooldownUntilMs);
         }
         badNodeStats.lastBadRunId = fId;
         badNodeStats.lastBadRunName = fr.containerName || fr.name || `#${fId}`;
-        badNodeStats.lastReason = `시작 ${runDurSec}초 만에 조기 실패(Rapid-Fail <= ${rapidSecLimit}초)`;
+        badNodeStats.lastReason = `시작 ${runDurSec}초 만에 조기 실패${failedNodeName ? ` (노드 ${failedNodeName})` : ""}`;
         badNodeStats.lastDetectedAt = new Date(now).toISOString();
         addLog(
           "warn",
-          `🩺 [불량 노드 회피 가드] ${badNodeStats.lastBadRunName} (#${fId})가 시작 ${runDurSec}초 만에 조기 실패했습니다. 동일 불량 노드 재할당 방지를 위해 ${cooldownSec}초 스마트 쿨다운을 적용합니다.`
+          `🩺 [불량 노드 회피·격리 가드] ${badNodeStats.lastBadRunName} (#${fId}${failedNodeName ? ` · ${failedNodeName}` : ""})가 시작 ${runDurSec}초 만에 조기 실패했습니다. 적응형 ${cooldownSec}초 스마트 우회 쿨다운을 적용합니다.`
         );
+        if (failedNodeName && (badNodeStats.problemNodes?.[failedNodeName]?.count || 0) >= 3) {
+          pushAlertNotification(
+            "warn",
+            `🚨 반복 불량 노드 격리 경보 (${failedNodeName})`,
+            `물리 노드 '${failedNodeName}'에서 연속 ${badNodeStats.problemNodes[failedNodeName].count}회 초기 크래시가 감지되어 우회 쿨다운을 ${cooldownSec}초로 확대했습니다.`,
+            { nodeName: failedNodeName, dedupeKey: `quarantine-${failedNodeName}` }
+          ).catch(() => {});
+        }
       }
     }
     if (runningRuns.length > 0 && badNodeStats.consecutiveRapidFails > 0) {
@@ -6455,9 +6784,25 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
 
   if (!forceTrigger) {
     const inFlightSlots = getInFlightReservationsForJob(job.id);
+    // Batch 6 - Feature 1: TTL Cliff Pre-Warm (spawn replacement Pending workers `ttlPreWarmLeadMin` before `expectedRunTime` expires!)
+    const ttlPreWarm =
+      state.config.ttlPreWarmEnabled !== false && !taskQueueProg.enabled
+        ? computeTtlPreWarmAllowance(
+            runningRuns,
+            job.expectedRunTime || "8h",
+            Number(state.config.ttlPreWarmLeadMin || 15),
+            4,
+            now
+          )
+        : { expiringSoonCount: 0, preWarmAllowance: 0, minRemainingSec: null };
+    const effectiveEvalMinConcurrent = minConcurrent + ttlPreWarm.preWarmAllowance;
+    const effectiveEvalPending =
+      ttlPreWarm.preWarmAllowance > 0
+        ? Math.max(targetPending, ttlPreWarm.preWarmAllowance)
+        : targetPending;
     const metrics = computeJobTargetMetrics({
-      minConcurrentRuns: minConcurrent,
-      targetPendingRuns: targetPending,
+      minConcurrentRuns: effectiveEvalMinConcurrent,
+      targetPendingRuns: effectiveEvalPending,
       coreCount: coreCountPerWorker,
       runningCount: runningRuns.length,
       pendingCount: pendingJobRuns.length,
@@ -7965,6 +8310,10 @@ const server = http.createServer(async (req, res) => {
           : {}),
         ...(body.nanGuardEnabled !== undefined ? { nanGuardEnabled: Boolean(body.nanGuardEnabled) } : {}),
         ...(body.nanAutoRestart !== undefined ? { nanAutoRestart: Boolean(body.nanAutoRestart) } : {}),
+        ...(body.ttlPreWarmEnabled !== undefined ? { ttlPreWarmEnabled: Boolean(body.ttlPreWarmEnabled) } : {}),
+        ...(body.ttlPreWarmLeadMin !== undefined
+          ? { ttlPreWarmLeadMin: toSafeInt(body.ttlPreWarmLeadMin, state.config.ttlPreWarmLeadMin ?? 15, 2, 180) }
+          : {}),
         ...(body.dailyDigestEnabled !== undefined ? { dailyDigestEnabled: Boolean(body.dailyDigestEnabled) } : {}),
         ...(body.dailyDigestHourKst !== undefined
           ? { dailyDigestHourKst: toSafeInt(body.dailyDigestHourKst, state.config.dailyDigestHourKst ?? 9, 0, 23) }
@@ -9072,6 +9421,40 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: Boolean(record?.ok), outputWatch: record });
     }
 
+    // 8-A3h. Batch 6 - Feature 5: SFM Quick File Preview (`GET /api/space/sfm-preview`) & 1-Click Download (`GET /api/space/sfm-download`)
+    if (pathname === "/api/space/sfm-preview" && req.method === "GET") {
+      const targetPath = String(parsedUrl.searchParams.get("path") || "").trim();
+      if (!targetPath) return sendJson(res, 400, { error: "파일 경로(path)를 지정해 주세요." });
+      const mode = String(parsedUrl.searchParams.get("mode") || "tail").toLowerCase();
+      const maxLines = toSafeInt(parsedUrl.searchParams.get("lines"), 100, 10, 500);
+      const readRes = await readSfmFile(targetPath);
+      const sliced = slicePreviewContent(readRes?.content || "", { mode, maxLines, maxBytes: 65536 });
+      return sendJson(res, 200, {
+        ok: true,
+        path: readRes?.path || targetPath,
+        source: readRes?.source || "remote",
+        ...sliced,
+      });
+    }
+
+    if (pathname === "/api/space/sfm-download" && req.method === "GET") {
+      const targetPath = String(parsedUrl.searchParams.get("path") || "").trim();
+      if (!targetPath) return sendJson(res, 400, { error: "파일 경로(path)를 지정해 주세요." });
+      const readRes = await readSfmFile(targetPath);
+      const rawContent = String(readRes?.content ?? "");
+      const safeFileName =
+        targetPath
+          .split("/")
+          .filter(Boolean)
+          .pop()
+          ?.replace(/[^a-zA-Z0-9._-]/g, "_") || "download.txt";
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${safeFileName}"`,
+      });
+      return res.end(rawContent);
+    }
+
     // 8-A3e. Batch 4 - Feature 1: Pre-Flight Script & Syntax Validator (`POST /api/jobs/preflight`)
     if (pathname === "/api/jobs/preflight" && req.method === "POST") {
       const body = await readJsonBody(req);
@@ -9565,6 +9948,22 @@ const server = http.createServer(async (req, res) => {
           body.watchOutputDir !== undefined
             ? String(body.watchOutputDir || "").trim()
             : String(existingJob?.watchOutputDir || ""),
+        maxGpuHours:
+          body.maxGpuHours !== undefined
+            ? Math.max(0, Number(parseFiniteNumber(body.maxGpuHours) || 0))
+            : Math.max(0, Number(existingJob?.maxGpuHours || 0)),
+        budgetCapAction:
+          body.budgetCapAction !== undefined
+            ? body.budgetCapAction === "stop"
+              ? "stop"
+              : "drain"
+            : existingJob?.budgetCapAction === "stop"
+            ? "stop"
+            : "drain",
+        _budgetWarn80Sent:
+          body.maxGpuHours !== undefined && Number(body.maxGpuHours) > Number(existingJob?.maxGpuHours || 0)
+            ? false
+            : Boolean(existingJob?._budgetWarn80Sent),
         taskQueueItems:
           body.taskQueueItems !== undefined
             ? parseTaskQueueItems(body.taskQueueItems)

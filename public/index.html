@@ -75,6 +75,7 @@
     <div class="status-bar">
       <span id="jwtBadge" class="badge warn" style="cursor:pointer;" onclick="switchMainView('settings', 'auth')" title="클릭하면 토큰 연동 설정으로 이동합니다">토큰 확인 중</span>
       <span id="schedBadge" class="badge ok">스케줄러 ON</span>
+      <button type="button" class="secondary sm mono" onclick="openQuickCommandPalette()" title="빠른 명령 팔레트 열기 (Ctrl+K / Cmd+K)">⌘K 명령</button>
       <button type="button" id="themeToggleBtn" class="secondary sm" onclick="toggleUiTheme()" title="다크 / 라이트 테마 전환">☀️ 라이트</button>
       <button type="button" class="secondary sm" onclick="lockDashboard()" title="대시보드 잠금">잠금</button>
     </div>
@@ -505,6 +506,17 @@
               <label>결과물 · 체크포인트 감시 폴더 (선택 — SFM 주기 확인)</label>
               <input type="text" id="jobWatchOutputDir" placeholder="예: /user-volume/offpolicy-misranking/v9/outputs" class="mono" />
             </div>
+            <div class="form-group">
+              <label>GPU-Hours 예산 상한 (0 = 무제한)</label>
+              <input type="number" id="jobMaxGpuHours" value="0" min="0" step="10" class="mono" />
+            </div>
+            <div class="form-group">
+              <label>예산 한도 도달 시 동작</label>
+              <select id="jobBudgetCapAction">
+                <option value="drain">무중단 드레이닝 (Running 자연 종료)</option>
+                <option value="stop">신규 생성 즉시 정지</option>
+              </select>
+            </div>
           </div>
 
           <div class="card-subtle" style="margin-top:14px;">
@@ -575,6 +587,22 @@
             <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/user-volume'; browseSfmFiles()">/user-volume</button>
           </div>
           <div id="sfmFilesList" class="pill-list" style="margin-top:10px; max-height:150px; overflow-y:auto;"></div>
+          <!-- Batch 6: 볼륨 데이터 · 결과 파일(.jsonl, .json, .yaml, .csv, .log) 빠른 미리보기 & 다운로드 -->
+          <div id="sfmQuickPreviewPanel" class="card-subtle" style="display:none; margin-top:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+              <div>
+                <b id="sfmPreviewTitle" class="mono" style="font-size:12.5px;">파일 미리보기</b>
+                <span id="sfmPreviewMeta" class="badge mono" style="margin-left:8px;"></span>
+              </div>
+              <div class="btn-row">
+                <button type="button" class="secondary sm" onclick="previewSfmDataFile(currentSfmPreviewPath, 'head')">앞 100줄</button>
+                <button type="button" class="secondary sm" onclick="previewSfmDataFile(currentSfmPreviewPath, 'tail')">뒤 100줄</button>
+                <button type="button" class="sm" onclick="downloadSfmDataFile(currentSfmPreviewPath)">파일 다운로드</button>
+                <button type="button" class="secondary sm" onclick="document.getElementById('sfmQuickPreviewPanel').style.display='none'">닫기</button>
+              </div>
+            </div>
+            <div id="sfmPreviewContentBox" class="code-box" style="max-height:220px; font-size:11.5px;"></div>
+          </div>
         </div>
 
         <div id="sfmScriptEditorPanel" class="card-subtle">
@@ -847,7 +875,16 @@
               </div>
               <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
                 <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
-                  <input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 즉시 실패(불량 노드) 쿨다운 보호
+                  <input type="checkbox" id="cfgTtlPreWarmEnabled" checked /> 수명 만료(<code>expectedRunTime</code> · 8h 등) 절벽 방지 선제 예열
+                </label>
+                <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
+                  <span>선제 예열(분 전)</span>
+                  <input type="number" id="cfgTtlPreWarmLeadMin" value="15" min="2" max="180" class="mono" style="width:64px;" />
+                </div>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                  <input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 즉시 실패(불량 노드) 적응형 회피 · 격리 보호
                 </label>
                 <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
                   <span>쿨다운(초)</span>
@@ -949,6 +986,21 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=28"></script>
+  <!-- Batch 6: 빠른 키보드 명령 팔레트 (Ctrl+K / Cmd+K) -->
+  <div id="cmdPaletteOverlay" onclick="if(event.target===this) closeQuickCommandPalette()" style="display:none; position:fixed; inset:0; z-index:9800; background:rgba(9,13,22,0.58); backdrop-filter:blur(3px); align-items:flex-start; justify-content:center; padding-top:11vh;">
+    <div class="card" style="width:min(580px, 92vw); padding:16px 18px; box-shadow:0 20px 50px rgba(0,0,0,0.45);">
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+        <span class="badge info mono">⌘K</span>
+        <input type="text" id="cmdPaletteInput" class="mono" placeholder="명령 입력 (예: v9 30, gpus 120, pending 6, log 5, grep loss=, rules)"
+          oninput="renderQuickPaletteSuggestions(this.value)"
+          onkeydown="handleQuickPaletteKeydown(event)"
+          style="flex:1; font-size:13.5px;" />
+        <button type="button" class="secondary sm" onclick="closeQuickCommandPalette()">ESC</button>
+      </div>
+      <div id="cmdPaletteList" style="display:flex; flex-direction:column; gap:5px; max-height:280px; overflow-y:auto;"></div>
+    </div>
+  </div>
+
+  <script src="/app.js?v=29"></script>
 </body>
 </html>
