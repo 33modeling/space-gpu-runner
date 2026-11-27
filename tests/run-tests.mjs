@@ -115,6 +115,7 @@ function createServerLogicSandbox() {
     "diffJobRules",
     "generateJobExperimentReport",
     "aggregateJsonlMetrics",
+    "computeNextAutoSpawnEligibility",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -1955,6 +1956,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     const reader = res.body.getReader();
     const { value } = await reader.read();
     const firstChunk = new TextDecoder().decode(value);
+    await reader.cancel().catch(() => {});
     ac.abort();
     assert.equal(firstChunk.includes("event: connected"), true, "SSE 초기 연결 이벤트 프레임이 즉시 수신되어야 함");
   });
@@ -2024,5 +2026,65 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     const styleCss = fs.readFileSync(path.join(ROOT_DIR, "public", "style.css"), "utf-8");
     assert.equal(styleCss.includes("@media (max-width: 768px)"), true);
     assert.equal(styleCss.includes("@media (max-width: 480px)"), true);
+  });
+
+  test("TC-79: [회귀 방지] `computeNextAutoSpawnEligibility` 5분(300초) 생성 간격 엄수 및 `targetPending > 0`에서도 불량 노드 쿨다운 적용 검증", () => {
+    const nowMs = Date.parse("2026-11-27T14:10:00.000Z");
+    // 1) 40초 전에 생성된 직후라면 300초(5분) 간격 설정 시 절대 허용되지 않아야 함 (남은 대기 260초)
+    const block5m = srv.computeNextAutoSpawnEligibility({
+      nowMs,
+      lastTriggeredAt: "2026-11-27T14:09:20.000Z",
+      cooldownSec: 300,
+      badNodeGuardEnabled: true,
+      badNodeCooldownUntilMs: 0,
+      manualImmediate: false,
+    });
+    assert.equal(block5m.allowedNow, false);
+    assert.equal(block5m.blockedBy, "cooldown");
+    assert.equal(block5m.waitSec, 260);
+
+    // 2) 불량 노드 쿨다운(50초)보다 설정된 생성 간격(260초 남음)이 더 길면 더 긴 260초(Math.max)를 유지해야 함!
+    const both = srv.computeNextAutoSpawnEligibility({
+      nowMs,
+      lastTriggeredAt: "2026-11-27T14:09:20.000Z",
+      cooldownSec: 300,
+      badNodeGuardEnabled: true,
+      badNodeCooldownUntilMs: nowMs + 50000,
+      manualImmediate: false,
+    });
+    assert.equal(both.allowedNow, false);
+    assert.equal(both.waitSec, 260);
+
+    // 3) 5분이 모두 경과했더라도 불량 노드 쿨다운이 활성 중이면 차단되어야 함
+    const badOnly = srv.computeNextAutoSpawnEligibility({
+      nowMs,
+      lastTriggeredAt: "2026-11-27T14:00:00.000Z",
+      cooldownSec: 300,
+      badNodeGuardEnabled: true,
+      badNodeCooldownUntilMs: nowMs + 95000,
+      manualImmediate: false,
+    });
+    assert.equal(badOnly.allowedNow, false);
+    assert.equal(badOnly.blockedBy, "bad_node_cooldown");
+    assert.equal(badOnly.waitSec, 95);
+
+    // 4) 5분 이상 경과하고 불량 노드 쿨다운도 없으면 정상 1개 생성 허용
+    const ok = srv.computeNextAutoSpawnEligibility({
+      nowMs,
+      lastTriggeredAt: "2026-11-27T14:04:55.000Z",
+      cooldownSec: 300,
+      badNodeGuardEnabled: true,
+      badNodeCooldownUntilMs: 0,
+      manualImmediate: false,
+    });
+    assert.equal(ok.allowedNow, true);
+
+    // 5) 코드 구조 검증: multi-spawn burst loop(`maxRefillSteps`) 및 `targetPending === 0 &&` 우회 조건이 완전히 제거되었는지 확인
+    assert.equal(serverSrc.includes("maxRefillSteps"), false, "단일 틱 연사 루프(maxRefillSteps)가 제거되어야 함");
+    assert.equal(
+      serverSrc.includes("targetPending === 0 && state.config.badNodeGuardEnabled"),
+      false,
+      "targetPending > 0 일 때도 불량 노드 쿨다운이 동일하게 적용되어야 함"
+    );
   });
 });
