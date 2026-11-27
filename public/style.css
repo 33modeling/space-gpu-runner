@@ -993,3 +993,70 @@ details.clean-details > summary:hover {
   color: #ffffff;
   text-decoration: none;
 }
+
+/* =========================================================================
+   Batch 7 (v3.1) - Feature 6: Mobile & Tablet Responsive Pocket UX
+   Desktop (>768px) remains 100% untouched.
+   ========================================================================= */
+@media (max-width: 768px) {
+  .topbar {
+    padding: 12px 14px;
+    gap: 10px;
+  }
+  .page-nav {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 2px;
+  }
+  .page-tab {
+    flex-shrink: 0;
+    padding: 7px 12px;
+    font-size: 12.5px;
+  }
+  .status-bar {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .container {
+    padding: 14px 12px 48px;
+  }
+  .card {
+    padding: 16px 14px;
+    border-radius: 12px;
+  }
+  .card-subtle {
+    padding: 12px 12px;
+  }
+  .kpi-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  .form-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .form-group[style*="span 2"] {
+    grid-column: span 1 !important;
+  }
+  table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+  button.sm {
+    min-height: 32px;
+    padding: 6px 10px;
+  }
+}
+
+@media (max-width: 480px) {
+  .brand-title {
+    font-size: 14.5px;
+  }
+  .slot-grid {
+    grid-template-columns: 1fr !important;
+  }
+}

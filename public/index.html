@@ -14,7 +14,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="/style.css?v=7" />
+  <link rel="stylesheet" href="/style.css?v=8" />
 </head>
 <body>
   <!-- Password Gate Modal -->
@@ -343,6 +343,52 @@
         <div id="presetsBarPanel" class="card-subtle" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
           <div style="font-size:12.5px; color:var(--muted);">프리셋을 불러오는 중...</div>
         </div>
+
+        <!-- Batch 7: 규칙 비교 & 실험 종합 리포트 결과 패널 (열었을 때만 표시) -->
+        <div id="ruleDiffOrReportPanel" class="card-subtle" style="display:none; margin-top:14px;"></div>
+
+        <!-- Batch 7: 시각 예약 오토파일럿 & 버전 간 비교 도구 -->
+        <details class="clean-details" style="margin-top:14px;">
+          <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <span>시각 예약 오토파일럿 (야간 · 주말 예약 실행) 및 버전 간 설정 비교</span>
+            <span id="scheduledActionsCountBadge" class="badge mono">예약 0건</span>
+          </summary>
+          <div style="margin-top:14px; display:flex; flex-direction:column; gap:14px;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <select id="schedTargetJobSelect" style="min-width:130px;"></select>
+              <select id="schedActionTypeSelect" onchange="onChangeSchedActionType(this.value)">
+                <option value="set_target">목표 워커 수 변경</option>
+                <option value="toggle_job">자동 생성 ON / OFF</option>
+                <option value="start_drain">무중단 드레이닝 교체</option>
+                <option value="set_command">실행 명령어 변경</option>
+              </select>
+              <span id="schedDynamicArgWrap" style="display:inline-flex; align-items:center; gap:6px;">
+                <input type="number" id="schedTargetWorkersInput" value="30" min="1" max="9999" class="mono" style="width:84px;" placeholder="워커수" />
+                <span class="txt-muted" style="font-size:12px;">워커</span>
+              </span>
+              <select id="schedTimePresetSelect" onchange="onSelectSchedTimePreset(this.value)">
+                <option value="60">1시간 뒤</option>
+                <option value="180">3시간 뒤</option>
+                <option value="tonight23">오늘 23:00</option>
+                <option value="tomorrow09">내일 09:00</option>
+                <option value="monday0830">월요일 08:30</option>
+                <option value="custom">직접 시각 지정</option>
+              </select>
+              <input type="datetime-local" id="schedCustomDateTime" class="mono" style="display:none;" />
+              <button type="button" class="sm" onclick="addScheduledAutopilotAction()">+ 예약 등록</button>
+              <button type="button" class="secondary sm" onclick="clearDoneScheduledActions()">완료 내역 정리</button>
+            </div>
+            <div id="scheduledActionsListBox" style="font-size:12.5px;"></div>
+
+            <div style="padding-top:12px; border-top:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span class="txt-muted" style="font-size:12.5px; font-weight:600;">규칙 간 설정 비교 (Diff):</span>
+              <select id="diffJobSelectA" style="min-width:120px;"></select>
+              <span class="txt-muted">vs</span>
+              <select id="diffJobSelectB" style="min-width:120px;"></select>
+              <button type="button" class="secondary sm" onclick="compareSelectedJobRules()">변경점 비교</button>
+            </div>
+          </div>
+        </details>
       </div>
 
       <!-- 3-B. 규칙 작성 / 수정 폼 (깔끔한 입력 위주, 과도한 프리셋 버튼 제거) -->
@@ -585,6 +631,7 @@
             <button type="button" class="secondary sm" onclick="browseSfmFiles()">폴더 열기</button>
             <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/group-volume'; browseSfmFiles()">/group-volume</button>
             <button type="button" class="secondary sm" onclick="document.getElementById('sfmBrowsePath').value='/user-volume'; browseSfmFiles()">/user-volume</button>
+            <button type="button" class="secondary sm" onclick="aggregateSfmFolderJsonl()" title="현재 폴더 내 .jsonl / .json 결과 파일들의 총 샘플 수와 평균 지표(reward, score, loss 등)를 즉시 집계합니다">.jsonl 결과 집계</button>
           </div>
           <div id="sfmFilesList" class="pill-list" style="margin-top:10px; max-height:150px; overflow-y:auto;"></div>
           <!-- Batch 6: 볼륨 데이터 · 결과 파일(.jsonl, .json, .yaml, .csv, .log) 빠른 미리보기 & 다운로드 -->
@@ -1001,6 +1048,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=29"></script>
+  <script src="/app.js?v=30"></script>
 </body>
 </html>

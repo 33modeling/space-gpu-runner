@@ -1,10 +1,10 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v3.0.0`
+- **문서 버전**: `v3.1.0`
 - **최종 검증일**: `2026-11-27`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **72개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **78개** 케이스)
 
 ---
 
@@ -178,6 +178,12 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-70** | Suite 6 (반복불량노드격리) | `evaluateProblemNodeQuarantine` | 동일 노드 반복 크래시 격리 판별 및 적응형 우회 쿨다운 확대 검증 | ✅ PASS |
 | **TC-71** | Suite 6 (볼륨결과미리보기) | `slicePreviewContent` | `.jsonl` 등 대용량 결과 텍스트 앞/뒤 줄 슬라이싱 및 바이트 절삭 검증 | ✅ PASS |
 | **TC-72** | Suite 6 (명령팔레트파서) | `parseQuickPaletteCommand` | `Ctrl+K` 명령창 단축 구문(`v9 30`, `v9 120g`, `log 5`, `grep`) 파싱 검증 | ✅ PASS |
+| **TC-73** | Suite 6 (시각예약오토파일럿) | `evaluateDueScheduledActions` | 사이트별 도래 예약 작업 추출 및 시간순 정렬 검증 | ✅ PASS |
+| **TC-74** | Suite 6 (규칙복제/변경점비교) | `buildClonedJobRule` & `diffJobRules` | `v9 ➔ v10` 스마트 복제(안전 OFF 초기화) 및 설정 Diff 산출 검증 | ✅ PASS |
+| **TC-75** | Suite 6 (SSE실시간스트림) | `GET /api/events` & `EventSource` | 실시간 SSE 스트림 연결 프레임 수신 및 비활성 탭 절전 폴링 검증 | ✅ PASS |
+| **TC-76** | Suite 6 (실험종합리포트) | `generateJobExperimentReport` | 누적 GPU-Hours·회수·수렴 요약 Markdown·CSV 성적표 생성 검증 | ✅ PASS |
+| **TC-77** | Suite 6 (샤드결과집계기) | `aggregateJsonlMetrics` | 분산 `.jsonl` 샤드 샘플 수 및 `reward`/`loss` 평균·최소·최대 산출 검증 | ✅ PASS |
+| **TC-78** | Suite 6 (모바일반응형UX) | `public/style.css` | `@media (max-width: 768px)` 모바일·태블릿 반응형 규칙 무결성 검증 | ✅ PASS |
 
 ---
 

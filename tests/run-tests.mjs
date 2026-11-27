@@ -109,6 +109,12 @@ function createServerLogicSandbox() {
     "appendMetricSeriesSample",
     "evaluateProblemNodeQuarantine",
     "slicePreviewContent",
+    "evaluateDueScheduledActions",
+    "incrementVersionToken",
+    "buildClonedJobRule",
+    "diffJobRules",
+    "generateJobExperimentReport",
+    "aggregateJsonlMetrics",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -136,6 +142,7 @@ function createServerLogicSandbox() {
     Promise,
     Infinity,
     decodeURIComponent,
+    structuredClone,
     fs,
     path,
     process,
@@ -1100,12 +1107,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=29`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=30`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
-      fetch(`${BASE_URL}/style.css?v=7`),
-      fetch(`${BASE_URL}/app.js?v=29`),
+      fetch(`${BASE_URL}/style.css?v=8`),
+      fetch(`${BASE_URL}/app.js?v=30`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1113,7 +1120,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=29"), true, "라이브 index.html이 최신 캐시버전 app.js?v=29를 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=30"), true, "라이브 index.html이 최신 캐시버전 app.js?v=30을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -1890,5 +1897,132 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     const c4 = ui.parseQuickPaletteCommand("grep reward=", jobs);
     assert.equal(c4.type, "grep");
     assert.equal(c4.query, "reward=");
+  });
+
+  test("TC-73: [Batch 7 - Feature 1] `evaluateDueScheduledActions` 시각 예약 오토파일럿 사이트 격리 및 도래 순서 판정 검증", () => {
+    const nowMs = Date.parse("2026-11-27T14:00:00.000Z");
+    const actions = [
+      { id: "a1", siteId: "n9", status: "pending", runAt: "2026-11-27T13:55:00.000Z", actionType: "set_target" },
+      { id: "a2", siteId: "n9", status: "pending", runAt: "2026-11-27T13:30:00.000Z", actionType: "toggle_job" },
+      { id: "a3", siteId: "n6", status: "pending", runAt: "2026-11-27T13:00:00.000Z", actionType: "set_target" },
+      { id: "a4", siteId: "n9", status: "executed", runAt: "2026-11-27T12:00:00.000Z", actionType: "set_target" },
+      { id: "a5", siteId: "n9", status: "pending", runAt: "2026-11-27T15:00:00.000Z", actionType: "set_target" }, // future
+    ];
+    const due = srv.evaluateDueScheduledActions(actions, nowMs, "n9");
+    assert.deepEqual(
+      [...due.map((x) => x.id)],
+      ["a2", "a1"],
+      "n9 사이트의 미실행 도래 건만 시간순(a2 -> a1)으로 추출되어야 함"
+    );
+  });
+
+  test("TC-74: [Batch 7 - Feature 2] `buildClonedJobRule` & `diffJobRules` 원클릭 버전업 복제(`v9 ➔ v10`) 및 변경점 비교 검증", () => {
+    const srcV9 = {
+      id: "job-v9",
+      name: "v9",
+      enabled: true,
+      draining: true,
+      minConcurrentRuns: 24,
+      coreCount: 4,
+      targetPendingRuns: 6,
+      allowSpot: true,
+      executionCommand: "sh /user-volume/offpolicy-misranking/v9/run.sh",
+      watchOutputDir: "/user-volume/offpolicy-misranking/v9/outputs",
+      taskQueueCompletedIdx: [1, 2],
+    };
+    const cloned = srv.buildClonedJobRule(srcV9);
+    assert.equal(cloned.name, "v10");
+    assert.equal(cloned.enabled, false, "복제 직후에는 안전한 점검을 위해 일시정지(false) 상태여야 함");
+    assert.equal(cloned.draining, false);
+    assert.equal(cloned.executionCommand, "sh /user-volume/offpolicy-misranking/v10/run.sh");
+    assert.equal(cloned.watchOutputDir, "/user-volume/offpolicy-misranking/v10/outputs");
+    assert.equal(cloned.taskQueueCompletedIdx.length, 0);
+
+    const diff = srv.diffJobRules(srcV9, cloned);
+    assert.equal(diff.identical, false);
+    assert.equal(diff.diffs.some((d) => d.field === "executionCommand"), true);
+  });
+
+  test("TC-75: [Batch 7 - Feature 3] 실시간 SSE 스트림(`GET /api/events`) 연결 핸드셰이크 및 백그라운드 탭 절전 폴링 검증", async (t) => {
+    assert.equal(appJsSrc.includes("new EventSource("), true);
+    assert.equal(appJsSrc.includes("document.hidden ? Math.max(baseSec * 5, 25)"), true);
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 SSE 스트림 스킵");
+
+    const ac = new AbortController();
+    const res = await fetch(`${BASE_URL}/api/events?pw=${encodeURIComponent(ADMIN_PW)}`, { signal: ac.signal });
+    assert.equal(res.status, 200);
+    assert.equal(String(res.headers.get("content-type") || "").includes("text/event-stream"), true);
+    const reader = res.body.getReader();
+    const { value } = await reader.read();
+    const firstChunk = new TextDecoder().decode(value);
+    ac.abort();
+    assert.equal(firstChunk.includes("event: connected"), true, "SSE 초기 연결 이벤트 프레임이 즉시 수신되어야 함");
+  });
+
+  test("TC-76: [Batch 7 - Feature 4] `generateJobExperimentReport` 및 `GET /api/jobs/report` Markdown·CSV 성적표 생성 검증", async (t) => {
+    const job = {
+      id: "job-v9",
+      name: "v9",
+      minConcurrentRuns: 24,
+      coreCount: 4,
+      allowSpot: true,
+      expectedRunTime: "8h",
+      executionCommand: "sh /user-volume/offpolicy-misranking/v9/run.sh",
+    };
+    const runs = [
+      { id: "1", status: "RUNNING", registerTime: "2026-11-27T08:00:00Z", startTime: "2026-11-27T08:04:00Z" },
+      { id: "2", status: "SUCCEEDED", registerTime: "2026-11-27T01:00:00Z", startTime: "2026-11-27T01:02:00Z" },
+      { id: "3", status: "PREEMPTED" },
+    ];
+    const rep = srv.generateJobExperimentReport(
+      job,
+      runs,
+      { jobGpuHours: { v9: 1180.5 }, todayJobGpuHours: { v9: 412.2 }, metricSeries: [{ avgLoss: 0.92 }, { avgLoss: 0.44 }] },
+      { throughputSummary: { totalThroughput: 96.5, speedUnit: "step/s" } }
+    );
+    assert.equal(rep.totalGpuHours, 1180.5);
+    assert.equal(rep.runningCount, 1);
+    assert.equal(rep.succeededCount, 1);
+    assert.equal(rep.preemptedCount, 1);
+    assert.equal(rep.markdown.includes("1180.5 GPU-h"), true);
+    assert.equal(rep.csv.includes("v9"), true);
+
+    if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 라이브 리포트 API 스킵");
+    const liveRes = await fetch(`${BASE_URL}/api/jobs/report`, { headers: { "X-Admin-Password": ADMIN_PW } });
+    assert.equal(liveRes.status, 200);
+    const liveJson = await liveRes.json();
+    assert.equal(liveJson.ok, true);
+    assert.equal(typeof liveJson.report?.markdown, "string");
+  });
+
+  test("TC-77: [Batch 7 - Feature 5] `aggregateJsonlMetrics` 분산 샤드 `.jsonl`/`.json` 샘플 수 및 수치 지표 자동 집계 검증", () => {
+    const files = [
+      {
+        fileName: "shard_0.jsonl",
+        content: [
+          '{"step": 1, "reward": 0.8, "loss": 0.4}',
+          '{"step": 2, "reward": 1.0, "loss": 0.2}',
+          "BROKEN_JSON_LINE",
+        ].join("\n"),
+      },
+      {
+        fileName: "shard_1.jsonl",
+        content: '{"step": 3, "reward": 0.6, "loss": 0.3}\n',
+      },
+    ];
+    const agg = srv.aggregateJsonlMetrics(files);
+    assert.equal(agg.scannedFiles, 2);
+    assert.equal(agg.totalRecords, 3);
+    assert.equal(agg.malformedLines, 1);
+    const rewardStat = agg.metrics.find((m) => m.key === "reward");
+    assert.equal(rewardStat.mean, 0.8);
+    assert.equal(rewardStat.min, 0.6);
+    assert.equal(rewardStat.max, 1.0);
+  });
+
+  test("TC-78: [Batch 7 - Feature 6] 모바일·태블릿 반응형 CSS(`@media (max-width: 768px)`) 무결성 검증", () => {
+    const styleCss = fs.readFileSync(path.join(ROOT_DIR, "public", "style.css"), "utf-8");
+    assert.equal(styleCss.includes("@media (max-width: 768px)"), true);
+    assert.equal(styleCss.includes("@media (max-width: 480px)"), true);
   });
 });

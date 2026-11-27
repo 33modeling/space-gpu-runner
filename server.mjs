@@ -218,6 +218,7 @@ const DEFAULT_STATE = {
   history: [],
   approvalHistory: [],
   alerts: [],
+  scheduledActions: [],
   activeSiteId: "n9",
   sites: {
     n9: {
@@ -569,6 +570,7 @@ function loadState() {
         history: rawHistory,
         approvalHistory: rawApprovalHistory,
         alerts: rawAlerts,
+        scheduledActions: Array.isArray(raw.scheduledActions) ? raw.scheduledActions.slice(-200) : [],
       };
     }
   } catch (e) {
@@ -764,6 +766,40 @@ function saveState() {
   }
 }
 
+const sseClients = new Set();
+let sseCoalesceTimer = null;
+
+function broadcastSseEvent(eventName = "state_changed", payload = {}) {
+  if (sseClients.size === 0) return;
+  if (eventName === "state_changed") {
+    if (sseCoalesceTimer) return;
+    sseCoalesceTimer = setTimeout(() => {
+      sseCoalesceTimer = null;
+      const frame = `event: state_changed\ndata: ${JSON.stringify({
+        ts: Date.now(),
+        ...payload,
+      })}\n\n`;
+      for (const client of Array.from(sseClients)) {
+        try {
+          client.res.write(frame);
+        } catch {
+          sseClients.delete(client);
+        }
+      }
+    }, 350);
+    if (typeof sseCoalesceTimer.unref === "function") sseCoalesceTimer.unref();
+    return;
+  }
+  const frame = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now(), ...payload })}\n\n`;
+  for (const client of Array.from(sseClients)) {
+    try {
+      client.res.write(frame);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
 function addLog(level, message, meta = {}) {
   const nowIso = new Date().toISOString();
   const sid = normalizeSiteId(meta.siteId || getCurrentSiteId());
@@ -807,6 +843,7 @@ function addLog(level, message, meta = {}) {
     }
   }
   saveState();
+  broadcastSseEvent("state_changed", { siteId: sid, level, summary: msgStr.slice(0, 120) });
 }
 
 function sanitizeGroupId(val) {
@@ -4696,6 +4733,397 @@ function slicePreviewContent(rawText = "", { mode = "tail", maxLines = 100, maxB
   };
 }
 
+// =========================================================================
+// Batch 7 Helpers (v3.1): Scheduled Autopilot, Rule Clone/Diff, Experiment Report & JSONL Aggregator
+// =========================================================================
+function evaluateDueScheduledActions(actions = [], nowMs = Date.now(), siteId = "") {
+  const normSid = siteId ? normalizeSiteId(siteId) : "";
+  const due = [];
+  for (const item of Array.isArray(actions) ? actions : []) {
+    if (!item || item.status !== "pending") continue;
+    if (normSid && normalizeSiteId(item.siteId || "n9") !== normSid) continue;
+    const runAtMs = item.runAt ? new Date(item.runAt).getTime() : NaN;
+    if (!Number.isNaN(runAtMs) && runAtMs <= nowMs) {
+      due.push(item);
+    }
+  }
+  due.sort((a, b) => new Date(a.runAt).getTime() - new Date(b.runAt).getTime());
+  return due;
+}
+
+async function executeDueScheduledActions(nowMs = Date.now()) {
+  if (!Array.isArray(rawState.scheduledActions) || rawState.scheduledActions.length === 0) {
+    return [];
+  }
+  const activeSid = getCurrentSiteId();
+  const dueItems = evaluateDueScheduledActions(rawState.scheduledActions, nowMs, activeSid);
+  if (dueItems.length === 0) return [];
+
+  const executedResults = [];
+  for (const act of dueItems) {
+    const targetJob =
+      state.jobs.find((j) => String(j.id) === String(act.jobId)) ||
+      state.jobs.find((j) => String(j.name) === String(act.jobName)) ||
+      null;
+    if (!targetJob) {
+      act.status = "failed";
+      act.executedAt = new Date(nowMs).toISOString();
+      act.resultMessage = `대상 규칙(${act.jobName || act.jobId})을 찾을 수 없습니다.`;
+      continue;
+    }
+
+    try {
+      let summary = "";
+      if (act.actionType === "set_target") {
+        const nextW = Math.max(1, Number(act.targetWorkers || targetJob.minConcurrentRuns || 1));
+        targetJob.minConcurrentRuns = nextW;
+        if (act.targetPending !== undefined && act.targetPending !== null && act.targetPending !== "") {
+          targetJob.targetPendingRuns = Math.max(0, Number(act.targetPending));
+        }
+        targetJob._pendingRefillImmediate = true;
+        summary = `[${targetJob.name}] 목표 워커 ${nextW}개(${nextW * Math.max(1, Number(targetJob.coreCount || 1))} GPU)로 자동 변경`;
+      } else if (act.actionType === "toggle_job") {
+        const nextOn = Boolean(act.enabled);
+        targetJob.enabled = nextOn;
+        if (nextOn) {
+          targetJob.draining = false;
+          targetJob._pendingRefillImmediate = true;
+          state.config.schedulerEnabled = true;
+        }
+        summary = `[${targetJob.name}] 자동 생성 ${nextOn ? "ON 활성화" : "일시정지(OFF)"}`;
+      } else if (act.actionType === "start_drain") {
+        targetJob.draining = true;
+        targetJob.drainNextJobId = String(act.drainNextJobId || "");
+        const nextJob = targetJob.drainNextJobId
+          ? state.jobs.find((j) => String(j.id) === targetJob.drainNextJobId)
+          : null;
+        if (nextJob) {
+          nextJob.enabled = true;
+          nextJob.draining = false;
+        }
+        summary = `[${targetJob.name}] 무중단 드레이닝 개시${nextJob ? ` → 후속 [${nextJob.name}] 자동 인계` : ""}`;
+      } else if (act.actionType === "set_command") {
+        const cmd = String(act.executionCommand || "").trim();
+        if (cmd) {
+          targetJob.executionCommand = cmd;
+          targetJob._stage2Transitioned = false;
+        }
+        summary = `[${targetJob.name}] 실행 명령어 예약 교체 완료 (${cmd})`;
+      } else {
+        throw new Error(`알 수 없는 예약 동작: ${act.actionType}`);
+      }
+
+      act.status = "executed";
+      act.executedAt = new Date(nowMs).toISOString();
+      act.resultMessage = summary;
+      executedResults.push(act);
+      addLog("success", `⏰ [시각 예약 오토파일럿 실행] ${summary}`);
+      await pushAlertNotification(
+        "success",
+        `⏰ 예약 작업 실행 완료 (${targetJob.name})`,
+        summary,
+        { scheduleId: act.id, dedupeKey: `sched-exec-${act.id}` }
+      );
+    } catch (err) {
+      act.status = "failed";
+      act.executedAt = new Date(nowMs).toISOString();
+      act.resultMessage = err.message;
+    }
+  }
+  saveState();
+  return executedResults;
+}
+
+function incrementVersionToken(str = "") {
+  const s = String(str ?? "");
+  if (!s) return s;
+  let replaced = false;
+  const out = s.replace(/(^|[^a-zA-Z0-9])v(\d+)(?=$|[^a-zA-Z0-9])/gi, (match, prefix, numStr) => {
+    replaced = true;
+    const nextNum = Number(numStr) + 1;
+    const vChar = match.includes("V") && !match.includes("v") ? "V" : "v";
+    return `${prefix}${vChar}${nextNum}`;
+  });
+  return replaced ? out : s;
+}
+
+function buildClonedJobRule(sourceJob, overrides = {}) {
+  const src = sourceJob && typeof sourceJob === "object" ? sourceJob : {};
+  const srcName = String(src.name || "worker").trim();
+  const bumpedName = incrementVersionToken(srcName);
+  const defaultNewName = bumpedName !== srcName ? bumpedName : `${srcName}-copy`;
+  const finalName = String(overrides.name || defaultNewName).trim();
+
+  let nextCmd = String(overrides.executionCommand || src.executionCommand || "bash /group-volume/run.sh").trim();
+  if (!overrides.executionCommand && bumpedName !== srcName) {
+    nextCmd = incrementVersionToken(nextCmd);
+  }
+  let nextWatchDir = String(overrides.watchOutputDir ?? src.watchOutputDir ?? "").trim();
+  if (overrides.watchOutputDir === undefined && nextWatchDir && bumpedName !== srcName) {
+    nextWatchDir = incrementVersionToken(nextWatchDir);
+  }
+
+  return {
+    ...structuredClone(src),
+    id: String(overrides.id || `job-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`),
+    name: finalName,
+    enabled: Boolean(overrides.enabled ?? false),
+    draining: false,
+    drainNextJobId: "",
+    executionCommand: nextCmd,
+    watchOutputDir: nextWatchDir,
+    taskQueueCompletedIdx: [],
+    taskQueueRunMap: {},
+    _stage2Transitioned: false,
+    _budgetWarn80Sent: false,
+    _knownPendingRunIds: [],
+    _pendingRefillImmediate: false,
+    lastCheckAt: null,
+    lastTriggeredAt: null,
+    lastRunId: null,
+    lastStatus: `📋 [${srcName}]에서 복제됨 (점검 후 ON으로 활성화하세요)`,
+  };
+}
+
+function diffJobRules(jobA, jobB) {
+  const a = jobA || {};
+  const b = jobB || {};
+  const fields = [
+    ["executionCommand", "실행 명령어"],
+    ["minConcurrentRuns", "목표 워커 수"],
+    ["coreCount", "워커당 GPU 수"],
+    ["targetPendingRuns", "목표 Pending 대기 수"],
+    ["allowSpot", "Spot 인스턴스 사용"],
+    ["containerImage", "컨테이너 이미지"],
+    ["expectedRunTime", "컨테이너 제한 시간"],
+    ["cooldownSec", "생성 간격(초)"],
+    ["priority", "우선순위"],
+    ["maxGpuHours", "GPU-Hours 예산 상한"],
+    ["watchOutputDir", "산출물 감시 폴더"],
+    ["groupPoolId", "그룹 Pool ID"],
+    ["coreId", "Core ID"],
+    ["taskQueueItems", "태스크 큐 항목 수"],
+  ];
+  const diffs = [];
+  for (const [key, label] of fields) {
+    const rawA = key === "taskQueueItems" ? (Array.isArray(a[key]) ? a[key].length : 0) : a[key] ?? "";
+    const rawB = key === "taskQueueItems" ? (Array.isArray(b[key]) ? b[key].length : 0) : b[key] ?? "";
+    if (String(rawA) !== String(rawB)) {
+      diffs.push({
+        field: key,
+        label,
+        valueA: rawA,
+        valueB: rawB,
+      });
+    }
+  }
+  return {
+    nameA: a.name || "-",
+    nameB: b.name || "-",
+    identical: diffs.length === 0,
+    diffCount: diffs.length,
+    diffs,
+  };
+}
+
+function generateJobExperimentReport(job, matchingRuns = [], siteTel = {}, fleetJob = null, nowMs = Date.now()) {
+  const j = job || {};
+  const jName = j.name || "experiment";
+  const coreCount = Math.max(1, Number(j.coreCount || 1));
+  const totalGpuHours = Math.round(Number(siteTel?.jobGpuHours?.[jName] || 0) * 100) / 100;
+  const todayGpuHours = Math.round(Number(siteTel?.todayJobGpuHours?.[jName] || 0) * 100) / 100;
+
+  let runningCnt = 0;
+  let pendingCnt = 0;
+  let succeededCnt = 0;
+  let failedCnt = 0;
+  let preemptedCnt = 0;
+  const waitSecs = [];
+
+  for (const r of Array.isArray(matchingRuns) ? matchingRuns : []) {
+    const stRaw = String(r.status || r.state || r.phase || "");
+    const cls = classifyRunStatus(stRaw);
+    if (cls === "ACTIVE") {
+      if (stRaw.toUpperCase().includes("RUNNING")) runningCnt += 1;
+      else pendingCnt += 1;
+    } else if (cls === "SUCCEEDED") {
+      succeededCnt += 1;
+    } else {
+      failedCnt += 1;
+      if (isSpotPreemptedRun(r)) preemptedCnt += 1;
+    }
+    const regMs = r.registerTime ? new Date(r.registerTime).getTime() : 0;
+    const stMs = r.startTime ? new Date(r.startTime).getTime() : 0;
+    if (regMs > 0 && stMs >= regMs) {
+      waitSecs.push(Math.round((stMs - regMs) / 1000));
+    }
+  }
+  waitSecs.sort((a, b) => a - b);
+  const medianWaitMin =
+    waitSecs.length > 0 ? Math.round((waitSecs[Math.floor(waitSecs.length / 2)] / 60) * 10) / 10 : null;
+
+  const tp = fleetJob?.throughputSummary || {};
+  const mSeries = Array.isArray(siteTel?.metricSeries) ? siteTel.metricSeries : [];
+  const lossSamples = mSeries.map((x) => x.avgLoss).filter((v) => v !== null && v !== undefined);
+  const lossSummary =
+    lossSamples.length >= 2
+      ? `${lossSamples[0]} ➔ ${lossSamples[lossSamples.length - 1]}`
+      : tp.avgLoss !== undefined && tp.avgLoss !== null
+      ? String(tp.avgLoss)
+      : "-";
+  const throughputStr =
+    tp.totalThroughput && tp.speedUnit ? `${tp.totalThroughput} ${tp.speedUnit}` : "-";
+
+  const reportTimeKst = new Date(nowMs + 9 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ") + " KST";
+  const markdown = [
+    `## 📊 실험 종합 리포트: \`${jName}\``,
+    `- **생성 시각**: ${reportTimeKst}`,
+    `- **실행 명령어**: \`${j.executionCommand || "-"}\``,
+    `- **리소스 구성**: 목표 ${j.minConcurrentRuns || 1}워커 × ${coreCount} GPU = **총 ${(j.minConcurrentRuns || 1) * coreCount} GPU** (${j.allowSpot ? "Spot" : "Standard"} · 제한 ${j.expectedRunTime || "8h"})`,
+    ``,
+    `| 지표 항목 | 측정 결과 |`,
+    `| :--- | :--- |`,
+    `| **누적 투입 GPU-Hours** | **${totalGpuHours} GPU-h** (금일 +${todayGpuHours} GPU-h) |`,
+    `| **현재 가동 상태** | Running **${runningCnt}개** (${runningCnt * coreCount} GPU) · Pending **${pendingCnt}개** |`,
+    `| **컨테이너 수행 이력** | 성공(Succeeded) **${succeededCnt}건** · 실패/종료 **${failedCnt}건** (Spot 회수 ${preemptedCnt}건) |`,
+    `| **클러스터 배정 대기 중앙값** | ${medianWaitMin !== null ? `**${medianWaitMin}분**` : "-"} |`,
+    `| **평균 Loss 변화** | ${lossSummary} |`,
+    `| **현재 합산 처리량** | ${throughputStr} |`,
+  ].join("\n");
+
+  const csvRows = [
+    ["rule_name", "generated_at_kst", "total_gpu_hours", "today_gpu_hours", "running_workers", "pending_workers", "succeeded_runs", "failed_runs", "spot_preemptions", "median_wait_min", "loss_summary", "throughput", "command"],
+    [
+      jName,
+      reportTimeKst,
+      totalGpuHours,
+      todayGpuHours,
+      runningCnt,
+      pendingCnt,
+      succeededCnt,
+      failedCnt,
+      preemptedCnt,
+      medianWaitMin ?? "",
+      lossSummary,
+      throughputStr,
+      `"${String(j.executionCommand || "").replace(/"/g, '""')}"`,
+    ],
+  ];
+  const csv = "\uFEFF" + csvRows.map((r) => r.join(",")).join("\n");
+
+  return {
+    jobId: j.id,
+    jobName: jName,
+    generatedAt: reportTimeKst,
+    totalGpuHours,
+    todayGpuHours,
+    runningCount: runningCnt,
+    pendingCount: pendingCnt,
+    succeededCount: succeededCnt,
+    failedCount: failedCnt,
+    preemptedCount: preemptedCnt,
+    medianWaitMin,
+    lossSummary,
+    throughputStr,
+    markdown,
+    csv,
+  };
+}
+
+function aggregateJsonlMetrics(fileContentsList = []) {
+  const EXCLUDE_KEYS = new Set(["id", "idx", "index", "step", "epoch", "seed", "timestamp", "time", "created_at", "rank", "world_size", "shard"]);
+  const metricStats = {};
+  const perFile = [];
+  let totalRecords = 0;
+  let malformedLines = 0;
+
+  const recordNumericObj = (obj) => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (EXCLUDE_KEYS.has(k.toLowerCase())) continue;
+      if (typeof v === "number" && Number.isFinite(v)) {
+        if (!metricStats[k]) {
+          metricStats[k] = { key: k, count: 0, sum: 0, min: v, max: v };
+        }
+        const st = metricStats[k];
+        st.count += 1;
+        st.sum += v;
+        if (v < st.min) st.min = v;
+        if (v > st.max) st.max = v;
+      } else if (typeof v === "boolean") {
+        const numB = v ? 1 : 0;
+        if (!metricStats[k]) {
+          metricStats[k] = { key: k, count: 0, sum: 0, min: numB, max: numB };
+        }
+        const st = metricStats[k];
+        st.count += 1;
+        st.sum += numB;
+        if (numB < st.min) st.min = numB;
+        if (numB > st.max) st.max = numB;
+      }
+    }
+  };
+
+  for (const fItem of Array.isArray(fileContentsList) ? fileContentsList : []) {
+    const fileName = String(fItem?.fileName || "file");
+    const raw = String(fItem?.content || "").trim();
+    if (!raw) {
+      perFile.push({ fileName, records: 0 });
+      continue;
+    }
+    let fileRecords = 0;
+    if (fileName.toLowerCase().endsWith(".json") && (raw.startsWith("[") || raw.startsWith("{"))) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (const row of parsed) {
+            recordNumericObj(row);
+            fileRecords += 1;
+          }
+        } else {
+          recordNumericObj(parsed);
+          fileRecords += 1;
+        }
+      } catch {
+        malformedLines += 1;
+      }
+    } else {
+      const lines = raw.split(/\r?\n/);
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const obj = JSON.parse(t);
+          recordNumericObj(obj);
+          fileRecords += 1;
+        } catch {
+          malformedLines += 1;
+        }
+      }
+    }
+    totalRecords += fileRecords;
+    perFile.push({ fileName, records: fileRecords });
+  }
+
+  const metrics = Object.values(metricStats)
+    .map((m) => ({
+      key: m.key,
+      count: m.count,
+      mean: Math.round((m.sum / Math.max(1, m.count)) * 10000) / 10000,
+      min: Math.round(m.min * 10000) / 10000,
+      max: Math.round(m.max * 10000) / 10000,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  return {
+    scannedFiles: perFile.length,
+    totalRecords,
+    malformedLines,
+    metrics,
+    perFile,
+  };
+}
+
 /**
  * Feature 1, 2, 3, 6: Round-Robin Live Worker Log Scanner, Progress Parser,
  * Goal Completion / Stage-2 Pipeline Detector & Hardware Bad-Node Detector.
@@ -7152,6 +7580,8 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
 async function runSchedulerTick(manual = false, options = {}) {
   const rt = getSiteRuntime();
   if (rt.isTickRunning) return { skipped: true, reason: "Already running tick" };
+  // Batch 7 - Feature 1: Always check scheduled actions even if auto-scheduler is paused (so scheduled ON actions fire on time!)
+  await executeDueScheduledActions().catch(() => {});
   if (!manual && !state.config.schedulerEnabled) return { skipped: true, reason: "Scheduler disabled" };
   if (!state.config.accessToken) {
     return { skipped: true, reason: "Access Token이 아직 설정되지 않았습니다." };
@@ -8001,6 +8431,33 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // 0-SSE. Batch 7 - Feature 3: Real-Time Server-Sent Events Stream (`GET /api/events`)
+    if (pathname === "/api/events" && req.method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(`event: connected\ndata: ${JSON.stringify({ ok: true, siteId: getCurrentSiteId(), ts: Date.now() })}\n\n`);
+      const clientRecord = { res, siteId: getCurrentSiteId(), connectedAt: Date.now() };
+      sseClients.add(clientRecord);
+      const hb = setInterval(() => {
+        try {
+          res.write(`: ping ${Date.now()}\n\n`);
+        } catch {
+          clearInterval(hb);
+          sseClients.delete(clientRecord);
+        }
+      }, 18000);
+      if (typeof hb.unref === "function") hb.unref();
+      req.on("close", () => {
+        clearInterval(hb);
+        sseClients.delete(clientRecord);
+      });
+      return;
+    }
+
     // 0. Multi-Site Management Endpoints (`GET /api/sites`, `POST /api/sites/select`, `POST /api/sites`, `DELETE /api/sites/:id`)
     if (pathname === "/api/sites" && req.method === "GET") {
       return sendJson(res, 200, {
@@ -8164,6 +8621,10 @@ const server = http.createServer(async (req, res) => {
         },
         jobs: state.jobs,
         presets: state.presets || [],
+        scheduledActions: (rawState.scheduledActions || [])
+          .filter((a) => normalizeSiteId(a?.siteId || "n9") === activeSid)
+          .slice(-50)
+          .reverse(),
         telemetry: fleet.telemetry,
         history: siteHistory.slice(0, 100),
         allHistory: (state.history || []).slice(0, 100),
@@ -9453,6 +9914,208 @@ const server = http.createServer(async (req, res) => {
         "Content-Disposition": `attachment; filename="${safeFileName}"`,
       });
       return res.end(rawContent);
+    }
+
+    // 8-A3i. Batch 7 (v3.1) Endpoints: Scheduled Actions, Rule Clone & Diff, Experiment Report, and SFM JSONL Aggregator
+    if (pathname === "/api/schedules" && req.method === "GET") {
+      const sid = getCurrentSiteId();
+      const items = (rawState.scheduledActions || [])
+        .filter((a) => normalizeSiteId(a?.siteId || "n9") === sid)
+        .slice(-50)
+        .reverse();
+      return sendJson(res, 200, { ok: true, scheduledActions: items });
+    }
+
+    if (pathname === "/api/schedules" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const sid = getCurrentSiteId();
+      const targetJob =
+        (body.jobId && state.jobs.find((j) => String(j.id) === String(body.jobId))) ||
+        state.jobs.find((j) => j.enabled) ||
+        state.jobs[0] ||
+        null;
+      if (!targetJob) return sendJson(res, 404, { error: "대상 규칙을 찾을 수 없습니다." });
+
+      let runAtMs = 0;
+      if (body.delayMinutes !== undefined && Number(body.delayMinutes) > 0) {
+        runAtMs = Date.now() + Math.round(Number(body.delayMinutes) * 60 * 1000);
+      } else if (body.runAt) {
+        runAtMs = new Date(body.runAt).getTime();
+      }
+      if (!runAtMs || Number.isNaN(runAtMs) || runAtMs < Date.now() - 60000) {
+        return sendJson(res, 400, { error: "유효한 미래 예약 시각을 지정해 주세요." });
+      }
+      const actionType = ["set_target", "toggle_job", "start_drain", "set_command"].includes(body.actionType)
+        ? body.actionType
+        : "set_target";
+
+      const item = {
+        id: `sched-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        siteId: sid,
+        runAt: new Date(runAtMs).toISOString(),
+        actionType,
+        jobId: targetJob.id,
+        jobName: targetJob.name,
+        targetWorkers: body.targetWorkers !== undefined ? Math.max(1, Number(body.targetWorkers || 1)) : undefined,
+        targetPending:
+          body.targetPending !== undefined && body.targetPending !== ""
+            ? Math.max(0, Number(body.targetPending))
+            : undefined,
+        enabled: body.enabled !== undefined ? Boolean(body.enabled) : true,
+        drainNextJobId: body.drainNextJobId ? String(body.drainNextJobId) : "",
+        executionCommand: body.executionCommand ? String(body.executionCommand).trim() : "",
+        status: "pending",
+        createdAt: new Date().toISOString(),
+        executedAt: null,
+        resultMessage: null,
+      };
+      if (!Array.isArray(rawState.scheduledActions)) rawState.scheduledActions = [];
+      rawState.scheduledActions.push(item);
+      if (rawState.scheduledActions.length > 200) {
+        rawState.scheduledActions = rawState.scheduledActions.slice(-200);
+      }
+      saveState();
+      addLog("info", `⏰ [예약 오토파일럿 등록] [${targetJob.name}] 예약 시각: ${new Date(runAtMs).toLocaleString("ko-KR")} (${actionType})`);
+      const items = rawState.scheduledActions
+        .filter((a) => normalizeSiteId(a?.siteId || "n9") === sid)
+        .slice(-50)
+        .reverse();
+      return sendJson(res, 200, { ok: true, item, scheduledActions: items });
+    }
+
+    if (pathname === "/api/schedules" && req.method === "DELETE") {
+      const id = String(parsedUrl.searchParams.get("id") || "").trim();
+      const clearDone = parsedUrl.searchParams.get("clearDone") === "1";
+      const sid = getCurrentSiteId();
+      if (clearDone) {
+        rawState.scheduledActions = (rawState.scheduledActions || []).filter(
+          (a) => normalizeSiteId(a?.siteId || "n9") !== sid || a.status === "pending"
+        );
+      } else if (id) {
+        rawState.scheduledActions = (rawState.scheduledActions || []).filter((a) => String(a.id) !== id);
+      }
+      saveState();
+      const items = (rawState.scheduledActions || [])
+        .filter((a) => normalizeSiteId(a?.siteId || "n9") === sid)
+        .slice(-50)
+        .reverse();
+      return sendJson(res, 200, { ok: true, scheduledActions: items });
+    }
+
+    if (pathname === "/api/jobs/clone" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const srcJob = state.jobs.find((j) => String(j.id) === String(body.jobId));
+      if (!srcJob) return sendJson(res, 404, { error: "복제할 원본 규칙을 찾을 수 없습니다." });
+      const cloned = buildClonedJobRule(srcJob, {
+        name: body.name ? String(body.name).trim() : undefined,
+        enabled: Boolean(body.enabled ?? false),
+      });
+      // Ensure unique rule name if collision exists
+      if (state.jobs.some((j) => j.name === cloned.name)) {
+        cloned.name = `${cloned.name}-${Math.floor(Math.random() * 90 + 10)}`;
+      }
+      state.jobs = [...state.jobs, cloned];
+      saveState();
+      addLog("info", `📋 [규칙 복제 완료] [${srcJob.name}] ➔ [${cloned.name}] (cmd: ${cloned.executionCommand})`);
+      return sendJson(res, 200, {
+        ok: true,
+        clonedJob: cloned,
+        jobs: state.jobs,
+        workerFleet: computeWorkerFleetStats(getSiteKnownRuns()),
+      });
+    }
+
+    if (pathname === "/api/jobs/diff" && req.method === "GET") {
+      const idA = String(parsedUrl.searchParams.get("a") || "").trim();
+      const idB = String(parsedUrl.searchParams.get("b") || "").trim();
+      const jobA = state.jobs.find((j) => String(j.id) === idA) || state.jobs[0];
+      const jobB = state.jobs.find((j) => String(j.id) === idB) || state.jobs[1] || state.jobs[0];
+      if (!jobA || !jobB) return sendJson(res, 404, { error: "비교할 규칙이 부족합니다." });
+      return sendJson(res, 200, { ok: true, diff: diffJobRules(jobA, jobB) });
+    }
+
+    if (pathname === "/api/jobs/report" && req.method === "GET") {
+      const jobId = String(parsedUrl.searchParams.get("jobId") || "").trim();
+      const fmt = String(parsedUrl.searchParams.get("format") || "json").toLowerCase();
+      const targetJob =
+        (jobId && state.jobs.find((j) => String(j.id) === jobId)) ||
+        state.jobs.find((j) => j.enabled) ||
+        state.jobs[0] ||
+        null;
+      if (!targetJob) return sendJson(res, 404, { error: "대상 규칙을 찾을 수 없습니다." });
+      const allRuns = getSiteKnownRuns().length > 0 ? getSiteKnownRuns() : await fetchCurrentRuns().catch(() => []);
+      const matchingRuns = allRuns.filter((r) => doesRunMatchJob(r, targetJob, state.jobs));
+      const fleet = computeWorkerFleetStats(allRuns);
+      const fleetJob = (fleet.jobs || []).find((jf) => jf.jobId === targetJob.id) || null;
+      const report = generateJobExperimentReport(
+        targetJob,
+        matchingRuns,
+        fleet.telemetry || getSiteTelemetryObject(),
+        fleetJob
+      );
+      if (fmt === "csv") {
+        res.writeHead(200, {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="experiment-report-${targetJob.name}.csv"`,
+        });
+        return res.end(report.csv);
+      }
+      if (fmt === "md") {
+        res.writeHead(200, {
+          "Content-Type": "text/markdown; charset=utf-8",
+          "Content-Disposition": `attachment; filename="experiment-report-${targetJob.name}.md"`,
+        });
+        return res.end(report.markdown);
+      }
+      return sendJson(res, 200, { ok: true, report });
+    }
+
+    if (pathname === "/api/space/sfm-aggregate" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const dirPath = String(body.dirPath || "").trim();
+      if (!dirPath) return sendJson(res, 400, { error: "집계할 볼륨 폴더 경로(dirPath)를 입력해 주세요." });
+      const maxFiles = toSafeInt(body.maxFiles, 25, 1, 60);
+      const rawListing = await listSfmFiles(dirPath);
+      const list = Array.isArray(rawListing)
+        ? rawListing
+        : rawListing?.items || rawListing?.results || rawListing?.data || rawListing?.files || [];
+      const dataFiles = list
+        .filter((f) => {
+          const isDir = Boolean(f?.isDir || f?.directory || f?.type === "directory" || f?.type === "dir");
+          if (isDir) return false;
+          const nm = String(f?.name || f?.fileName || f?.path || "").toLowerCase();
+          return nm.endsWith(".jsonl") || nm.endsWith(".json");
+        })
+        .slice(0, maxFiles);
+
+      const fileContentsList = [];
+      const batchSize = 5;
+      for (let i = 0; i < dataFiles.length; i += batchSize) {
+        const batch = dataFiles.slice(i, i + batchSize);
+        const batchRes = await Promise.all(
+          batch.map(async (f) => {
+            const nm = String(f?.name || f?.fileName || "data.jsonl");
+            const cPath =
+              f?.containerPath ||
+              `${dirPath.replace(/\/+$/, "")}/${nm}`;
+            try {
+              const rd = await readSfmFile(cPath);
+              return { fileName: nm, content: rd?.content || "" };
+            } catch {
+              return { fileName: nm, content: "" };
+            }
+          })
+        );
+        fileContentsList.push(...batchRes);
+      }
+
+      const summary = aggregateJsonlMetrics(fileContentsList);
+      return sendJson(res, 200, {
+        ok: true,
+        dirPath,
+        totalCandidateFiles: dataFiles.length,
+        ...summary,
+      });
     }
 
     // 8-A3e. Batch 4 - Feature 1: Pre-Flight Script & Syntax Validator (`POST /api/jobs/preflight`)

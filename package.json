@@ -1,6 +1,6 @@
 {
   "name": "space-gpu-runner",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "SPACE (space.n9.sr-cloud.com) Periodic GPU Allocator & Group-Volume Script Runner Web Server",
   "type": "module",
   "main": "server.mjs",

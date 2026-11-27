@@ -84,6 +84,7 @@ async function submitPassword(event) {
       overlay.style.display = "none";
     }
     showToast("🔓 인증 완료! 대시보드 데이터를 불러옵니다.");
+    connectSseEventStream();
     await loadServerState();
     if (serverState.config?.hasAccessToken) {
       discoverSpaceResources({ silent: true });
@@ -99,6 +100,7 @@ async function submitPassword(event) {
 
 function lockDashboard(msg = "") {
   sessionPassword = "";
+  disconnectSseEventStream();
   if (uiRefreshTimer) {
     clearInterval(uiRefreshTimer);
     uiRefreshTimer = null;
@@ -119,20 +121,19 @@ let lastKnownPendingApprovals = 0;
 let lastKnownActiveWorkerIdsSig = "";
 
 function applyUiRefreshInterval(sec) {
-  const cleanSec = Math.max(2, Math.min(600, Number(sec || 5)));
-  if (uiRefreshTimer && currentUiRefreshSec === cleanSec) return;
-  currentUiRefreshSec = cleanSec;
+  const baseSec = Math.max(2, Math.min(600, Number(sec || 5)));
+  const effectiveSec = typeof document !== "undefined" && document.hidden ? Math.max(baseSec * 5, 25) : baseSec;
+  if (uiRefreshTimer && currentUiRefreshSec === effectiveSec) return;
+  currentUiRefreshSec = effectiveSec;
   if (uiRefreshTimer) clearInterval(uiRefreshTimer);
   uiRefreshTimer = setInterval(async () => {
     if (!sessionPassword) return;
     bgRefreshTickCounter += 1;
     await loadServerState({ background: true });
-    // Avoid redundant back-to-back DOM redraws: /api/state already includes approvalLoopStats & timeline.
-    // Only poll /api/space/approvals or /api/space/runs when pending approvals exist, active runs changed, or every 3rd tick.
-    if (lastKnownPendingApprovals > 0 || bgRefreshTickCounter % 3 === 0) {
+    if (!document.hidden && (lastKnownPendingApprovals > 0 || bgRefreshTickCounter % 3 === 0)) {
       loadApprovals({ background: true });
     }
-  }, cleanSec * 1000);
+  }, effectiveSec * 1000);
 }
 
 let currentSiteId = localStorage.getItem("space_active_site_id") || "n9";
@@ -503,6 +504,7 @@ async function loadServerState(options = {}) {
     renderPresetsBar(data.presets || latestWorkerFleet?.presets || []);
     renderWorkerFleetBoard(latestWorkerFleet);
     renderJobsTable(data.jobs || [], latestWorkerFleet);
+    renderScheduledAutopilotPanel(data.scheduledActions || [], data.jobs || []);
     renderHistoryTable(data.history || []);
     applyUiRefreshInterval(data.config?.uiRefreshIntervalSec || 5);
 
@@ -3545,7 +3547,8 @@ function renderJobsTable(jobs, fleet = latestWorkerFleet) {
                 <button class="soft-success sm" onclick="triggerJobNow('${escapeJsStr(j.id)}')" title="이 규칙으로 워커 1개를 즉시 할당 및 승인합니다">+1 실행</button>
                 ${drainActionBtn}
                 <button class="secondary sm" onclick="selectAndEditJobRule('${escapeJsStr(j.id)}', true)">수정</button>
-                <button class="secondary sm" onclick="duplicateJobRule('${escapeJsStr(j.id)}')" title="이 규칙을 복제하여 새 규칙으로 추가합니다">복제</button>
+                <button class="secondary sm" onclick="duplicateJobRule('${escapeJsStr(j.id)}')" title="버전 번호(예: v9 ➔ v10)까지 스마트하게 올려 안전 복제(일시정지 상태)합니다">복제</button>
+                <button class="secondary sm" onclick="openJobExperimentReport('${escapeJsStr(j.id)}')" title="누적 GPU-Hours · 성공/회수 · 수렴 지표를 Markdown/CSV 리포트로 생성합니다">리포트</button>
                 <button class="danger sm" onclick="deleteJob('${escapeJsStr(j.id)}')">삭제</button>
               </div>
             </td>
@@ -3891,20 +3894,17 @@ async function saveAsNewJobRule() {
 
 async function duplicateJobRule(jobId) {
   try {
-    const existingJobs = Array.isArray(serverState?.jobs) ? serverState.jobs : [];
-    const target = existingJobs.find((j) => String(j.id) === String(jobId));
-    if (!target) return;
-    const cloned = {
-      ...target,
-      id: "job-" + Date.now(),
-      name: `${target.name}-${existingJobs.length + 1}`,
-      lastStatus: "신규 복제됨 (대기 중)",
-    };
-    focusedFleetJobId = cloned.id;
-    await api("/api/jobs", { method: "POST", body: JSON.stringify(cloned) });
+    const res = await api("/api/jobs/clone", {
+      method: "POST",
+      body: JSON.stringify({ jobId }),
+    });
+    const cloned = res?.clonedJob;
     await loadServerState();
-    loadJobToForm(cloned, true, false);
-    showToast(`📋 [${target.name}] 규칙을 복제하여 새 규칙 [${cloned.name}]을(를) 추가했습니다!`);
+    if (cloned) {
+      focusedFleetJobId = cloned.id;
+      loadJobToForm(cloned, false, false);
+      showToast(`📋 [${cloned.name}] 규칙 복제 완료! (일시정지 상태 — 명령어 점검 후 ON으로 켜주세요)`);
+    }
   } catch (e) {
     alert("규칙 복제 실패: " + e.message);
   }
@@ -6044,6 +6044,344 @@ document.addEventListener("keydown", (e) => {
     }
   }
 });
+
+// =========================================================================
+// Batch 7 (v3.1): SSE Real-Time Stream, Scheduled Autopilot, Rule Diff, Experiment Report & SFM JSONL Aggregator
+// =========================================================================
+let sseSource = null;
+let sseRefreshDebounceTimer = null;
+let latestExperimentReportMarkdown = "";
+
+function connectSseEventStream() {
+  disconnectSseEventStream();
+  if (!sessionPassword || typeof EventSource === "undefined") return;
+  try {
+    const url = `/api/events?pw=${encodeURIComponent(sessionPassword)}&siteId=${encodeURIComponent(currentSiteId)}`;
+    sseSource = new EventSource(url);
+    sseSource.addEventListener("state_changed", () => {
+      if (!sessionPassword || document.hidden) return;
+      clearTimeout(sseRefreshDebounceTimer);
+      sseRefreshDebounceTimer = setTimeout(() => {
+        loadServerState({ background: true });
+      }, 320);
+    });
+  } catch {
+    sseSource = null;
+  }
+}
+
+function disconnectSseEventStream() {
+  if (sseSource) {
+    try {
+      sseSource.close();
+    } catch {}
+    sseSource = null;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!sessionPassword) return;
+  applyUiRefreshInterval(serverState?.config?.uiRefreshIntervalSec || 5);
+  if (!document.hidden) {
+    loadServerState({ background: true });
+  }
+});
+
+function computePresetScheduleIso(presetVal, nowMs = Date.now()) {
+  if (presetVal === "60" || presetVal === "180") {
+    return new Date(nowMs + Number(presetVal) * 60 * 1000).toISOString();
+  }
+  const d = new Date(nowMs);
+  if (presetVal === "tonight23") {
+    const t = new Date(d);
+    t.setHours(23, 0, 0, 0);
+    if (t.getTime() <= nowMs) t.setDate(t.getDate() + 1);
+    return t.toISOString();
+  }
+  if (presetVal === "tomorrow09") {
+    const t = new Date(d);
+    t.setDate(t.getDate() + 1);
+    t.setHours(9, 0, 0, 0);
+    return t.toISOString();
+  }
+  if (presetVal === "monday0830") {
+    const t = new Date(d);
+    const day = t.getDay(); // 0=Sun, 1=Mon
+    const addDays = day === 1 && t.getHours() < 8 ? 0 : ((8 - day) % 7) || 7;
+    t.setDate(t.getDate() + addDays);
+    t.setHours(8, 30, 0, 0);
+    return t.toISOString();
+  }
+  return "";
+}
+
+function onSelectSchedTimePreset(val) {
+  const dtInput = document.getElementById("schedCustomDateTime");
+  if (!dtInput) return;
+  dtInput.style.display = val === "custom" ? "inline-block" : "none";
+}
+
+function onChangeSchedActionType(actionType) {
+  const wrap = document.getElementById("schedDynamicArgWrap");
+  if (!wrap) return;
+  const jobs = serverState?.jobs || [];
+  if (actionType === "set_target") {
+    wrap.innerHTML = `<input type="number" id="schedTargetWorkersInput" value="30" min="1" max="9999" class="mono" style="width:84px;" /> <span class="txt-muted" style="font-size:12px;">워커</span>`;
+  } else if (actionType === "toggle_job") {
+    wrap.innerHTML = `<select id="schedToggleBoolSelect"><option value="true">자동 생성 ON 켜기</option><option value="false">일시정지 (OFF)</option></select>`;
+  } else if (actionType === "start_drain") {
+    const opts = [`<option value="">-- 전원 종료 후 정지 --</option>`]
+      .concat(jobs.map((j) => `<option value="${escapeHtml(j.id)}">후속 인계: ${escapeHtml(j.name)}</option>`))
+      .join("");
+    wrap.innerHTML = `<select id="schedDrainNextSelect">${opts}</select>`;
+  } else if (actionType === "set_command") {
+    wrap.innerHTML = `<input type="text" id="schedCommandInput" class="mono" placeholder="새 실행 명령어" style="width:240px;" />`;
+  }
+}
+
+function renderScheduledAutopilotPanel(actions = [], jobs = []) {
+  const badge = document.getElementById("scheduledActionsCountBadge");
+  const listBox = document.getElementById("scheduledActionsListBox");
+  const targetSel = document.getElementById("schedTargetJobSelect");
+  const diffSelA = document.getElementById("diffJobSelectA");
+  const diffSelB = document.getElementById("diffJobSelectB");
+
+  const pendingCnt = (actions || []).filter((a) => a.status === "pending").length;
+  if (badge) {
+    badge.className = pendingCnt > 0 ? "badge info mono" : "badge mono";
+    badge.textContent = `대기 예약 ${pendingCnt}건`;
+  }
+
+  const jobSig = jobs.map((j) => `${j.id}:${j.name}`).join("|");
+  for (const [sel, defaultIdx] of [
+    [targetSel, 0],
+    [diffSelA, Math.max(0, jobs.length - 2)],
+    [diffSelB, Math.max(0, jobs.length - 1)],
+  ]) {
+    if (sel && sel.getAttribute("data-job-sig") !== jobSig && document.activeElement !== sel) {
+      sel.setAttribute("data-job-sig", jobSig);
+      sel.innerHTML = jobs
+        .map(
+          (j, idx) =>
+            `<option value="${escapeHtml(j.id)}" ${idx === defaultIdx ? "selected" : ""}>${escapeHtml(j.name)}</option>`
+        )
+        .join("");
+    }
+  }
+
+  if (!listBox) return;
+  if (!actions || actions.length === 0) {
+    listBox.innerHTML = `<div class="hint" style="margin:0;">등록된 시각 예약 작업이 없습니다. (야간·주말 자동 증설/축소, 세대교체를 미리 예약할 수 있습니다)</div>`;
+    return;
+  }
+
+  listBox.innerHTML = actions
+    .slice(0, 12)
+    .map((a) => {
+      const stCls = a.status === "executed" ? "ok" : a.status === "failed" ? "err" : "info";
+      const stTxt = a.status === "executed" ? "실행됨" : a.status === "failed" ? "실패" : "예약 대기";
+      const runTimeStr = a.runAt ? new Date(a.runAt).toLocaleString("ko-KR") : "-";
+      let desc = "";
+      if (a.actionType === "set_target") desc = `목표 워커 → ${a.targetWorkers}개`;
+      else if (a.actionType === "toggle_job") desc = `자동 생성 → ${a.enabled ? "ON" : "OFF"}`;
+      else if (a.actionType === "start_drain") desc = `무중단 드레이닝 전환`;
+      else if (a.actionType === "set_command") desc = `명령어 교체 (${a.executionCommand})`;
+
+      return `<div class="mono" style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 10px; border-radius:7px; background:var(--panel); border:1px solid var(--border); margin-bottom:5px; font-size:11.5px;">
+        <div>
+          <span class="badge ${stCls}" style="margin-right:6px;">${stTxt}</span>
+          <b>[${escapeHtml(a.jobName || a.jobId)}]</b> ${escapeHtml(desc)} · <span class="txt-muted">${escapeHtml(runTimeStr)}</span>
+          ${a.resultMessage ? `<span class="txt-secondary"> — ${escapeHtml(a.resultMessage)}</span>` : ""}
+        </div>
+        <button type="button" class="secondary sm" onclick="deleteScheduledAutopilotAction('${escapeJsStr(a.id)}')">삭제</button>
+      </div>`;
+    })
+    .join("");
+}
+
+async function addScheduledAutopilotAction() {
+  try {
+    const jobId = document.getElementById("schedTargetJobSelect")?.value || "";
+    const actionType = document.getElementById("schedActionTypeSelect")?.value || "set_target";
+    const presetVal = document.getElementById("schedTimePresetSelect")?.value || "60";
+    let runAt = "";
+    if (presetVal === "custom") {
+      const rawDt = document.getElementById("schedCustomDateTime")?.value || "";
+      if (!rawDt) return alert("예약 실행할 날짜와 시각을 선택해 주세요.");
+      runAt = new Date(rawDt).toISOString();
+    } else {
+      runAt = computePresetScheduleIso(presetVal);
+    }
+
+    const body = { jobId, actionType, runAt };
+    if (actionType === "set_target") {
+      body.targetWorkers = Math.max(1, Number(document.getElementById("schedTargetWorkersInput")?.value || 30));
+    } else if (actionType === "toggle_job") {
+      body.enabled = document.getElementById("schedToggleBoolSelect")?.value === "true";
+    } else if (actionType === "start_drain") {
+      body.drainNextJobId = document.getElementById("schedDrainNextSelect")?.value || "";
+    } else if (actionType === "set_command") {
+      body.executionCommand = (document.getElementById("schedCommandInput")?.value || "").trim();
+      if (!body.executionCommand) return alert("교체할 실행 명령어를 입력해 주세요.");
+    }
+
+    const res = await api("/api/schedules", { method: "POST", body: JSON.stringify(body) });
+    renderScheduledAutopilotPanel(res.scheduledActions || [], serverState?.jobs || []);
+    showToast("⏰ 시각 예약 오토파일럿이 등록되었습니다!");
+  } catch (e) {
+    alert("예약 등록 실패: " + e.message);
+  }
+}
+
+async function deleteScheduledAutopilotAction(id) {
+  try {
+    const res = await api(`/api/schedules?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    renderScheduledAutopilotPanel(res.scheduledActions || [], serverState?.jobs || []);
+  } catch (e) {
+    alert("예약 삭제 실패: " + e.message);
+  }
+}
+
+async function clearDoneScheduledActions() {
+  try {
+    const res = await api("/api/schedules?clearDone=1", { method: "DELETE" });
+    renderScheduledAutopilotPanel(res.scheduledActions || [], serverState?.jobs || []);
+    showToast("🧹 실행 완료된 예약 내역을 정리했습니다.");
+  } catch (e) {
+    alert("정리 실패: " + e.message);
+  }
+}
+
+async function compareSelectedJobRules() {
+  const idA = document.getElementById("diffJobSelectA")?.value || "";
+  const idB = document.getElementById("diffJobSelectB")?.value || "";
+  const panel = document.getElementById("ruleDiffOrReportPanel");
+  if (!panel) return;
+  try {
+    const res = await api(`/api/jobs/diff?a=${encodeURIComponent(idA)}&b=${encodeURIComponent(idB)}`);
+    const d = res.diff;
+    panel.style.display = "block";
+    if (d.identical) {
+      panel.innerHTML = `<div style="display:flex; justify-content:space-between; align-items:center;">
+        <span>✅ <b>[${escapeHtml(d.nameA)}]</b> 규칙과 <b>[${escapeHtml(d.nameB)}]</b> 규칙의 주요 실행 설정이 100% 동일합니다.</span>
+        <button type="button" class="secondary sm" onclick="document.getElementById('ruleDiffOrReportPanel').style.display='none'">닫기</button>
+      </div>`;
+      return;
+    }
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <b>🔍 규칙 설정 비교: [${escapeHtml(d.nameA)}] vs [${escapeHtml(d.nameB)}] (차이 ${d.diffCount}개)</b>
+        <button type="button" class="secondary sm" onclick="document.getElementById('ruleDiffOrReportPanel').style.display='none'">닫기</button>
+      </div>
+      <table>
+        <thead><tr><th>비교 항목</th><th>${escapeHtml(d.nameA)}</th><th>${escapeHtml(d.nameB)}</th></tr></thead>
+        <tbody>
+          ${d.diffs
+            .map(
+              (row) => `<tr>
+                <td><b>${escapeHtml(row.label)}</b></td>
+                <td class="mono txt-secondary">${escapeHtml(String(row.valueA))}</td>
+                <td class="mono" style="color:var(--accent-text); font-weight:600;">${escapeHtml(String(row.valueB))}</td>
+              </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+    `;
+  } catch (e) {
+    alert("규칙 비교 실패: " + e.message);
+  }
+}
+
+async function openJobExperimentReport(jobId) {
+  const panel = document.getElementById("ruleDiffOrReportPanel");
+  if (!panel) return;
+  try {
+    const res = await api(`/api/jobs/report?jobId=${encodeURIComponent(jobId)}`);
+    const rep = res.report;
+    latestExperimentReportMarkdown = rep.markdown || "";
+    panel.style.display = "block";
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+        <b>📊 실험 종합 성적표 — [${escapeHtml(rep.jobName)}]</b>
+        <div class="btn-row">
+          <button type="button" class="soft-success sm" onclick="copyLatestExperimentReportMarkdown()">Markdown 복사</button>
+          <button type="button" class="secondary sm" onclick="downloadJobExperimentReportCsv('${escapeJsStr(rep.jobId)}', '${escapeJsStr(rep.jobName)}')">CSV 다운로드</button>
+          <button type="button" class="secondary sm" onclick="document.getElementById('ruleDiffOrReportPanel').style.display='none'">닫기</button>
+        </div>
+      </div>
+      <div class="code-box" style="max-height:240px; font-size:12px;">${escapeHtml(rep.markdown)}</div>
+    `;
+    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (e) {
+    alert("실험 리포트 생성 실패: " + e.message);
+  }
+}
+
+async function copyLatestExperimentReportMarkdown() {
+  if (!latestExperimentReportMarkdown) return;
+  try {
+    await navigator.clipboard.writeText(latestExperimentReportMarkdown);
+    showToast("📋 실험 종합 리포트(Markdown)가 클립보드에 복사되었습니다!");
+  } catch {
+    showToast("⚠️ 클립보드 복사에 실패했습니다. 텍스트 박스에서 직접 복사해 주세요.");
+  }
+}
+
+function downloadJobExperimentReportCsv(jobId, jobName) {
+  const pw = encodeURIComponent(sessionPassword || "");
+  const siteParam = encodeURIComponent(currentSiteId || "n9");
+  window.open(`/api/jobs/report?jobId=${encodeURIComponent(jobId)}&format=csv&siteId=${siteParam}&pw=${pw}`, "_blank");
+  showToast(`📥 [${jobName}] 실험 리포트(CSV) 다운로드를 시작합니다.`);
+}
+
+async function aggregateSfmFolderJsonl() {
+  const dirPath = (document.getElementById("sfmBrowsePath")?.value || "").trim();
+  if (!dirPath) return alert("집계할 볼륨 폴더 경로를 입력해 주세요.");
+  const panel = document.getElementById("sfmQuickPreviewPanel");
+  const titleEl = document.getElementById("sfmPreviewTitle");
+  const metaEl = document.getElementById("sfmPreviewMeta");
+  const boxEl = document.getElementById("sfmPreviewContentBox");
+  if (!panel || !boxEl) return;
+
+  currentSfmPreviewPath = dirPath;
+  panel.style.display = "block";
+  if (titleEl) titleEl.textContent = `📊 샤드·결과 집계: ${dirPath}`;
+  if (metaEl) metaEl.textContent = "스캔 중...";
+  boxEl.textContent = "폴더 내 .jsonl / .json 파일들을 읽어 지표를 집계하는 중입니다...";
+
+  try {
+    const res = await api("/api/space/sfm-aggregate", {
+      method: "POST",
+      body: JSON.stringify({ dirPath, maxFiles: 30 }),
+    });
+    if (metaEl) {
+      metaEl.textContent = `파일 ${res.scannedFiles}개 · 총 ${res.totalRecords}샘플`;
+    }
+    const lines = [
+      `[집계 폴더] ${res.dirPath}`,
+      `[스캔 결과] 파일 ${res.scannedFiles}개 · 유효 샘플 총 ${res.totalRecords}건${res.malformedLines > 0 ? ` (파싱 제외 ${res.malformedLines}줄)` : ""}`,
+      "",
+    ];
+    if (Array.isArray(res.metrics) && res.metrics.length > 0) {
+      lines.push("=== 주요 수치 지표 요약 (mean / min ~ max) ===");
+      for (const m of res.metrics.slice(0, 15)) {
+        lines.push(`  • ${m.key.padEnd(18)} : 평균 ${m.mean}   (min ${m.min} ~ max ${m.max}, n=${m.count})`);
+      }
+      lines.push("");
+    }
+    if (Array.isArray(res.perFile) && res.perFile.length > 0) {
+      lines.push("=== 파일별 샘플 수 ===");
+      for (const f of res.perFile) {
+        lines.push(`  - ${f.fileName}: ${f.records}건`);
+      }
+    }
+    boxEl.textContent = lines.join("\n");
+  } catch (e) {
+    if (metaEl) metaEl.textContent = "집계 실패";
+    boxEl.textContent = "결과 집계 실패: " + e.message;
+  }
+}
 
 // Always start locked on every visit / page refresh (except 1-click Bookmarklet `#tokenSync=` popup!)
 window.addEventListener("DOMContentLoaded", async () => {
