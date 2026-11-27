@@ -2087,4 +2087,15 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       "targetPending > 0 일 때도 불량 노드 쿨다운이 동일하게 적용되어야 함"
     );
   });
+
+  test("TC-80: [회귀 방지] 연속 5회 조기 실패 시 30분(1800s) 서킷 브레이커 작동 및 전역 `bypassCooldown: true` 우회 제거 검증", () => {
+    const q5 = srv.evaluateProblemNodeQuarantine({}, 5, Date.now(), 25);
+    assert.equal(q5.isCircuitOpen, true, "연속 5회 조기 크래시 시 서킷 브레이커가 열려야 함");
+    assert.equal(q5.escalatedCooldownSec >= 1800, true, "무의미한 재신청 및 메일 폭주 차단을 위해 최소 30분(1800초) 대기해야 함");
+    assert.equal(
+      serverSrc.includes("runSchedulerTick(false, { bypassCooldown: true })"),
+      false,
+      "목표 하향·간격 수정 시 전역 쿨다운을 무시하는 호출이 없어야 함"
+    );
+  });
 });

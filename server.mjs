@@ -4682,14 +4682,18 @@ function evaluateProblemNodeQuarantine(
   quarantinedNodes.sort((a, b) => b.count - a.count);
 
   const effectiveStreak = Math.max(Number(consecutiveRapidFails || 0), maxCount);
+  const isCircuitOpen = Number(consecutiveRapidFails || 0) >= 5;
   let multiplier = 1;
   if (effectiveStreak >= 4) multiplier = 5;
   else if (effectiveStreak === 3) multiplier = 3.5;
   else if (effectiveStreak === 2) multiplier = 2;
 
-  const escalatedCooldownSec = Math.min(600, Math.round(baseSec * multiplier));
+  const escalatedCooldownSec = isCircuitOpen
+    ? Math.max(1800, Math.min(3600, Math.round(baseSec * 12)))
+    : Math.min(600, Math.round(baseSec * multiplier));
   return {
     isQuarantineActive: quarantinedNodes.length > 0 || effectiveStreak >= 2,
+    isCircuitOpen,
     quarantinedNodes,
     highestRepeatNode,
     escalatedCooldownSec,
@@ -7165,8 +7169,20 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
     const rapidSecLimit = Math.max(20, Number(state.config.badNodeRapidFailSec || 180));
     const baseCooldownSec = Math.max(5, Number(state.config.badNodeCooldownSec || 25));
     const recentTermMap = getSiteRuntime().recentlyTerminatedRunsMap;
-    const failedRuns = matchingRuns.filter((r) => isGenuineBadNodeFailureRun(r, recentTermMap));
-    for (const fr of failedRuns.slice(0, 5)) {
+    const recentFailedRuns = matchingRuns
+      .filter((r) => {
+        if (!isGenuineBadNodeFailureRun(r, recentTermMap)) return false;
+        const endMs = r.endTime ? new Date(r.endTime).getTime() : now;
+        return !Number.isNaN(endMs) && now - endMs < 30 * 60 * 1000;
+      })
+      .sort((a, b) => {
+        const ea = a.endTime ? new Date(a.endTime).getTime() : 0;
+        const eb = b.endTime ? new Date(b.endTime).getTime() : 0;
+        return ea - eb;
+      });
+    let newRapidFailsInTick = 0;
+    let lastCooldownAppliedSec = 0;
+    for (const fr of recentFailedRuns) {
       const fId = String(fr.id ?? fr.runId ?? "");
       if (!fId || badNodeStats.seenFailedRunIds.has(fId)) continue;
       badNodeStats.seenFailedRunIds.add(fId);
@@ -7177,13 +7193,12 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       }
       const startMs = fr.startTime ? new Date(fr.startTime).getTime() : 0;
       const endMs = fr.endTime ? new Date(fr.endTime).getTime() : now;
-      if (now - endMs < 30 * 60 * 1000) {
-        captureFailurePostMortem(fr, job.name).catch(() => {});
-      }
+      captureFailurePostMortem(fr, job.name).catch(() => {});
       const runDurSec = startMs > 0 ? Math.max(0, Math.floor((endMs - startMs) / 1000)) : 9999;
       if (runDurSec <= rapidSecLimit && now - endMs < 180000) {
         badNodeStats.rapidFailCount += 1;
         badNodeStats.consecutiveRapidFails += 1;
+        newRapidFailsInTick += 1;
         const failedNodeName = extractNodeIdentifierFromRunOrLog(fr, "");
         if (failedNodeName) {
           recordProblemNodeEvent(failedNodeName, `초기 크래시(${runDurSec}s)`, fId);
@@ -7195,6 +7210,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
           baseCooldownSec
         );
         const cooldownSec = qEval.escalatedCooldownSec;
+        lastCooldownAppliedSec = cooldownSec;
         const candidateCooldownUntilMs = (fr.endTime ? endMs : now) + cooldownSec * 1000;
         if (candidateCooldownUntilMs > now) {
           badNodeStats.cooldownUntilMs = Math.max(badNodeStats.cooldownUntilMs, candidateCooldownUntilMs);
@@ -7203,10 +7219,6 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
         badNodeStats.lastBadRunName = fr.containerName || fr.name || `#${fId}`;
         badNodeStats.lastReason = `시작 ${runDurSec}초 만에 조기 실패${failedNodeName ? ` (노드 ${failedNodeName})` : ""}`;
         badNodeStats.lastDetectedAt = new Date(now).toISOString();
-        addLog(
-          "warn",
-          `🩺 [불량 노드 회피·격리 가드] ${badNodeStats.lastBadRunName} (#${fId}${failedNodeName ? ` · ${failedNodeName}` : ""})가 시작 ${runDurSec}초 만에 조기 실패했습니다. 적응형 ${cooldownSec}초 스마트 우회 쿨다운을 적용합니다.`
-        );
         if (failedNodeName && (badNodeStats.problemNodes?.[failedNodeName]?.count || 0) >= 3) {
           pushAlertNotification(
             "warn",
@@ -7216,6 +7228,16 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
           ).catch(() => {});
         }
       }
+    }
+    if (newRapidFailsInTick > 0) {
+      const circuitMsg =
+        badNodeStats.consecutiveRapidFails >= 5
+          ? ` (🚨 연속 ${badNodeStats.consecutiveRapidFails}회 크래시 서킷 브레이커 — 무의미한 재신청·메일 폭주 방지를 위해 ${Math.round(lastCooldownAppliedSec / 60)}분 대기)`
+          : "";
+      addLog(
+        "warn",
+        `🩺 [불량 노드 회피·격리 가드] ${badNodeStats.lastBadRunName} (#${badNodeStats.lastBadRunId}) 등 ${newRapidFailsInTick}건 조기 실패 감지 — ${lastCooldownAppliedSec}초 스마트 우회 쿨다운 적용${circuitMsg}`
+      );
     }
     if (runningRuns.length > 0 && badNodeStats.consecutiveRapidFails > 0) {
       // Only reset consecutive rapid fails when a worker started AFTER the last rapid failure has survived > 3 minutes!
@@ -7277,9 +7299,11 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
             now
           )
         : { expiringSoonCount: 0, preWarmAllowance: 0, minRemainingSec: null };
-    const effectiveEvalMinConcurrent = minConcurrent + ttlPreWarm.preWarmAllowance;
+    // Only add TTL pre-warm extra capacity when existing Pending workers do not already cover expiring Running workers!
+    const extraPreWarmSlots = Math.max(0, runningRuns.length + ttlPreWarm.preWarmAllowance - minConcurrent);
+    const effectiveEvalMinConcurrent = minConcurrent + extraPreWarmSlots;
     const effectiveEvalPending =
-      ttlPreWarm.preWarmAllowance > 0
+      extraPreWarmSlots > 0
         ? Math.max(targetPending, ttlPreWarm.preWarmAllowance)
         : targetPending;
     const metrics = computeJobTargetMetrics({
@@ -10616,7 +10640,10 @@ const server = http.createServer(async (req, res) => {
             ? false
             : Boolean(existingJob?._stage2Transitioned),
         _knownPendingRunIds: Array.isArray(existingJob?._knownPendingRunIds) ? existingJob._knownPendingRunIds : undefined,
-        _pendingRefillImmediate: true,
+        _pendingRefillImmediate:
+          !existingJob ||
+          (!existingJob.enabled && Boolean(body.enabled)) ||
+          (prevMinConcurrent !== null && toSafeInt(body.minConcurrentRuns, 1, 1, 99999) > prevMinConcurrent),
         lastCheckAt: existingJob ? existingJob.lastCheckAt : null,
         lastTriggeredAt: existingJob ? existingJob.lastTriggeredAt : null,
         lastRunId: existingJob ? existingJob.lastRunId : null,
@@ -10649,9 +10676,9 @@ const server = http.createServer(async (req, res) => {
           addLog("info", `✂️ [${jobObj.name}] 목표 하향에 맞춰 초과 Pending 워커 ${trimmedPendingCount}개 자동 취소 완료`);
         }
       }
-      if (jobObj.enabled && state.config.schedulerEnabled) {
+      if (jobObj.enabled && state.config.schedulerEnabled && jobObj._pendingRefillImmediate) {
         getSiteRuntime().lastSchedulerTickTime = 0;
-        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+        runSchedulerTick(false).catch(() => {});
       }
       return sendJson(res, 200, {
         ok: true,
@@ -10679,7 +10706,7 @@ const server = http.createServer(async (req, res) => {
       );
       if (job.enabled && state.config.schedulerEnabled) {
         getSiteRuntime().lastSchedulerTickTime = 0;
-        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+        runSchedulerTick(false).catch(() => {});
       }
       return sendJson(res, 200, { ok: true, job, jobs: state.jobs, workerFleet: computeWorkerFleetStats(getSiteKnownRuns()) });
     }
@@ -10700,7 +10727,7 @@ const server = http.createServer(async (req, res) => {
         addLog("info", `▶️ [무중단 드레이닝 해제] [${job.name}] 일반 목표 유지 모드로 복귀했습니다.`);
         if (job.enabled && state.config.schedulerEnabled) {
           getSiteRuntime().lastSchedulerTickTime = 0;
-          runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+          runSchedulerTick(false).catch(() => {});
         }
         return sendJson(res, 200, {
           ok: true,
@@ -10786,7 +10813,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (state.config.schedulerEnabled) {
         getSiteRuntime().lastSchedulerTickTime = 0;
-        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+        runSchedulerTick(false).catch(() => {});
       }
       return sendJson(res, 200, {
         ok: true,
@@ -10824,16 +10851,16 @@ const server = http.createServer(async (req, res) => {
       if (parsedTargetGpus !== null && parsedTargetGpus > 0) {
         const gpusPerWorker = toSafeInt(job.coreCount, 1, 1, 1024);
         const nextMinFromGpus = Math.max(1, Math.min(99999, Math.ceil(parsedTargetGpus / gpusPerWorker)));
-        if (nextMinFromGpus !== job.minConcurrentRuns) shouldImmediateRefill = true;
+        if (nextMinFromGpus > job.minConcurrentRuns) shouldImmediateRefill = true;
         job.minConcurrentRuns = nextMinFromGpus;
       } else if (body.minConcurrentRuns !== undefined) {
         const nextMin = toSafeInt(body.minConcurrentRuns, job.minConcurrentRuns ?? 1, 1, 99999);
-        if (nextMin !== job.minConcurrentRuns) shouldImmediateRefill = true;
+        if (nextMin > job.minConcurrentRuns) shouldImmediateRefill = true;
         job.minConcurrentRuns = nextMin;
       }
       if (body.targetPendingRuns !== undefined) {
         const nextTargetPending = toSafeInt(body.targetPendingRuns, job.targetPendingRuns ?? 0, 0, 99999);
-        if (nextTargetPending > 0 && nextTargetPending !== job.targetPendingRuns) shouldImmediateRefill = true;
+        if (nextTargetPending > prevTargetPending) shouldImmediateRefill = true;
         job.targetPendingRuns = nextTargetPending;
       }
       if (body.cooldownSec !== undefined) {
@@ -10884,7 +10911,7 @@ const server = http.createServer(async (req, res) => {
       );
       if (shouldImmediateRefill && job.enabled && state.config.schedulerEnabled) {
         getSiteRuntime().lastSchedulerTickTime = 0;
-        runSchedulerTick(false, { bypassCooldown: true }).catch(() => {});
+        runSchedulerTick(false).catch(() => {});
       }
       const fleet = computeWorkerFleetStats(getSiteKnownRuns());
       return sendJson(res, 200, {

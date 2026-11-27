@@ -4,7 +4,7 @@
 - **문서 버전**: `v3.1.0`
 - **최종 검증일**: `2026-11-27`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **79개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **80개** 케이스)
 
 ---
 
@@ -185,6 +185,7 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-77** | Suite 6 (샤드결과집계기) | `aggregateJsonlMetrics` | 분산 `.jsonl` 샤드 샘플 수 및 `reward`/`loss` 평균·최소·최대 산출 검증 | ✅ PASS |
 | **TC-78** | Suite 6 (모바일반응형UX) | `public/style.css` | `@media (max-width: 768px)` 모바일·태블릿 반응형 규칙 무결성 검증 | ✅ PASS |
 | **TC-79** | Suite 6 (5분간격엄수/불량쿨다운) | `computeNextAutoSpawnEligibility` | `targetPending > 0`에서도 설정 생성 간격(예: `300s` 5분) 1개씩 엄수 및 불량 노드 쿨다운 적용 검증 | ✅ PASS |
+| **TC-80** | Suite 6 (연속실패서킷브레이커) | `evaluateProblemNodeQuarantine` | 연속 5회 초기 크래시 시 30분(`1800s`) 서킷 브레이커 대기 및 설정 수정 시 전역 쿨다운 우회 제거 검증 | ✅ PASS |
 
 ---
 
