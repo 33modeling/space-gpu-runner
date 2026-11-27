@@ -99,6 +99,8 @@ const DEFAULT_STATE = {
     silentHangDetectEnabled: true,
     silentHangTimeoutMin: 45,
     silentHangAutoRestart: false,
+    nanGuardEnabled: true,
+    nanAutoRestart: false,
     dailyDigestEnabled: false,
     dailyDigestHourKst: 9,
     globalMaxGpus: 0,
@@ -199,6 +201,8 @@ const DEFAULT_STATE = {
     dailyGpuHours: {},
     jobGpuHours: {},
     dailyJobGpuHours: {},
+    hourlyWeather: {},
+    seenWeatherRunIds: [],
     timeSeries: [],
     lastAccountingAtMs: 0,
     lastSampleAtMs: 0,
@@ -406,6 +410,8 @@ function loadState() {
         dailyGpuHours: tObj.dailyGpuHours || {},
         jobGpuHours: tObj.jobGpuHours || {},
         dailyJobGpuHours: tObj.dailyJobGpuHours && typeof tObj.dailyJobGpuHours === "object" ? tObj.dailyJobGpuHours : {},
+        hourlyWeather: tObj.hourlyWeather && typeof tObj.hourlyWeather === "object" ? tObj.hourlyWeather : {},
+        seenWeatherRunIds: Array.isArray(tObj.seenWeatherRunIds) ? tObj.seenWeatherRunIds.slice(-2000) : [],
         timeSeries: Array.isArray(tObj.timeSeries) ? tObj.timeSeries.slice(-60) : [],
         lastAccountingAtMs: Number(tObj.lastAccountingAtMs || 0),
         lastSampleAtMs: Number(tObj.lastSampleAtMs || 0),
@@ -1254,10 +1260,14 @@ function getSiteRuntime(siteId = getCurrentSiteId()) {
         logErrorRestartedCount: 0,
         silentHangDetectedCount: 0,
         silentHangRestartedCount: 0,
+        nanDivergedCount: 0,
+        nanRestartedCount: 0,
         lastActionMessage: null,
         workerLogSnippets: {},
         failurePostMortems: [],
         seenPostMortemIds: new Set(),
+        outputWatchCache: {},
+        inFlightTaskReservations: new Map(),
         roundRobinIndex: 0,
       },
       hybridFallbackStats: {
@@ -4114,6 +4124,345 @@ async function captureFailurePostMortem(failedRun, jobName = "") {
   return entry;
 }
 
+// =========================================================================
+// Batch 5 Helpers: Stateful Task Queue, NaN Divergence, Output Watcher, Uptime/Console & 24h Cluster Weather
+// =========================================================================
+function shellSingleQuote(str = "") {
+  return `'${String(str ?? "").replace(/'/g, `'\\''`)}'`;
+}
+
+function parseTaskQueueItems(rawInput) {
+  if (Array.isArray(rawInput)) {
+    return rawInput.map((x) => String(x ?? "").trim()).filter((x) => x && !x.startsWith("#"));
+  }
+  return String(rawInput ?? "")
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter((x) => x && !x.startsWith("#"));
+}
+
+function extractAssignedTaskIdxFromRun(run, job = null) {
+  if (!run || typeof run !== "object") return null;
+  const rId = String(run.id ?? run.runId ?? "").trim();
+  if (rId && job?.taskQueueRunMap && Number.isFinite(Number(job.taskQueueRunMap[rId]))) {
+    const mapped = Number(job.taskQueueRunMap[rId]);
+    if (mapped > 0) return mapped;
+  }
+  const cName = String(run.containerName || run.name || "");
+  const m = cName.match(/-t(\d+)-/i);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function reconcileTaskQueueProgress(job, matchingRuns = [], inFlightTaskSet = new Set()) {
+  const items = parseTaskQueueItems(job?.taskQueueItems);
+  const totalTasks = items.length;
+  if (totalTasks === 0) {
+    return {
+      enabled: false,
+      totalTasks: 0,
+      items: [],
+      completedIndices: [],
+      activeIndices: [],
+      remainingIndices: [],
+      isAllCompleted: false,
+    };
+  }
+  const completedSet = new Set(
+    (Array.isArray(job?.taskQueueCompletedIdx) ? job.taskQueueCompletedIdx : [])
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n >= 1 && n <= totalTasks)
+  );
+  const activeSet = new Set();
+
+  for (const r of Array.isArray(matchingRuns) ? matchingRuns : []) {
+    const tIdx = extractAssignedTaskIdxFromRun(r, job);
+    if (!tIdx || tIdx < 1 || tIdx > totalTasks) continue;
+    const cls = classifyRunStatus(r.status || r.state || r.phase);
+    if (cls === "SUCCEEDED") {
+      completedSet.add(tIdx);
+    } else if (cls === "ACTIVE") {
+      activeSet.add(tIdx);
+    }
+  }
+  if (inFlightTaskSet && typeof inFlightTaskSet.forEach === "function") {
+    inFlightTaskSet.forEach((idxVal) => {
+      const n = Number(idxVal);
+      if (Number.isInteger(n) && n >= 1 && n <= totalTasks && !completedSet.has(n)) {
+        activeSet.add(n);
+      }
+    });
+  }
+
+  const completedIndices = [...completedSet].sort((a, b) => a - b);
+  const activeIndices = [...activeSet].filter((n) => !completedSet.has(n)).sort((a, b) => a - b);
+  const remainingIndices = [];
+  for (let k = 1; k <= totalTasks; k++) {
+    if (!completedSet.has(k) && !activeSet.has(k)) {
+      remainingIndices.push(k);
+    }
+  }
+  return {
+    enabled: true,
+    totalTasks,
+    items,
+    completedIndices,
+    activeIndices,
+    remainingIndices,
+    isAllCompleted: completedIndices.length >= totalTasks && activeIndices.length === 0,
+  };
+}
+
+function pickNextTaskQueueItem(job, matchingRuns = [], inFlightTaskSet = new Set()) {
+  const stateInfo = reconcileTaskQueueProgress(job, matchingRuns, inFlightTaskSet);
+  if (!stateInfo.enabled || stateInfo.remainingIndices.length === 0) {
+    return null;
+  }
+  const nextIdx = stateInfo.remainingIndices[0];
+  return {
+    taskIdx: nextIdx,
+    taskArg: stateInfo.items[nextIdx - 1],
+    totalTasks: stateInfo.totalTasks,
+    remainingAfterPick: stateInfo.remainingIndices.length - 1,
+  };
+}
+
+function detectLossDivergence(logText = "") {
+  const raw = String(logText || "");
+  if (!raw) return { isDiverged: false, matchedToken: null, matchedLine: null };
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const recentLines = lines.slice(-15);
+  const metricNanRx =
+    /\b(loss|train_loss|val_loss|eval_loss|grad_norm|gnorm|total_loss|policy_loss|value_loss|kl|ppl|perplexity)\s*(?:=|:)\s*[-+]?(?:nan|inf|infinity)\b/i;
+  const phraseNanRx = /\b(loss\s+is\s+nan|nan\s+loss\s+detected|floating\s+point\s+exception|gradient\s+overflow.*nan)\b/i;
+
+  for (let i = recentLines.length - 1; i >= 0; i--) {
+    const ln = recentLines[i];
+    const m1 = ln.match(metricNanRx);
+    if (m1) {
+      return {
+        isDiverged: true,
+        matchedToken: m1[0].slice(0, 48),
+        matchedLine: ln.slice(0, 180),
+      };
+    }
+    const m2 = ln.match(phraseNanRx);
+    if (m2) {
+      return {
+        isDiverged: true,
+        matchedToken: m2[0].slice(0, 48),
+        matchedLine: ln.slice(0, 180),
+      };
+    }
+  }
+  return { isDiverged: false, matchedToken: null, matchedLine: null };
+}
+
+function summarizeOutputDirectoryEntries(entries = [], nowMs = Date.now()) {
+  const list = Array.isArray(entries) ? entries : [];
+  let fileCount = 0;
+  let dirCount = 0;
+  let totalBytes = 0;
+  let latestMs = 0;
+  let latestFileName = null;
+
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const name = String(item.name || item.fileName || item.path || "").split("/").filter(Boolean).pop() || "";
+    if (!name || name === "." || name === "..") continue;
+    const isDir =
+      Boolean(item.isDir || item.isDirectory || item.directory) ||
+      String(item.type || "").toUpperCase().includes("DIR");
+    if (isDir) {
+      dirCount += 1;
+      continue;
+    }
+    fileCount += 1;
+    const sz = Number(item.size ?? item.fileSize ?? item.length ?? 0);
+    if (Number.isFinite(sz) && sz > 0) totalBytes += sz;
+    const rawTime = item.modifiedAt || item.mtime || item.updatedAt || item.lastModified || item.createdAt || null;
+    if (rawTime) {
+      const tMs = typeof rawTime === "number" ? (rawTime < 1e11 ? rawTime * 1000 : rawTime) : new Date(rawTime).getTime();
+      if (!Number.isNaN(tMs) && tMs > latestMs) {
+        latestMs = tMs;
+        latestFileName = name;
+      }
+    }
+  }
+
+  const minutesSinceLastWrite = latestMs > 0 ? Math.max(0, Math.round((nowMs - latestMs) / 60000)) : null;
+  return {
+    fileCount,
+    dirCount,
+    totalBytes,
+    totalSizeMB: Math.round((totalBytes / (1024 * 1024)) * 100) / 100,
+    latestFileName,
+    latestModifiedAt: latestMs > 0 ? new Date(latestMs).toISOString() : null,
+    minutesSinceLastWrite,
+  };
+}
+
+function computeWorkerUptimeSec(run, nowMs = Date.now()) {
+  if (!run || typeof run !== "object") return { uptimeSec: null, queueWaitSec: null };
+  const stUpper = String(run.status || run.state || run.phase || "").toUpperCase();
+  const startMs = run.startTime ? new Date(run.startTime).getTime() : 0;
+  const regMs = (run.registerTime || run.createdAt) ? new Date(run.registerTime || run.createdAt).getTime() : 0;
+
+  if (stUpper.includes("RUNNING")) {
+    const basis = startMs > 0 && !Number.isNaN(startMs) ? startMs : regMs;
+    const uptimeSec = basis > 0 && !Number.isNaN(basis) ? Math.max(0, Math.floor((nowMs - basis) / 1000)) : null;
+    const queueWaitSec =
+      startMs > 0 && regMs > 0 && startMs >= regMs ? Math.max(0, Math.floor((startMs - regMs) / 1000)) : null;
+    return { uptimeSec, queueWaitSec };
+  }
+  const queueWaitSec = regMs > 0 && !Number.isNaN(regMs) ? Math.max(0, Math.floor((nowMs - regMs) / 1000)) : null;
+  return { uptimeSec: null, queueWaitSec };
+}
+
+function buildRunConsoleLinks(run, siteProfile = {}) {
+  const rId = String(run?.id ?? run?.runId ?? "").trim();
+  const portalBase = String(siteProfile?.portalUrl || "https://space.n9.sr-cloud.com").replace(/\/$/, "");
+  const directWebUrl = String(
+    run?.webConsoleUrl || run?.consoleUrl || run?.interactiveUrl || run?.terminalUrl || ""
+  ).trim();
+  const portalRunUrl = rId ? `${portalBase}/console/home` : portalBase;
+  return {
+    portalRunUrl,
+    webConsoleUrl: directWebUrl || "",
+  };
+}
+
+function computeHourlyClusterWeather(runsList = [], siteTel = {}, jobs = []) {
+  const buckets = Array.from({ length: 24 }, (_, h) => {
+    const saved = siteTel?.hourlyWeather?.[String(h)] || {};
+    return {
+      hour: h,
+      promotions: Number(saved.promotions || 0),
+      totalWaitSec: Number(saved.totalWaitSec || 0),
+      waitSamples: Number(saved.waitSamples || 0),
+      preemptions: Number(saved.preemptions || 0),
+    };
+  });
+
+  const seenIds = new Set((Array.isArray(siteTel?.seenWeatherRunIds) ? siteTel.seenWeatherRunIds : []).map(String));
+  const jobList = Array.isArray(jobs) ? jobs : [];
+
+  // Live non-mutating enrichment from `runsList` & `recentPreemptions` for any runs not yet folded into `hourlyWeather`
+  for (const r of Array.isArray(runsList) ? runsList : []) {
+    if (!r) continue;
+    const rId = String(r.id ?? r.runId ?? "").trim();
+    if (!rId || seenIds.has(`p:${rId}`)) continue;
+    if (jobList.length > 0 && !jobList.some((j) => doesRunMatchJob(r, j, jobList))) continue;
+    if (r.startTime) {
+      const sMs = new Date(r.startTime).getTime();
+      if (!Number.isNaN(sMs) && sMs > 0) {
+        const kstHour = new Date(sMs + 9 * 3600 * 1000).getUTCHours();
+        buckets[kstHour].promotions += 1;
+        const regIso = r.registerTime || r.createdAt || null;
+        if (regIso) {
+          const rMs = new Date(regIso).getTime();
+          if (!Number.isNaN(rMs) && rMs > 0 && sMs >= rMs) {
+            buckets[kstHour].totalWaitSec += Math.round((sMs - rMs) / 1000);
+            buckets[kstHour].waitSamples += 1;
+          }
+        }
+      }
+    }
+  }
+  for (const ev of Array.isArray(siteTel?.recentPreemptions) ? siteTel.recentPreemptions : []) {
+    const evId = String(ev?.runId || "").trim();
+    if (!evId || seenIds.has(`e:${evId}`)) continue;
+    if (ev?.time) {
+      const eMs = new Date(ev.time).getTime();
+      if (!Number.isNaN(eMs) && eMs > 0) {
+        const kstHour = new Date(eMs + 9 * 3600 * 1000).getUTCHours();
+        buckets[kstHour].preemptions += 1;
+      }
+    }
+  }
+
+  const hours = buckets.map((b) => {
+    const avgWaitMin =
+      b.waitSamples > 0 ? Math.round((b.totalWaitSec / b.waitSamples / 60) * 10) / 10 : null;
+    // Lower wait + higher promotions + fewer preemptions = better hour
+    const score = b.promotions * 2 - b.preemptions * 1.5 - (avgWaitMin !== null ? Math.min(30, avgWaitMin * 0.5) : 0);
+    return {
+      hour: b.hour,
+      label: `${String(b.hour).padStart(2, "0")}시`,
+      promotions: b.promotions,
+      avgWaitMin,
+      preemptions: b.preemptions,
+      score: Math.round(score * 10) / 10,
+    };
+  });
+
+  const activeHours = hours.filter((h) => h.promotions > 0 || h.preemptions > 0);
+  const bestHours = [...activeHours]
+    .filter((h) => h.promotions > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map((h) => h.hour);
+  const busyHours = [...activeHours]
+    .filter((h) => h.preemptions > 0 || (h.avgWaitMin !== null && h.avgWaitMin >= 10))
+    .sort((a, b) => a.score - b.score)
+    .slice(0, 3)
+    .map((h) => h.hour);
+
+  return {
+    hours,
+    bestHours,
+    busyHours,
+    hasData: activeHours.length > 0,
+  };
+}
+
+async function pollWatchedOutputDirIfNeeded(job, force = false) {
+  const dirPath = String(job?.watchOutputDir || "").trim();
+  if (!dirPath || !state.config.accessToken) return null;
+  if (!watchdogStats.outputWatchCache) watchdogStats.outputWatchCache = {};
+  const cached = watchdogStats.outputWatchCache[dirPath];
+  const nowMs = Date.now();
+  if (!force && cached?.checkedAtMs && nowMs - cached.checkedAtMs < 90_000) {
+    return cached;
+  }
+  try {
+    const listRes = await listSfmFiles(dirPath);
+    const items = Array.isArray(listRes?.files) ? listRes.files : Array.isArray(listRes) ? listRes : [];
+    const summary = summarizeOutputDirectoryEntries(items, nowMs);
+    const record = {
+      path: dirPath,
+      ok: true,
+      checkedAt: new Date(nowMs).toISOString(),
+      checkedAtMs: nowMs,
+      ...summary,
+    };
+    watchdogStats.outputWatchCache[dirPath] = record;
+    return record;
+  } catch (err) {
+    const errRecord = {
+      path: dirPath,
+      ok: false,
+      error: err.message,
+      checkedAt: new Date(nowMs).toISOString(),
+      checkedAtMs: nowMs,
+      fileCount: 0,
+      dirCount: 0,
+      totalSizeMB: 0,
+      latestFileName: null,
+      latestModifiedAt: null,
+      minutesSinceLastWrite: null,
+    };
+    watchdogStats.outputWatchCache[dirPath] = errRecord;
+    return errRecord;
+  }
+}
+
 /**
  * Feature 1, 2, 3, 6: Round-Robin Live Worker Log Scanner, Progress Parser,
  * Goal Completion / Stage-2 Pipeline Detector & Hardware Bad-Node Detector.
@@ -4167,8 +4516,10 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
   const batchSize = options.scanAll ? Math.min(runningRuns.length, 16) : Math.min(runningRuns.length, 2);
   let scannedCount = 0;
   let silentHangRestartsThisPass = 0;
+  let nanRestartsThisPass = 0;
   const silentHangEnabled = state.config.silentHangDetectEnabled !== false;
   const silentHangTimeoutMin = Math.max(5, Number(state.config.silentHangTimeoutMin || 45));
+  const nanGuardEnabled = state.config.nanGuardEnabled !== false;
 
   for (let i = 0; i < batchSize; i++) {
     const idx = (watchdogStats.roundRobinIndex + i) % runningRuns.length;
@@ -4234,6 +4585,10 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
       const hasError = Boolean(matchedKeyword);
       const prevHadError = Boolean(existing?.hasError);
       const prevWasSilentHang = Boolean(existing?.isSilentHang);
+      const prevWasNan = Boolean(existing?.isNanDiverged);
+      const nanState = nanGuardEnabled
+        ? detectLossDivergence(text)
+        : { isDiverged: false, matchedToken: null, matchedLine: null };
       watchdogStats.workerLogSnippets[rId] = {
         runId: rId,
         runName: run.containerName || run.name || `#${rId}`,
@@ -4243,6 +4598,8 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
         isBadNodeHwError,
         matchedKeyword,
         matchedCompleteKw,
+        isNanDiverged: nanState.isDiverged,
+        nanMatchedToken: nanState.matchedToken,
         progress,
         logSignature: hangState.logSignature,
         lastLogChangeAt: hangState.lastLogChangeAt,
@@ -4254,6 +4611,44 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
 
       if (hasError && !prevHadError && detectedNode) {
         recordProblemNodeEvent(detectedNode, matchedKeyword, rId);
+      }
+
+      // Batch 5 - Feature 2: Loss NaN / Inf Divergence Detection & Optional Auto-Restart
+      if (nanState.isDiverged && !prevWasNan && !hasError && !matchedCompleteKw) {
+        watchdogStats.nanDivergedCount = (watchdogStats.nanDivergedCount || 0) + 1;
+        const rName = run.containerName || run.name || `#${rId}`;
+        addLog(
+          "warn",
+          `💥 [학습 발산(NaN/Inf) 감지] ${rName} (#${rId})에서 '${nanState.matchedToken}'이(가) 감지되었습니다. GPU 공회전 여부를 확인해 주세요.`,
+          { runId: rId, runName: rName, matchedToken: nanState.matchedToken, line: nanState.matchedLine }
+        );
+        if (state.config.notifyOnError !== false) {
+          await pushAlertNotification(
+            "warn",
+            `💥 학습 발산(NaN/Inf) 감지 (${rName})`,
+            `워커 #${rId} (${rName}) 로그에서 수치 발산('${nanState.matchedToken}')이 감지되었습니다.\n라인: ${nanState.matchedLine || lastLine}`,
+            { runId: rId, matchedToken: nanState.matchedToken, dedupeKey: `nan-div-${rId}` }
+          );
+        }
+        if (
+          state.config.watchdogEnabled !== false &&
+          state.config.nanAutoRestart === true &&
+          nanRestartsThisPass < 2
+        ) {
+          try {
+            await spaceApi.terminateRun(rId);
+            markRunRecentlyTerminated(rId);
+            nanRestartsThisPass += 1;
+            watchdogStats.nanRestartedCount = (watchdogStats.nanRestartedCount || 0) + 1;
+            watchdogStats.lastActionMessage = `NaN/Inf 발산(${nanState.matchedToken}) 워커 ${rName} (#${rId}) 자동 종료`;
+            addLog(
+              "warn",
+              `🔄 [NaN 발산 자동 종료] 수치 발산('${nanState.matchedToken}')이 발생한 ${rName} (#${rId})를 조기 종료하여 GPU 낭비를 차단했습니다.`
+            );
+          } catch (nanErr) {
+            addLog("error", `[Watchdog] NaN 발산 워커 #${rId} 종료 실패: ${nanErr.message}`);
+          }
+        }
       }
 
       // Silent Hang handling (alert once per hang episode; auto-restart only if `silentHangAutoRestart` is enabled, max 2/pass)
@@ -4649,14 +5044,29 @@ async function buildRunPayload(job, options = {}) {
     .replace(/^-+|-+$/g, "")
     .slice(0, 28);
   const slotTag = `s${String(slotIndex).padStart(2, "0")}`;
-  const containerName = `${cleanPrefix}-${slotTag}-${suffix}`;
+  const pickedTask = options.pickedTask || null;
+  const taskTag = pickedTask?.taskIdx ? `-t${String(pickedTask.taskIdx).padStart(2, "0")}` : "";
+  const containerName = `${cleanPrefix}-${slotTag}${taskTag}-${suffix}`;
 
-  // Feature 3: Replace template placeholders (`{{SLOT}}`, `{{INDEX}}`, `{{TOTAL}}`, `{{NAME}}`) & optionally inject `WORKER_SLOT` env vars
+  // Feature 3 & Batch 5: Replace template placeholders (`{{SLOT}}`, `{{INDEX}}`, `{{TOTAL}}`, `{{NAME}}`, `{{TASK}}`, `{{TASK_ID}}`) & optionally inject `WORKER_SLOT` / `SWEEP_ARGS` env vars
+  const hasExplicitTaskPlaceholder = /\{\{\s*(?:TASK|SWEEP_ARGS)\s*\}\}|\$SWEEP_ARGS\b|\$\{SWEEP_ARGS\}/i.test(
+    rawExecutionCommand
+  );
   let executionCommand = rawExecutionCommand
     .replace(/\{\{\s*(?:WORKER_)?SLOT\s*\}\}/gi, String(slotIndex))
     .replace(/\{\{\s*(?:WORKER_)?INDEX\s*\}\}/gi, String(slotIndex - 1))
     .replace(/\{\{\s*(?:WORKER_)?TOTAL\s*\}\}/gi, String(targetCount))
     .replace(/\{\{\s*(?:WORKER_)?NAME\s*\}\}/gi, containerName);
+
+  if (pickedTask) {
+    executionCommand = executionCommand
+      .replace(/\{\{\s*(?:TASK|SWEEP_ARGS)\s*\}\}/gi, String(pickedTask.taskArg))
+      .replace(/\{\{\s*TASK_ID\s*\}\}/gi, String(pickedTask.taskIdx));
+    if (!hasExplicitTaskPlaceholder && job.appendTaskArgsToCmd !== false) {
+      executionCommand = `${executionCommand} ${pickedTask.taskArg}`;
+    }
+    executionCommand = `export SWEEP_TASK_ID=${pickedTask.taskIdx} SWEEP_TOTAL_TASKS=${pickedTask.totalTasks} SWEEP_ARGS=${shellSingleQuote(pickedTask.taskArg)}; ${executionCommand}`;
+  }
 
   const shouldInjectWorkerEnv = Boolean(job.injectWorkerEnv ?? state.config.injectWorkerEnv);
   if (shouldInjectWorkerEnv && !executionCommand.includes("WORKER_SLOT=")) {
@@ -5387,11 +5797,15 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       const timeBasis = r.startTime || r.registerTime || r.createdAt || null;
       const startMs = timeBasis ? new Date(timeBasis).getTime() : 0;
       const elapsedSec = startMs && !Number.isNaN(startMs) ? Math.max(0, Math.floor((now - startMs) / 1000)) : 0;
+      const { uptimeSec, queueWaitSec } = computeWorkerUptimeSec(r, now);
+      const consoleLinks = buildRunConsoleLinks(r, getSiteProfile());
+      const assignedTaskIdx = extractAssignedTaskIdxFromRun(r, job);
       const rawProgress = snippet?.progress ? { ...snippet.progress } : null;
       return {
         slotIndex: idx + 1,
         stateOrderIndex,
         assignedSlot,
+        assignedTaskIdx,
         isExcessPending,
         id: r.id ?? r.runId,
         name: rName,
@@ -5404,6 +5818,10 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
         startTime: r.startTime || null,
         registerTime: r.registerTime || null,
         elapsedSec,
+        uptimeSec,
+        queueWaitSec,
+        portalRunUrl: consoleLinks.portalRunUrl,
+        webConsoleUrl: consoleLinks.webConsoleUrl,
         approvalStatus: r.approvalStatus || tl?.approvalStatus || (isRunning ? "approved" : "pending"),
         allocationRequestedAt: tl?.allocationRequestedAt || r.registerTime || r.startTime || null,
         createdAt: tl?.createdAt || r.registerTime || r.startTime || null,
@@ -5415,6 +5833,8 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
         lastLogUpdatedAt: snippet?.updatedAt || null,
         hasLogError: Boolean(snippet?.hasError),
         logErrorKeyword: snippet?.matchedKeyword || null,
+        isNanDiverged: Boolean(snippet?.isNanDiverged),
+        nanMatchedToken: snippet?.nanMatchedToken || null,
         isSilentHang: Boolean(snippet?.isSilentHang),
         stalledMinutes: Number(snippet?.stalledMinutes || 0),
         nodeName: snippet?.nodeName || extractNodeIdentifierFromRunOrLog(r, ""),
@@ -5425,6 +5845,21 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     // Feature 5: Detect Straggler workers (`speedVal < 0.55 * medianSpeed`) & aggregate throughput
     const throughputSummary = detectStragglerWorkers(activeWorkers, 0.55);
     const silentHangCount = activeWorkers.filter((w) => w.isSilentHang).length;
+    const nanDivergedCount = activeWorkers.filter((w) => w.isNanDiverged).length;
+    const taskQueueInfo = reconcileTaskQueueProgress(job, matchingRuns);
+    const outputWatchInfo = job.watchOutputDir
+      ? watchdogStats.outputWatchCache?.[String(job.watchOutputDir).trim()] || {
+          path: String(job.watchOutputDir).trim(),
+          ok: true,
+          pendingInitialCheck: true,
+          fileCount: 0,
+          dirCount: 0,
+          totalSizeMB: 0,
+          latestFileName: null,
+          latestModifiedAt: null,
+          minutesSinceLastWrite: null,
+        }
+      : null;
 
     const succeededCount = matchingRuns.filter(
       (r) => classifyRunStatus(r.status || r.state || r.phase) === "SUCCEEDED"
@@ -5455,8 +5890,21 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       isGlobalGpuCapped,
       globalCapWorkers,
       silentHangCount,
+      nanDivergedCount,
       stragglerCount: throughputSummary.stragglerCount,
       throughputSummary,
+      taskQueue: taskQueueInfo.enabled
+        ? {
+            enabled: true,
+            totalTasks: taskQueueInfo.totalTasks,
+            completedCount: taskQueueInfo.completedIndices.length,
+            activeCount: taskQueueInfo.activeIndices.length,
+            remainingCount: taskQueueInfo.remainingIndices.length,
+            isAllCompleted: taskQueueInfo.isAllCompleted,
+          }
+        : null,
+      outputWatch: outputWatchInfo,
+      watchOutputDir: job.watchOutputDir || "",
       allowSpot: Boolean(job.allowSpot),
       coreId: job.coreId,
       coreCountPerWorker,
@@ -5605,6 +6053,7 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     jfItem.gpuHoursToday = Number(telemetryStatus.todayJobGpuHours?.[jfItem.jobName] || 0);
   }
   const queueVelocity = computeQueueAllocationVelocity(runsList, state.jobs, now);
+  const clusterWeather = computeHourlyClusterWeather(runsList, getSiteTelemetryObject(), state.jobs);
   const badNodeCooldownRemainingSec =
     badNodeStats.cooldownUntilMs > now ? Math.ceil((badNodeStats.cooldownUntilMs - now) / 1000) : 0;
 
@@ -5629,6 +6078,7 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
     totalRemainingGpus,
     nextSpawnInSec: globalNextSpawnInSec,
     queueVelocity,
+    clusterWeather,
     spaceReconciliation,
     jobs: jobFleetList,
     autoApprovalTimeline: timelineList.slice(0, 40),
@@ -5640,6 +6090,8 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       silentHangDetectEnabled: state.config.silentHangDetectEnabled !== false,
       silentHangTimeoutMin: Number(state.config.silentHangTimeoutMin || 45),
       silentHangAutoRestart: Boolean(state.config.silentHangAutoRestart),
+      nanGuardEnabled: state.config.nanGuardEnabled !== false,
+      nanAutoRestart: Boolean(state.config.nanAutoRestart),
       customErrorKeywords: state.config.customErrorKeywords || "",
       lastSweepAt: watchdogStats.lastSweepAt,
       zombieTerminatedCount: watchdogStats.zombieTerminatedCount,
@@ -5647,6 +6099,8 @@ function computeWorkerFleetStats(allRuns = getSiteKnownRuns()) {
       logErrorRestartedCount: watchdogStats.logErrorRestartedCount,
       silentHangDetectedCount: watchdogStats.silentHangDetectedCount || 0,
       silentHangRestartedCount: watchdogStats.silentHangRestartedCount || 0,
+      nanDivergedCount: watchdogStats.nanDivergedCount || 0,
+      nanRestartedCount: watchdogStats.nanRestartedCount || 0,
       lastActionMessage: watchdogStats.lastActionMessage,
       workerLogSnippets: watchdogStats.workerLogSnippets,
       failurePostMortems: (watchdogStats.failurePostMortems || []).slice(0, 20),
@@ -5866,8 +6320,47 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
   const configuredTargetPending = Math.max(0, Number(job.targetPendingRuns ?? 0));
   const baseMinConcurrent =
     !forceTrigger && drainBudget.waitingOnDrainJobId ? drainBudget.effectiveMinConcurrent : rawMinConcurrent;
-  const minConcurrent =
+  let minConcurrent =
     !forceTrigger && globalCapWorkers !== null ? Math.min(baseMinConcurrent, globalCapWorkers) : baseMinConcurrent;
+
+  // Batch 5 - Feature 1: Stateful Task Queue Reconciliation & Auto-Completion
+  const inFlightJobTasks =
+    watchdogStats.inFlightTaskReservations?.get(String(job.id)) instanceof Set
+      ? watchdogStats.inFlightTaskReservations.get(String(job.id))
+      : new Set();
+  const taskQueueProg = reconcileTaskQueueProgress(job, matchingRuns, inFlightJobTasks);
+  if (taskQueueProg.enabled) {
+    const prevLen = Array.isArray(job.taskQueueCompletedIdx) ? job.taskQueueCompletedIdx.length : 0;
+    if (taskQueueProg.completedIndices.length !== prevLen) {
+      job.taskQueueCompletedIdx = taskQueueProg.completedIndices;
+      saveState();
+    }
+    if (!forceTrigger && taskQueueProg.isAllCompleted) {
+      job.enabled = false;
+      job.lastStatus = `🎉 태스크 큐 전량 완료! (${taskQueueProg.totalTasks}/${taskQueueProg.totalTasks}개 성공 → 자동 정지됨)`;
+      saveState();
+      addLog(
+        "success",
+        `🎉 [태스크 큐 전량 완료] [${job.name}] 등록된 ${taskQueueProg.totalTasks}개 태스크가 모두 SUCCEEDED 완료되어 규칙을 자동 정지했습니다.`
+      );
+      await pushAlertNotification(
+        "success",
+        `🎉 [${job.name}] 실험 태스크 큐 전량 완료 (${taskQueueProg.totalTasks}건)`,
+        `[${job.name}]에 등록된 ${taskQueueProg.totalTasks}개 실험 태스크가 모두 완료되어 자동 생성을 종료했습니다.`,
+        { jobId: job.id, totalTasks: taskQueueProg.totalTasks, dedupeKey: `tq-done-${job.id}-${taskQueueProg.totalTasks}` }
+      );
+      return { triggered: false, reason: job.lastStatus };
+    }
+    if (!forceTrigger && taskQueueProg.remainingIndices.length === 0) {
+      job.lastStatus = `⏳ 태스크 큐 잔여 항목 실행 중 (완료 ${taskQueueProg.completedIndices.length}/${taskQueueProg.totalTasks} · 진행 ${taskQueueProg.activeIndices.length}개 — 추가 대기 없음)`;
+      saveState();
+      return { triggered: false, reason: job.lastStatus };
+    }
+    if (!forceTrigger) {
+      minConcurrent = Math.min(minConcurrent, activeRuns.length + taskQueueProg.remainingIndices.length);
+    }
+  }
+
   const baseTargetPending =
     !forceTrigger && drainBudget.waitingOnDrainJobId ? drainBudget.effectiveTargetPending : configuredTargetPending;
   const targetPending = Math.min(baseTargetPending, minConcurrent);
@@ -6109,6 +6602,14 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
   // Feature 3: Pick lowest missing Worker Slot Index (1..minConcurrent) and reserve it across concurrent calls
   const nextWorkerSlot = pickNextWorkerSlot(job, activeRuns, minConcurrent);
   const slotReservationKey = reserveWorkerSlot(job.id, nextWorkerSlot);
+  const pickedTask = taskQueueProg.enabled ? pickNextTaskQueueItem(job, matchingRuns, inFlightJobTasks) : null;
+  if (pickedTask) {
+    if (!watchdogStats.inFlightTaskReservations) watchdogStats.inFlightTaskReservations = new Map();
+    if (!watchdogStats.inFlightTaskReservations.has(String(job.id))) {
+      watchdogStats.inFlightTaskReservations.set(String(job.id), new Set());
+    }
+    watchdogStats.inFlightTaskReservations.get(String(job.id)).add(pickedTask.taskIdx);
+  }
   const remainingTargetCapAfterThis = Math.max(0, minConcurrent - (activeRuns.length + 1));
   const remainingAfterThis =
     targetPending > 0
@@ -6121,6 +6622,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       slotIndex: nextWorkerSlot,
       targetCount: minConcurrent,
       overrideAllowSpot: preOverrideAllowSpot,
+      pickedTask,
     });
     const reqIso = new Date().toISOString();
     schedulerLoopStats.lastAllocationRequestAt = reqIso;
@@ -6178,6 +6680,7 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
             targetCount: minConcurrent,
             overrideAllowSpot: altAllowSpot,
             overrideCoreId: altCoreId || undefined,
+            pickedTask,
           });
           createRes = await spaceApi.createRun(payload);
           hybridFallbackStats.fallbackTriggeredCount += 1;
@@ -6195,7 +6698,13 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
     const createdIso = new Date().toISOString();
 
     job.lastTriggeredAt = new Date(now).toISOString();
-    if (createdId) job.lastRunId = createdId;
+    if (createdId) {
+      job.lastRunId = createdId;
+      if (pickedTask) {
+        if (!job.taskQueueRunMap || typeof job.taskQueueRunMap !== "object") job.taskQueueRunMap = {};
+        job.taskQueueRunMap[String(createdId)] = pickedTask.taskIdx;
+      }
+    }
     schedulerLoopStats.lastCreatedAt = createdIso;
     schedulerLoopStats.lastCreatedRunId = createdId;
     schedulerLoopStats.lastCreatedRunName = payload.containerName;
@@ -6286,6 +6795,9 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
     };
   } finally {
     releaseWorkerSlot(job.id, slotReservationKey);
+    if (pickedTask && watchdogStats.inFlightTaskReservations?.get(String(job.id))) {
+      watchdogStats.inFlightTaskReservations.get(String(job.id)).delete(pickedTask.taskIdx);
+    }
   }
 }
 
@@ -6542,6 +7054,13 @@ async function runSchedulerTick(manual = false, options = {}) {
 
       // Feature 2: Round-Robin Live Worker Log Scan (runs after scheduling decisions with short per-call timeout)
       await scanWorkerLogsRoundRobin(allRuns, { scanAll: manual }).catch(() => {});
+
+      // Batch 5 - Feature 3: Output / Checkpoint Directory Watcher (throttled every 90s per directory)
+      for (const wJob of state.jobs) {
+        if (wJob.watchOutputDir && (wJob.enabled || manual)) {
+          await pollWatchedOutputDirIfNeeded(wJob, manual).catch(() => {});
+        }
+      }
 
       // Feature 6: Optional KST Daily Summary Digest
       await maybeDispatchDailyDigest().catch(() => {});
@@ -7444,6 +7963,8 @@ const server = http.createServer(async (req, res) => {
         ...(body.silentHangAutoRestart !== undefined
           ? { silentHangAutoRestart: Boolean(body.silentHangAutoRestart) }
           : {}),
+        ...(body.nanGuardEnabled !== undefined ? { nanGuardEnabled: Boolean(body.nanGuardEnabled) } : {}),
+        ...(body.nanAutoRestart !== undefined ? { nanAutoRestart: Boolean(body.nanAutoRestart) } : {}),
         ...(body.dailyDigestEnabled !== undefined ? { dailyDigestEnabled: Boolean(body.dailyDigestEnabled) } : {}),
         ...(body.dailyDigestHourKst !== undefined
           ? { dailyDigestHourKst: toSafeInt(body.dailyDigestHourKst, state.config.dailyDigestHourKst ?? 9, 0, 23) }
@@ -8515,6 +9036,42 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // 8-A3g. Batch 5 - Feature 1 & 3: Task Queue Reset (`POST /api/jobs/task-queue/reset`) & Output Directory Watcher (`GET /api/space/output-watch`)
+    if (pathname === "/api/jobs/task-queue/reset" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const job =
+        (body.jobId && state.jobs.find((j) => String(j.id) === String(body.jobId))) ||
+        state.jobs.find((j) => j.enabled) ||
+        state.jobs[0] ||
+        null;
+      if (!job) return sendJson(res, 404, { error: "대상 규칙을 찾을 수 없습니다." });
+      job.taskQueueCompletedIdx = [];
+      job.taskQueueRunMap = {};
+      saveState();
+      addLog("info", `🔄 [태스크 큐 초기화] [${job.name}] 완료 기록을 초기화했습니다 (총 ${parseTaskQueueItems(job.taskQueueItems).length}개 항목 재대기).`);
+      return sendJson(res, 200, {
+        ok: true,
+        job,
+        jobs: state.jobs,
+        workerFleet: computeWorkerFleetStats(getSiteKnownRuns()),
+      });
+    }
+
+    if (pathname === "/api/space/output-watch" && req.method === "GET") {
+      const qPath = String(parsedUrl.searchParams.get("path") || "").trim();
+      const qJobId = String(parsedUrl.searchParams.get("jobId") || "").trim();
+      const targetJob =
+        (qJobId && state.jobs.find((j) => String(j.id) === qJobId)) ||
+        state.jobs.find((j) => j.watchOutputDir) ||
+        null;
+      const dirPath = qPath || String(targetJob?.watchOutputDir || "").trim();
+      if (!dirPath) {
+        return sendJson(res, 400, { error: "감시할 볼륨 경로(path)가 지정되지 않았습니다." });
+      }
+      const record = await pollWatchedOutputDirIfNeeded({ watchOutputDir: dirPath }, true);
+      return sendJson(res, 200, { ok: Boolean(record?.ok), outputWatch: record });
+    }
+
     // 8-A3e. Batch 4 - Feature 1: Pre-Flight Script & Syntax Validator (`POST /api/jobs/preflight`)
     if (pathname === "/api/jobs/preflight" && req.method === "POST") {
       const body = await readJsonBody(req);
@@ -9004,6 +9561,25 @@ const server = http.createServer(async (req, res) => {
           body.drainSharedCap !== undefined
             ? toSafeInt(body.drainSharedCap, existingJob?.drainSharedCap ?? 0, 0, 99999)
             : Number(existingJob?.drainSharedCap || 0),
+        watchOutputDir:
+          body.watchOutputDir !== undefined
+            ? String(body.watchOutputDir || "").trim()
+            : String(existingJob?.watchOutputDir || ""),
+        taskQueueItems:
+          body.taskQueueItems !== undefined
+            ? parseTaskQueueItems(body.taskQueueItems)
+            : Array.isArray(existingJob?.taskQueueItems)
+            ? existingJob.taskQueueItems
+            : [],
+        appendTaskArgsToCmd:
+          body.appendTaskArgsToCmd !== undefined
+            ? Boolean(body.appendTaskArgsToCmd)
+            : existingJob?.appendTaskArgsToCmd !== false,
+        taskQueueCompletedIdx: Array.isArray(existingJob?.taskQueueCompletedIdx) ? existingJob.taskQueueCompletedIdx : [],
+        taskQueueRunMap:
+          existingJob?.taskQueueRunMap && typeof existingJob.taskQueueRunMap === "object"
+            ? existingJob.taskQueueRunMap
+            : {},
         _stage2Transitioned:
           existingJob &&
           String(body.executionCommand || "").trim() &&

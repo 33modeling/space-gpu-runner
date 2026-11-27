@@ -112,6 +112,7 @@
         <div class="card-header" style="margin-bottom:12px; padding-bottom:10px;">
           <h2 id="monitorQuickLogTitle">컨테이너 실시간 로그</h2>
           <div class="btn-row">
+            <a id="quickLogConsoleLink" href="#" target="_blank" rel="noopener" class="badge info" style="display:none; text-decoration:none; padding:5px 10px;">SPACE 콘솔 ↗</a>
             <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">새로고침</button>
             <button type="button" class="secondary sm" onclick="switchMainView('workloads', 'log')">워크로드 페이지에서 크게 보기</button>
             <button type="button" class="secondary sm" onclick="closeMonitorQuickLog()">닫기</button>
@@ -163,6 +164,9 @@
 
           <!-- Batch 4: 최근 실패 워커 자동 원인 부검 요약 (실패 건이 있을 때만 표시) -->
           <div id="failurePostMortemPanel" style="display:none; margin-bottom:16px;"></div>
+
+          <!-- Batch 5: 24시간 클러스터 한산도 · Spot 회수율 히트맵 (데이터 축적 시 표시) -->
+          <div id="clusterWeatherPanel" style="display:none; margin-bottom:16px;"></div>
 
           <div style="overflow-x:auto; max-height:460px; overflow-y:auto; border:1px solid var(--border); border-radius:10px;">
             <table>
@@ -217,7 +221,10 @@
           <div style="margin-top:20px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
               <label id="logViewerTitle" style="font-size:13.5px;">컨테이너 실시간 로그</label>
-              <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">로그 새로고침</button>
+              <div class="btn-row">
+                <a id="fullLogConsoleLink" href="#" target="_blank" rel="noopener" class="badge info" style="display:none; text-decoration:none; padding:5px 10px;">SPACE 콘솔 ↗</a>
+                <button type="button" class="secondary sm" onclick="refreshCurrentRunLog()">로그 새로고침</button>
+              </div>
             </div>
             <div id="runLogBox" class="code-box">위 목록에서 컨테이너의 [로그] 버튼을 누르면 표준 출력(stdout/stderr)이 표시됩니다.</div>
           </div>
@@ -494,6 +501,26 @@
                 <option value="">-- 선택 안함 --</option>
               </select>
             </div>
+            <div class="form-group" style="grid-column: span 2;">
+              <label>결과물 · 체크포인트 감시 폴더 (선택 — SFM 주기 확인)</label>
+              <input type="text" id="jobWatchOutputDir" placeholder="예: /user-volume/offpolicy-misranking/v9/outputs" class="mono" />
+            </div>
+          </div>
+
+          <div class="card-subtle" style="margin-top:14px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+              <div>
+                <label style="margin:0; color:var(--text);">실험 태스크 큐 · 스윕 인자 목록 (선택 — 미완료 태스크만 순서대로 배분)</label>
+                <span id="jobTaskQueueStatusBadge" class="badge mono" style="margin-left:8px; display:none;"></span>
+              </div>
+              <div class="btn-row">
+                <label style="display:inline-flex; align-items:center; gap:5px; margin:0; font-size:12px; color:var(--text-secondary);">
+                  <input type="checkbox" id="jobAppendTaskArgs" checked /> 명령어 뒤에 태스크 인자 자동 부착
+                </label>
+                <button type="button" class="secondary sm" onclick="resetJobTaskQueueProgress()">완료 기록 초기화</button>
+              </div>
+            </div>
+            <textarea id="jobTaskQueueText" rows="3" class="mono" placeholder="한 줄에 하나씩 실험 인자 입력 (비워두면 일반 반복 실행 모드)&#10;예: --seed 1 --shard 0&#10;--seed 2 --shard 1" style="width:100%; font-size:12px; line-height:1.5; resize:vertical;"></textarea>
           </div>
 
           <div class="checkbox-row" style="margin-top:14px;">
@@ -812,6 +839,14 @@
               </div>
               <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
                 <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
+                  <input type="checkbox" id="cfgNanGuardEnabled" checked /> 학습 발산(<code>NaN</code> / <code>Inf</code> Loss) 실시간 감지
+                </label>
+                <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin:0; font-size:12px; color:var(--text-secondary);">
+                  <input type="checkbox" id="cfgNanAutoRestart" /> 발산 워커 자동 재시작
+                </label>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:7px; cursor:pointer; margin:0;">
                   <input type="checkbox" id="cfgBadNodeGuardEnabled" checked /> 즉시 실패(불량 노드) 쿨다운 보호
                 </label>
                 <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
@@ -914,6 +949,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=27"></script>
+  <script src="/app.js?v=28"></script>
 </body>
 </html>

@@ -1,10 +1,10 @@
 # 🧪 SPACE Multi-Site GPU Auto-Allocator & Admin Run-Approval Server
 ## 테스트 구성 전략 및 수행 결과 보고서 (Test Strategy & Execution Report)
 
-- **문서 버전**: `v2.8.0`
-- **최종 검증일**: `2026-11-26`
-- **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **60개** 케이스)
+- **문서 버전**: `v2.9.0`
+- **최종 검증일**: `2026-11-27`
+- **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **66개** 케이스)
 
 ---
 
@@ -166,6 +166,12 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-58** | Suite 6 (안전백업스냅샷) | `sanitizeStateForBackup` & `/backup/export` | 토큰 마스킹·임시 상태 제거 스냅샷 생성 및 라이브 백업 다운로드 검증 | ✅ PASS |
 | **TC-59** | Suite 6 (5xx생성멱등재시도) | `isTransientGatewayCreateError` | `createRun` `502/503/504`/타임아웃 일시 장애 판별 및 4xx 배제 검증 | ✅ PASS |
 | **TC-60** | Suite 6 (규칙별GPU시간정산) | `jobGpuHours` / `dailyJobGpuHours` | 규칙별 독립 누적·금일 `GPU-Hours` 적산 및 프론트엔드 표시 바인딩 검증 | ✅ PASS |
+| **TC-61** | Suite 6 (스윕태스크큐) | `reconcileTaskQueueProgress` | 완료 건 스킵, Spot 회수 건 자동 재큐잉 및 전량 완료 판정 검증 | ✅ PASS |
+| **TC-62** | Suite 6 (NaN발산감지) | `detectLossDivergence` | `loss=nan` / `grad_norm=-inf` 감지 및 `nanosecond` 등 정상 단어 오탐 방지 검증 | ✅ PASS |
+| **TC-63** | Suite 6 (산출물폴더감시) | `summarizeOutputDirectoryEntries` | 볼륨 산출물 파일 수·용량(MB)·최근 저장 경과 분 집계 검증 | ✅ PASS |
+| **TC-64** | Suite 6 (터미널CLI제어기) | `bin/gpu-ctl.mjs` | 구문 검사, `help` 출력 및 라이브 `:4300` `status` 연동 검증 | ✅ PASS |
+| **TC-65** | Suite 6 (가동시간/콘솔링크) | `computeWorkerUptimeSec` & `buildRunConsoleLinks` | 슬롯 가동 시간·큐 대기시간 분리 산출 및 SPACE 웹 콘솔 URL 생성 검증 | ✅ PASS |
+| **TC-66** | Suite 6 (24h클러스터날씨) | `computeHourlyClusterWeather` | KST 0~23시 시간대별 배정·대기·회수 히트맵 및 추천/혼잡 시간대 도출 검증 | ✅ PASS |
 
 ---
 

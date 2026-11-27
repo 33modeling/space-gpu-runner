@@ -93,6 +93,15 @@ function createServerLogicSandbox() {
     "classifyFailureRootCause",
     "isTransientGatewayCreateError",
     "sanitizeStateForBackup",
+    "parseTaskQueueItems",
+    "extractAssignedTaskIdxFromRun",
+    "reconcileTaskQueueProgress",
+    "pickNextTaskQueueItem",
+    "detectLossDivergence",
+    "summarizeOutputDirectoryEntries",
+    "computeWorkerUptimeSec",
+    "buildRunConsoleLinks",
+    "computeHourlyClusterWeather",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -1077,12 +1086,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=27`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=7`, `/app.js?v=28`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=7`),
-      fetch(`${BASE_URL}/app.js?v=27`),
+      fetch(`${BASE_URL}/app.js?v=28`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1090,7 +1099,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=27"), true, "라이브 index.html이 최신 캐시버전 app.js?v=27을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=28"), true, "라이브 index.html이 최신 캐시버전 app.js?v=28을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -1644,5 +1653,129 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(serverSrc.includes("siteTel.dailyJobGpuHours[dateKey][jName]"), true);
     assert.equal(serverSrc.includes("jfItem.gpuHoursTotal = Number(telemetryStatus.jobGpuHours?.[jfItem.jobName] || 0)"), true);
     assert.equal(appJsSrc.includes("jf.gpuHoursTotal"), true);
+  });
+
+  test("TC-61: [Batch 5 - Feature 1] `reconcileTaskQueueProgress` & `pickNextTaskQueueItem` 상태 보존형 태스크 큐 자동 분배·재시도 검증", () => {
+    const job = {
+      id: "job-sweep",
+      name: "v9-sweep",
+      taskQueueItems: ["--seed 1", "--seed 2", "--seed 3", "--seed 4"],
+      taskQueueCompletedIdx: [1],
+      taskQueueRunMap: {},
+    };
+    const matchingRuns = [
+      // Task 2 is currently RUNNING
+      { id: "101", containerName: "v9-sweep-s01-t02-1127", status: "RUNNING" },
+      // Task 3 was PREEMPTED (FAILED class) -> must automatically be re-queued!
+      { id: "102", containerName: "v9-sweep-s02-t03-1127", status: "PREEMPTED" },
+      // Task 4 just SUCCEEDED -> must be folded into completedIndices!
+      { id: "103", containerName: "v9-sweep-s03-t04-1127", status: "SUCCEEDED" },
+    ];
+    const prog = srv.reconcileTaskQueueProgress(job, matchingRuns);
+    assert.deepEqual([...prog.completedIndices], [1, 4], "기존 완료(1)와 신규 SUCCEEDED(4)가 합산되어야 함");
+    assert.deepEqual([...prog.activeIndices], [2], "현재 RUNNING 중인 태스크(2)는 active로 분류되어야 함");
+    assert.deepEqual([...prog.remainingIndices], [3], "Spot 회수된 태스크(3)만 재실행 대기열에 남아야 함");
+    assert.equal(prog.isAllCompleted, false);
+
+    const nextPick = srv.pickNextTaskQueueItem(job, matchingRuns);
+    assert.equal(nextPick.taskIdx, 3);
+    assert.equal(nextPick.taskArg, "--seed 3");
+
+    // Once Task 2 & Task 3 also succeed -> isAllCompleted === true!
+    const allDoneRuns = [
+      { id: "101", containerName: "v9-sweep-s01-t02-1127", status: "SUCCEEDED" },
+      { id: "104", containerName: "v9-sweep-s02-t03-1127", status: "SUCCEEDED" },
+      { id: "103", containerName: "v9-sweep-s03-t04-1127", status: "SUCCEEDED" },
+    ];
+    const doneProg = srv.reconcileTaskQueueProgress(job, allDoneRuns);
+    assert.equal(doneProg.isAllCompleted, true);
+  });
+
+  test("TC-62: [Batch 5 - Feature 2] `detectLossDivergence` 학습 중 NaN / Inf 발산 정밀 감지 및 정상 로그 오탐 방지 검증", () => {
+    assert.equal(
+      srv.detectLossDivergence("step 120/1000 | loss=0.3821 | grad_norm=1.24 | elapsed=12000ns (nanosecond timer)").isDiverged,
+      false,
+      "정상 수치 및 nanosecond 같은 일반 단어에서는 오탐하지 않아야 함"
+    );
+    const nanHit = srv.detectLossDivergence("step 121/1000 | train_loss=nan | lr=1e-4");
+    assert.equal(nanHit.isDiverged, true);
+    assert.equal(nanHit.matchedToken, "train_loss=nan");
+
+    const infHit = srv.detectLossDivergence("[Rank 0] step=88 grad_norm: -inf");
+    assert.equal(infHit.isDiverged, true);
+  });
+
+  test("TC-63: [Batch 5 - Feature 3] `summarizeOutputDirectoryEntries` 볼륨 산출물·체크포인트 폴더 요약 검증", () => {
+    const nowMs = Date.parse("2026-11-27T06:00:00.000Z");
+    const entries = [
+      { name: "logs", isDir: true },
+      { name: "ckpt_step_1000.pt", size: 10 * 1024 * 1024, modifiedAt: "2026-11-27T05:30:00.000Z" },
+      { name: "ckpt_step_2000.pt", size: 15 * 1024 * 1024, modifiedAt: "2026-11-27T05:54:00.000Z" },
+    ];
+    const sum = srv.summarizeOutputDirectoryEntries(entries, nowMs);
+    assert.equal(sum.fileCount, 2);
+    assert.equal(sum.dirCount, 1);
+    assert.equal(sum.totalSizeMB, 25);
+    assert.equal(sum.latestFileName, "ckpt_step_2000.pt");
+    assert.equal(sum.minutesSinceLastWrite, 6);
+  });
+
+  test("TC-64: [Batch 5 - Feature 4] 터미널 전용 CLI(`bin/gpu-ctl.mjs`) 구문 검사, `help` 및 라이브 `status` 동작 검증", () => {
+    const cliPath = path.join(ROOT_DIR, "bin", "gpu-ctl.mjs");
+    assert.equal(fs.existsSync(cliPath), true, "bin/gpu-ctl.mjs 파일이 존재해야 함");
+    assert.doesNotThrow(() => {
+      execFileSync(process.execPath, ["--check", cliPath], { encoding: "utf-8" });
+    });
+    const helpOut = execFileSync(process.execPath, [cliPath, "help"], { encoding: "utf-8" });
+    assert.equal(helpOut.includes("SPACE GPU Runner Terminal CLI"), true);
+
+    if (serverReachable) {
+      const stOut = execFileSync(process.execPath, [cliPath, "status"], {
+        encoding: "utf-8",
+        env: { ...process.env, GPU_RUNNER_URL: BASE_URL, RUNNER_PASSWORD: ADMIN_PW },
+      });
+      assert.equal(stOut.includes("[SPACE GPU Runner]"), true);
+    }
+  });
+
+  test("TC-65: [Batch 5 - Feature 5] `computeWorkerUptimeSec` & `buildRunConsoleLinks` 슬롯 생존 시간 및 웹 콘솔 링크 생성 검증", () => {
+    const nowMs = Date.parse("2026-11-27T06:00:00.000Z");
+    const runRunning = {
+      id: "374823",
+      status: "RUNNING",
+      registerTime: "2026-11-27T04:50:00.000Z",
+      startTime: "2026-11-27T05:00:00.000Z",
+      webConsoleUrl: "https://console-viewer.n9.sr-cloud.com/term/374823",
+    };
+    const up = srv.computeWorkerUptimeSec(runRunning, nowMs);
+    assert.equal(up.uptimeSec, 3600);
+    assert.equal(up.queueWaitSec, 600);
+
+    const links = srv.buildRunConsoleLinks(runRunning, { portalUrl: "https://space.n9.sr-cloud.com" });
+    assert.equal(links.webConsoleUrl, "https://console-viewer.n9.sr-cloud.com/term/374823");
+    assert.equal(links.portalRunUrl, "https://space.n9.sr-cloud.com/console/home");
+  });
+
+  test("TC-66: [Batch 5 - Feature 6] `computeHourlyClusterWeather` 24시간 클러스터 노드 배정·회수 날씨 히트맵 집계 검증", () => {
+    const jobs = [{ id: "j-v9", name: "v9", executionCommand: "sh /user-volume/v9/run.sh" }];
+    // 2026-11-26T18:10:00Z = 2026-11-27 03:10 KST (fast 1m wait, 2 promotions)
+    // 2026-11-27T05:20:00Z = 2026-11-27 14:20 KST (2 preemptions)
+    const runs = [
+      { id: "1", containerName: "v9-s01-1127", registerTime: "2026-11-26T18:09:00Z", startTime: "2026-11-26T18:10:00Z" },
+      { id: "2", containerName: "v9-s02-1127", registerTime: "2026-11-26T18:19:00Z", startTime: "2026-11-26T18:20:00Z" },
+    ];
+    const siteTel = {
+      recentPreemptions: [
+        { runId: "10", time: "2026-11-27T05:15:00Z" },
+        { runId: "11", time: "2026-11-27T05:25:00Z" },
+      ],
+    };
+    const weather = srv.computeHourlyClusterWeather(runs, siteTel, jobs);
+    assert.equal(weather.hasData, true);
+    assert.equal(weather.hours.length, 24);
+    assert.equal(weather.hours[3].promotions, 2, "KST 03시에 배정 2건이 집계되어야 함");
+    assert.equal(weather.hours[14].preemptions, 2, "KST 14시에 Spot 회수 2건이 집계되어야 함");
+    assert.equal([...weather.bestHours].includes(3), true);
+    assert.equal([...weather.busyHours].includes(14), true);
   });
 });

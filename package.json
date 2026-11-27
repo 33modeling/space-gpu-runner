@@ -1,13 +1,17 @@
 {
   "name": "space-gpu-runner",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "description": "SPACE (space.n9.sr-cloud.com) Periodic GPU Allocator & Group-Volume Script Runner Web Server",
   "type": "module",
   "main": "server.mjs",
+  "bin": {
+    "gpu-ctl": "./bin/gpu-ctl.mjs"
+  },
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test tests/run-tests.mjs",
-    "check": "node --check server.mjs && node --check public/app.js",
+    "check": "node --check server.mjs && node --check public/app.js && node --check bin/gpu-ctl.mjs",
+    "cli": "node bin/gpu-ctl.mjs",
     "service:install": "bash scripts/manage-service.sh install",
     "service:status": "bash scripts/manage-service.sh status",
     "service:restart": "bash scripts/manage-service.sh restart",

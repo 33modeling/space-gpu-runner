@@ -1204,12 +1204,13 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       const isRun = stUpper.includes("RUN");
       const isExcess = Boolean(w.isExcessPending);
       const hasErr = Boolean(w.hasLogError);
+      const isNanDiv = Boolean(w.isNanDiverged);
       const isSilentHang = Boolean(w.isSilentHang);
       const stalledMin = Number(w.stalledMinutes || 0);
       const prog = w.progress || null;
       const isStraggler = Boolean(prog?.isStraggler);
-      const stClass = hasErr ? "st-err" : isSilentHang ? "st-pend" : isRun ? "st-run" : "st-pend";
-      const statusDotColor = hasErr
+      const stClass = hasErr || isNanDiv ? "st-err" : isSilentHang ? "st-pend" : isRun ? "st-run" : "st-pend";
+      const statusDotColor = hasErr || isNanDiv
         ? "var(--danger-text)"
         : isSilentHang || isStraggler
         ? "var(--warn-text)"
@@ -1219,16 +1220,26 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       const srcTag = w.triggerSource === "auto_scheduler" ? "자동" : "수동";
       const seqNum = i + 1;
       const stateIdx = w.stateOrderIndex || (isRun ? seqNum : seqNum - runningCnt);
+      const taskChip = w.assignedTaskIdx ? ` · T#${w.assignedTaskIdx}` : "";
       const pillHeaderLabel = isRun
-        ? `워커 #${stateIdx}`
+        ? `워커 #${stateIdx}${taskChip}`
         : isExcess
-        ? `초과대기 #${seqNum}`
-        : `대기 #${stateIdx}`;
-      const doneTimeShort = w.approvedAt ? formatPreciseTime(w.approvedAt, false).slice(0, 8) : "";
+        ? `초과대기 #${seqNum}${taskChip}`
+        : `대기 #${stateIdx}${taskChip}`;
+      const liveAgeShort = isRun
+        ? w.uptimeSec !== null && w.uptimeSec !== undefined
+          ? `가동 ${formatDurationSecCompact(w.uptimeSec)}`
+          : ""
+        : w.queueWaitSec !== null && w.queueWaitSec !== undefined
+        ? `대기 ${formatDurationSecCompact(w.queueWaitSec)}`
+        : "";
       const logLineShort = w.lastLogLine ? String(w.lastLogLine).slice(0, 44) : "";
       const nodeTip = w.nodeName ? ` · 노드: ${w.nodeName}` : "";
 
       const progParts = [];
+      if (isNanDiv) {
+        progParts.push(`💥 NaN 발산(${w.nanMatchedToken || "loss=nan"})`);
+      }
       if (isSilentHang) {
         progParts.push(`⏸️ 무응답 ${stalledMin}분`);
       }
@@ -1243,9 +1254,12 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       }
       const progBadgeHtml =
         progParts.length > 0
-          ? `<span style="font-size:10.5px; color:${isSilentHang || isStraggler ? "var(--warn-text)" : "var(--accent-text)"}; font-weight:600;">${escapeHtml(progParts.join(" · "))}</span>`
+          ? `<span style="font-size:10.5px; color:${
+              isNanDiv ? "var(--danger-text)" : isSilentHang || isStraggler ? "var(--warn-text)" : "var(--accent-text)"
+            }; font-weight:600;">${escapeHtml(progParts.join(" · "))}</span>`
           : "";
 
+      const ageBucket = Math.floor(Number((isRun ? w.uptimeSec : w.queueWaitSec) || 0) / 30);
       const slotSig = [
         seqNum,
         stateIdx,
@@ -1253,9 +1267,10 @@ function renderWorkerFleetBoard(fleet, options = {}) {
         isSelected ? 1 : 0,
         isExcess ? 1 : 0,
         hasErr ? 1 : 0,
+        isNanDiv ? 1 : 0,
         isSilentHang ? stalledMin : 0,
         isStraggler ? 1 : 0,
-        doneTimeShort,
+        ageBucket,
         logLineShort,
         progParts.join(","),
       ].join("|");
@@ -1281,7 +1296,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
                 title="이 슬롯(#${escapeHtml(wIdStr)})을 종료하고 목표 워커 수를 -1 줄입니다">-1</button>
             </div>
           </div>
-          <span style="font-size:10.5px; color:var(--muted);">${isRun ? "Running" : escapeHtml(w.status)} · ${srcTag}${doneTimeShort ? ` · ${escapeHtml(doneTimeShort)}` : ""}</span>
+          <span style="font-size:10.5px; color:var(--muted);">${isRun ? "Running" : escapeHtml(w.status)} · ${srcTag}${liveAgeShort ? ` · ${escapeHtml(liveAgeShort)}` : ""}</span>
           ${progBadgeHtml}
           ${
             hasErr
@@ -1356,7 +1371,10 @@ function renderWorkerFleetBoard(fleet, options = {}) {
   const workersWithLogs = activeWorkers.filter((w) => w.lastLogLine);
   const stragglerCount = activeWorkers.filter((w) => w.progress?.isStraggler).length;
   const silentHangCnt = activeWorkers.filter((w) => w.isSilentHang).length;
-  const problemSlotCnt = activeWorkers.filter((w) => w.hasLogError || w.isSilentHang || w.progress?.isStraggler).length;
+  const nanDivCnt = activeWorkers.filter((w) => w.isNanDiverged).length;
+  const problemSlotCnt = activeWorkers.filter(
+    (w) => w.hasLogError || w.isNanDiverged || w.isSilentHang || w.progress?.isStraggler
+  ).length;
   const tp = jf.throughputSummary || null;
   const tpBadgeText =
     tp && tp.speedUnit
@@ -1375,7 +1393,7 @@ function renderWorkerFleetBoard(fleet, options = {}) {
       ? `
       <details class="clean-details" style="margin-top:18px;">
         <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-          <span>가동 워커 진행률 및 최근 로그 요약 (${workersWithLogs.length}/${activeWorkers.length} 스캔${silentHangCnt > 0 ? ` · 무응답 ${silentHangCnt}개` : ""}${stragglerCount > 0 ? ` · 저속 ${stragglerCount}개` : ""}${escapeHtml(tpBadgeText)})</span>
+          <span>가동 워커 진행률 및 최근 로그 요약 (${workersWithLogs.length}/${activeWorkers.length} 스캔${nanDivCnt > 0 ? ` · NaN발산 ${nanDivCnt}개` : ""}${silentHangCnt > 0 ? ` · 무응답 ${silentHangCnt}개` : ""}${stragglerCount > 0 ? ` · 저속 ${stragglerCount}개` : ""}${escapeHtml(tpBadgeText)})</span>
           <span class="mono txt-muted" style="font-size:11.5px; font-weight:400;">Watchdog 교체 ${wd.zombieTerminatedCount || 0}건 · 오류 감지 ${wd.logErrorDetectedCount || 0}건${escapeHtml(probNodesNote)}</span>
         </summary>
         <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:8px; max-height:150px; overflow-y:auto; margin-top:12px;">
@@ -1714,8 +1732,41 @@ function renderWorkerFleetBoard(fleet, options = {}) {
     isSlotBoardFrozen || (autoFreezeOnSlotHover && isMouseOverSlotGrid) ? "display:inline-flex;" : "display:none;";
   const freezeBadgeText = isSlotBoardFrozen ? "화면 수동 고정 중" : "마우스 오버 — 일시 고정됨";
 
-  const slotHeaderSig = `${activeWorkers.length}|${targetCnt}|${isManageVisible ? 1 : 0}|${selectedWorkerRunIds.size}|${isSlotBoardFrozen ? 1 : 0}`;
+  const tq = jf.taskQueue || null;
+  const ow = jf.outputWatch || null;
+  const extraInsightsParts = [];
+  if (tq && tq.enabled) {
+    extraInsightsParts.push(
+      `<span class="badge info mono">태스크 큐: 완료 ${tq.completedCount}/${tq.totalTasks} · 진행 ${tq.activeCount} · 대기 ${tq.remainingCount}</span>`
+    );
+  }
+  if (ow && ow.path) {
+    if (ow.pendingInitialCheck) {
+      extraInsightsParts.push(
+        `<span class="badge mono" style="cursor:pointer;" onclick="refreshWatchedOutputDir('${escapeJsStr(jf.jobId)}')">산출물 감시: ${escapeHtml(ow.path)} (클릭하여 조회)</span>`
+      );
+    } else if (!ow.ok) {
+      extraInsightsParts.push(
+        `<span class="badge warn mono" style="cursor:pointer;" onclick="refreshWatchedOutputDir('${escapeJsStr(jf.jobId)}')">산출물 폴더 조회 대기 (${escapeHtml(ow.path)})</span>`
+      );
+    } else {
+      const staleWarn = runningCnt > 0 && ow.minutesSinceLastWrite !== null && ow.minutesSinceLastWrite >= 120;
+      const recStr = ow.latestFileName
+        ? ` · 최근 ${escapeHtml(ow.latestFileName)} (${ow.minutesSinceLastWrite ?? 0}분 전)`
+        : "";
+      extraInsightsParts.push(
+        `<span class="badge ${staleWarn ? "warn" : "ok"} mono" style="cursor:pointer;" onclick="refreshWatchedOutputDir('${escapeJsStr(jf.jobId)}')" title="클릭하여 결과 폴더 다시 조회">산출물 ${ow.fileCount}개 (${ow.totalSizeMB}MB)${recStr}</span>`
+      );
+    }
+  }
+  const extraInsightsBarHtml =
+    extraInsightsParts.length > 0
+      ? `<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px;">${extraInsightsParts.join("")}</div>`
+      : "";
+
+  const slotHeaderSig = `${activeWorkers.length}|${targetCnt}|${isManageVisible ? 1 : 0}|${selectedWorkerRunIds.size}|${isSlotBoardFrozen ? 1 : 0}|${tq ? `${tq.completedCount}:${tq.activeCount}` : ""}|${ow ? `${ow.fileCount}:${ow.minutesSinceLastWrite}` : ""}`;
   const slotHeaderHtml = `
+    ${extraInsightsBarHtml}
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin:6px 0 12px;">
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
         <span style="font-size:14px; font-weight:600; color:var(--text);">워커 슬롯 (${activeWorkers.length} / ${targetCnt})</span>
@@ -2267,6 +2318,10 @@ function renderConfig(cfg, loopStats = null) {
   }
   const shRestartEl = document.getElementById("cfgSilentHangAutoRestart");
   if (shRestartEl) shRestartEl.checked = Boolean(cfg.silentHangAutoRestart);
+  const nanGuardEl = document.getElementById("cfgNanGuardEnabled");
+  if (nanGuardEl) nanGuardEl.checked = cfg.nanGuardEnabled !== false;
+  const nanRestartEl = document.getElementById("cfgNanAutoRestart");
+  if (nanRestartEl) nanRestartEl.checked = Boolean(cfg.nanAutoRestart);
   const digestEl = document.getElementById("cfgDailyDigestEnabled");
   if (digestEl) digestEl.checked = Boolean(cfg.dailyDigestEnabled);
   if (activeId !== "cfgDailyDigestHourKst" && document.getElementById("cfgDailyDigestHourKst")) {
@@ -2448,6 +2503,12 @@ async function saveConfig(overrideSiteId = "") {
       silentHangTimeoutMin: Number(document.getElementById("cfgSilentHangTimeoutMin")?.value || 45),
       silentHangAutoRestart: document.getElementById("cfgSilentHangAutoRestart")
         ? document.getElementById("cfgSilentHangAutoRestart").checked
+        : false,
+      nanGuardEnabled: document.getElementById("cfgNanGuardEnabled")
+        ? document.getElementById("cfgNanGuardEnabled").checked
+        : true,
+      nanAutoRestart: document.getElementById("cfgNanAutoRestart")
+        ? document.getElementById("cfgNanAutoRestart").checked
         : false,
       badNodeGuardEnabled: document.getElementById("cfgBadNodeGuardEnabled")
         ? document.getElementById("cfgBadNodeGuardEnabled").checked
@@ -3602,6 +3663,26 @@ function loadJobToForm(j, scrollToForm = false, asNewMode = false) {
   document.getElementById("jobName").value = j.name || "group-vol-worker";
   const prioEl = document.getElementById("jobPriority");
   if (prioEl) prioEl.value = Number(j.priority ?? 10);
+  const watchDirEl = document.getElementById("jobWatchOutputDir");
+  if (watchDirEl) watchDirEl.value = j.watchOutputDir || "";
+  const tqTextEl = document.getElementById("jobTaskQueueText");
+  if (tqTextEl) {
+    tqTextEl.value = Array.isArray(j.taskQueueItems) ? j.taskQueueItems.join("\n") : "";
+  }
+  const appendTaskEl = document.getElementById("jobAppendTaskArgs");
+  if (appendTaskEl) appendTaskEl.checked = j.appendTaskArgsToCmd !== false;
+  const tqBadgeEl = document.getElementById("jobTaskQueueStatusBadge");
+  if (tqBadgeEl) {
+    const tqCnt = Array.isArray(j.taskQueueItems) ? j.taskQueueItems.length : 0;
+    const doneCnt = Array.isArray(j.taskQueueCompletedIdx) ? j.taskQueueCompletedIdx.length : 0;
+    if (tqCnt > 0) {
+      tqBadgeEl.style.display = "inline-flex";
+      tqBadgeEl.className = doneCnt >= tqCnt ? "badge ok mono" : "badge info mono";
+      tqBadgeEl.textContent = `완료 ${doneCnt} / 전체 ${tqCnt}`;
+    } else {
+      tqBadgeEl.style.display = "none";
+    }
+  }
   document.getElementById("jobMode").value = j.mode || "ensure_running";
   document.getElementById("jobUseSpecId").value = j.useSpecId || "";
   document.getElementById("jobMinConcurrent").value = j.minConcurrentRuns || 1;
@@ -3706,6 +3787,11 @@ function collectJobFormPayload() {
     id: document.getElementById("jobId").value || "job-" + Date.now(),
     name: (document.getElementById("jobName").value || "group-vol-worker").trim(),
     priority: Math.max(1, Number(document.getElementById("jobPriority")?.value || 10)),
+    watchOutputDir: (document.getElementById("jobWatchOutputDir")?.value || "").trim(),
+    taskQueueItems: document.getElementById("jobTaskQueueText")?.value || "",
+    appendTaskArgsToCmd: document.getElementById("jobAppendTaskArgs")
+      ? document.getElementById("jobAppendTaskArgs").checked
+      : true,
     mode: document.getElementById("jobMode").value,
     useSpecId: document.getElementById("jobUseSpecId").value,
     minConcurrentRuns,
@@ -4172,7 +4258,7 @@ function selectWorkerGroup(mode, jobId) {
   } else if (mode === "problem") {
     selectedWorkerRunIds.clear();
     for (const w of workers) {
-      if (w.hasLogError || w.isSilentHang || w.progress?.isStraggler) {
+      if (w.hasLogError || w.isNanDiverged || w.isSilentHang || w.progress?.isStraggler) {
         selectedWorkerRunIds.add(String(w.id));
       }
     }
@@ -4578,6 +4664,7 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
   }
 
   renderFailurePostMortems(fleetObj?.watchdog?.failurePostMortems || []);
+  renderClusterWeatherPanel(fleetObj?.clusterWeather || null);
 
   if (!displayList.length) {
     updateHtmlIfSigChanged(
@@ -4735,6 +4822,28 @@ async function viewRunLog(runId, name) {
   if (titleEl) titleEl.textContent = titleText;
   const box = document.getElementById("runLogBox");
   if (box) box.textContent = "로그 불러오는 중...";
+
+  // Batch 5 - Feature 5: Populate 1-click SPACE Console / Portal link for this worker
+  let consoleUrl = "";
+  for (const jfItem of latestWorkerFleet?.jobs || []) {
+    const found = (jfItem.activeWorkers || []).find((w) => String(w.id) === String(runId));
+    if (found) {
+      consoleUrl = found.webConsoleUrl || found.portalRunUrl || "";
+      break;
+    }
+  }
+  if (!consoleUrl) {
+    const activeSiteObj = (sitesList || []).find((s) => s.id === currentSiteId);
+    const portalBase = String(activeSiteObj?.portalUrl || "https://space.n9.sr-cloud.com").replace(/\/$/, "");
+    consoleUrl = `${portalBase}/console/home`;
+  }
+  for (const linkId of ["quickLogConsoleLink", "fullLogConsoleLink"]) {
+    const aEl = document.getElementById(linkId);
+    if (aEl && consoleUrl) {
+      aEl.href = consoleUrl;
+      aEl.style.display = "inline-flex";
+    }
+  }
 
   const quickCard = document.getElementById("monitorQuickLogCard");
   const quickTitle = document.getElementById("monitorQuickLogTitle");
@@ -5450,6 +5559,99 @@ async function importBackupSnapshotFile(fileInput) {
     alert("백업 파일 복원 실패: " + e.message);
   } finally {
     fileInput.value = "";
+  }
+}
+
+function renderClusterWeatherPanel(weather) {
+  const panel = document.getElementById("clusterWeatherPanel");
+  if (!panel) return;
+  if (!weather || !weather.hasData || !Array.isArray(weather.hours)) {
+    panel.style.display = "none";
+    panel.innerHTML = "";
+    panel.removeAttribute("data-render-sig");
+    return;
+  }
+  const sig = weather.hours.map((h) => `${h.hour}:${h.promotions}:${h.preemptions}:${h.avgWaitMin ?? ""}`).join("|");
+  if (panel.getAttribute("data-render-sig") === sig) return;
+  panel.setAttribute("data-render-sig", sig);
+  panel.style.display = "block";
+
+  const bestStr =
+    Array.isArray(weather.bestHours) && weather.bestHours.length > 0
+      ? `추천 배정 시간대: ${weather.bestHours.map((h) => `${String(h).padStart(2, "0")}시`).join(", ")}`
+      : "";
+  const busyStr =
+    Array.isArray(weather.busyHours) && weather.busyHours.length > 0
+      ? `혼잡/회수 주의: ${weather.busyHours.map((h) => `${String(h).padStart(2, "0")}시`).join(", ")}`
+      : "";
+
+  panel.innerHTML = `
+    <details class="clean-details">
+      <summary style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <span>24시간 클러스터 노드 배정 속도 · Spot 회수 히트맵 (KST 기준)</span>
+        <span class="mono txt-muted" style="font-size:11.5px; font-weight:400;">${escapeHtml([bestStr, busyStr].filter(Boolean).join(" · "))}</span>
+      </summary>
+      <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(74px, 1fr)); gap:6px; margin-top:12px;">
+        ${weather.hours
+          .map((h) => {
+            const isBest = (weather.bestHours || []).includes(h.hour);
+            const isBusy = (weather.busyHours || []).includes(h.hour);
+            const bg = isBest
+              ? "var(--success-soft)"
+              : isBusy
+              ? "var(--warn-soft)"
+              : "var(--panel)";
+            const bd = isBest
+              ? "var(--success-border)"
+              : isBusy
+              ? "var(--warn-border)"
+              : "var(--border)";
+            return `<div class="mono" style="padding:6px 8px; border-radius:7px; background:${bg}; border:1px solid ${bd}; font-size:11px;">
+              <div style="font-weight:600; color:var(--text);">${escapeHtml(h.label)}</div>
+              <div class="txt-secondary" style="font-size:10px;">배정 ${h.promotions}건</div>
+              <div class="txt-muted" style="font-size:10px;">${
+                h.preemptions > 0 ? `회수 ${h.preemptions}건` : h.avgWaitMin !== null ? `대기 ${h.avgWaitMin}m` : "-"
+              }</div>
+            </div>`;
+          })
+          .join("")}
+      </div>
+    </details>
+  `;
+}
+
+async function refreshWatchedOutputDir(jobId) {
+  try {
+    const res = await api(`/api/space/output-watch?jobId=${encodeURIComponent(jobId || "")}`);
+    const ow = res.outputWatch;
+    if (ow?.ok) {
+      showToast(`📂 산출물 폴더 확인 완료: 파일 ${ow.fileCount}개 (${ow.totalSizeMB}MB)${ow.latestFileName ? ` · 최근 ${ow.latestFileName}` : ""}`);
+    } else {
+      showToast(`⚠️ 산출물 폴더 조회 실패: ${ow?.error || "경로를 확인해 주세요"}`);
+    }
+    await loadServerState();
+  } catch (e) {
+    showToast("산출물 폴더 조회 실패: " + e.message);
+  }
+}
+
+async function resetJobTaskQueueProgress() {
+  const jobId = document.getElementById("jobId")?.value || "";
+  if (!jobId) return;
+  const ok = confirm("이 규칙의 태스크 큐 완료 기록을 초기화하여 1번 항목부터 다시 실행할 수 있도록 하시겠습니까?");
+  if (!ok) return;
+  try {
+    const res = await api("/api/jobs/task-queue/reset", {
+      method: "POST",
+      body: JSON.stringify({ jobId }),
+    });
+    if (res.job) {
+      loadJobToForm(res.job, false, false);
+    }
+    showToast("🔄 태스크 큐 완료 기록이 초기화되었습니다.");
+    await loadServerState();
+  } catch (e) {
+    alert("태스크 큐 초기화 실패: " + e.message);
   }
 }
 
