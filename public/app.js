@@ -4029,7 +4029,7 @@ async function triggerSchedulerTick() {
 // ============================================================================
 // Run-Approval (/run-approval) & TaskOrbit Queue Functions
 // ============================================================================
-async function loadApprovals() {
+async function loadApprovals(options = {}) {
   if (!sessionPassword) return;
   const reqSiteId = currentSiteId;
   const tbody = document.getElementById("approvalsTableBody");
@@ -4042,7 +4042,7 @@ async function loadApprovals() {
     if (data.approvalLoopStats) {
       latestApprovalStats = data.approvalLoopStats;
       renderApprovalLoopStatus(data.approvalLoopStats, serverState?.config || {});
-      renderConfig(serverState?.config || {}, data.approvalLoopStats);
+      renderConfig(serverState?.config || {}, data.approvalLoopStats, { background: Boolean(options?.background) });
     }
     if (Array.isArray(data.autoApprovalTimeline)) {
       latestAutoApprovalTimeline = data.autoApprovalTimeline;
@@ -4288,7 +4288,9 @@ function toggleSelectWorkerRun(runId, forceVal) {
 }
 
 function selectWorkerGroup(mode, jobId) {
-  const jf = getFocusedJobFleet(latestWorkerFleet);
+  const jf =
+    (jobId && (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(jobId))) ||
+    getFocusedJobFleet(latestWorkerFleet);
   const workers = jf?.activeWorkers || [];
   if (mode === "none") {
     selectedWorkerRunIds.clear();
@@ -4738,8 +4740,9 @@ function renderSpaceRunsTable(runs = latestRawSpaceRuns, fleet = latestWorkerFle
     return;
   }
 
-  renderFailurePostMortems(fleetObj?.watchdog?.failurePostMortems || []);
-  renderClusterWeatherPanel(fleetObj?.clusterWeather || null);
+  const resolvedFleet = fleet || latestWorkerFleet;
+  renderFailurePostMortems(resolvedFleet?.watchdog?.failurePostMortems || []);
+  renderClusterWeatherPanel(resolvedFleet?.clusterWeather || null);
 
   if (!displayList.length) {
     updateHtmlIfSigChanged(

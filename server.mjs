@@ -5526,6 +5526,9 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
             );
           } else {
             activeJob.enabled = false;
+            activeJob.draining = false;
+            activeJob._pendingRefillImmediate = false;
+            activeJob._knownPendingRunIds = [];
             activeJob.lastStatus = `🏁 목표 완료 키워드('${matchedCompleteKw}') 감지됨 — 자동 정지 완료`;
             pipelineStats.completedCount += 1;
             pipelineStats.lastCompletedAt = new Date().toISOString();
@@ -5649,12 +5652,15 @@ async function runWatchdogSweep(allRuns = getSiteKnownRuns()) {
   const now = Date.now();
   const runsList = Array.isArray(allRuns) ? allRuns : [];
 
-  // Strictly restrict Watchdog termination to runs matching our site's job rules (NEVER terminate colleagues' Pending runs in the group!)
-  const activeRuns = runsList.filter(
-    (r) =>
-      classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
-      state.jobs.some((j) => doesRunMatchJob(r, j, state.jobs))
-  );
+  // Strictly restrict Watchdog termination to runs owned by current user & matching enabled site job rules (NEVER terminate colleagues' Pending runs!)
+  const myUser = resolveCurrentUserName();
+  const activeRuns = runsList.filter((r) => {
+    if (classifyRunStatus(r.status || r.state || r.phase) !== "ACTIVE") return false;
+    if (!isRunOwnedByUser(r, myUser)) return false;
+    const runUser = String(r.userId || r.userName || r.user || "").trim();
+    if (myUser && myUser !== "admin" && runUser && runUser.toLowerCase() !== String(myUser).toLowerCase()) return false;
+    return state.jobs.some((j) => j.enabled && doesRunMatchJob(r, j, state.jobs));
+  });
   const nonRunningActive = activeRuns.filter(
     (r) => !String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING")
   );
@@ -7346,6 +7352,9 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
         );
       } else if (state.config.autoStopOnComplete !== false) {
         job.enabled = false;
+        job.draining = false;
+        job._pendingRefillImmediate = false;
+        job._knownPendingRunIds = [];
         job.lastStatus = `🏁 목표 성공 횟수(${succeededCount}/${maxSucc}회) 달성 완료 — 자동 정지됨`;
         pipelineStats.completedCount += 1;
         pipelineStats.lastCompletedAt = new Date(now).toISOString();
@@ -11096,6 +11105,7 @@ const server = http.createServer(async (req, res) => {
       if (body.clearBackoff) {
         loadMonitorStats.backoffUntilMs = 0;
         loadMonitorStats.consecutiveErrors = 0;
+        loadMonitorStats.backoffReason = null;
         loadMonitorStats.lastBackoffReason = null;
       }
       saveState();

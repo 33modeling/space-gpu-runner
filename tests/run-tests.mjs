@@ -1110,12 +1110,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=33`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=34`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=8`),
-      fetch(`${BASE_URL}/app.js?v=33`),
+      fetch(`${BASE_URL}/app.js?v=34`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1123,7 +1123,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=33"), true, "라이브 index.html이 최신 캐시버전 app.js?v=33을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=34"), true, "라이브 index.html이 최신 캐시버전 app.js?v=34을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -2248,6 +2248,58 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       serverSrc.includes('!(String(a?.jobId || "") === String(jobId) && a?.status === "pending")'),
       true,
       "규칙 삭제 시 해당 규칙의 대기 예약도 함께 정리되어야 함"
+    );
+  });
+
+  test("TC-93: [4차 감사 회귀 방지] `renderSpaceRunsTable` 내 미선언 변수(`fleetObj`) 부재 및 정상 렌더링 참조 검증", () => {
+    const fnStart = appJsSrc.indexOf("function renderSpaceRunsTable(");
+    assert.ok(fnStart > 0);
+    const fnSlice = appJsSrc.slice(fnStart, fnStart + 6500);
+    assert.equal(fnSlice.includes("fleetObj"), false, "renderSpaceRunsTable 내부에 미선언 fleetObj 참조가 없어야 함");
+    assert.equal(fnSlice.includes("const resolvedFleet = fleet || latestWorkerFleet;"), true);
+  });
+
+  test("TC-94: [4차 감사 정적 전수 검증] `index.html` 및 `app.js`의 모든 인라인 이벤트 핸들러(`onclick` 등)가 실제 선언된 함수를 참조함", () => {
+    const appFns = new Set([
+      ...[...appJsSrc.matchAll(/\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g)].map((m) => m[1]),
+      ...[...appJsSrc.matchAll(/\b(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=/g)].map((m) => m[1]),
+      "alert", "confirm", "prompt", "Boolean", "Number", "String", "parseInt", "parseFloat", "encodeURIComponent", "if", "event",
+    ]);
+    const missing = [];
+    for (const [label, src] of [["index.html", indexHtmlSrc], ["app.js", appJsSrc]]) {
+      src.split("\n").forEach((line, idx) => {
+        for (const m of line.matchAll(/\bon(?:click|change|input|submit|keydown|keyup)\s*=\s*"([^"]+)"/gi)) {
+          for (const fm of m[1].matchAll(/(?<![.\w$])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g)) {
+            if (!appFns.has(fm[1])) missing.push(`${label}:L${idx + 1}:${fm[1]}`);
+          }
+        }
+      });
+    }
+    assert.deepEqual(missing, [], `미정의 인라인 핸들러 함수 호출이 없어야 함: ${missing.join(", ")}`);
+  });
+
+  test("TC-95: [4차 감사 회귀 방지] `loadApprovals` 백그라운드 갱신 시 `isSettingsFormDirty` 보호 전달 및 `selectWorkerGroup` `jobId` 반영 검증", () => {
+    assert.equal(
+      appJsSrc.includes("async function loadApprovals(options = {})"),
+      true,
+      "loadApprovals가 background 옵션을 수신해야 함"
+    );
+    assert.equal(
+      appJsSrc.includes("renderConfig(serverState?.config || {}, data.approvalLoopStats, { background: Boolean(options?.background) })"),
+      true
+    );
+    assert.equal(
+      appJsSrc.includes("(jobId && (latestWorkerFleet?.jobs || []).find((j) => String(j.jobId) === String(jobId)))"),
+      true
+    );
+  });
+
+  test("TC-96: [4차 감사 회귀 방지] `clearBackoff`의 `backoffReason` 초기화 및 `runWatchdogSweep` 활성 규칙·본인 소유 이중 가드 검증", () => {
+    assert.equal(serverSrc.includes("loadMonitorStats.backoffReason = null;"), true);
+    assert.equal(
+      serverSrc.includes("return state.jobs.some((j) => j.enabled && doesRunMatchJob(r, j, state.jobs));"),
+      true,
+      "Watchdog 좀비 스윕은 활성화된 본인 규칙의 런만 검사해야 함"
     );
   });
 });

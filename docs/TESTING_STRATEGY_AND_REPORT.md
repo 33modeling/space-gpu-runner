@@ -4,7 +4,7 @@
 - **문서 버전**: `v3.1.0`
 - **최종 검증일**: `2026-11-27`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **92개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **96개** 케이스)
 
 ---
 
@@ -198,6 +198,10 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-90** | Suite 6 (저장후실행필드보존) | `POST /api/jobs/trigger` | `[저장 후 지금 +1 실행]` 시 `maxGpuHours`, `taskQueueItems`, `watchOutputDir`, `priority` 유실 방지 검증 | ✅ PASS |
 | **TC-91** | Suite 6 (설정폼편집보호) | `renderConfig` (`isSettingsFormDirty`) | `[시스템 설정]` 수정 중 5초 백그라운드 폴링이 미저장 입력·체크박스를 덮어쓰지 않음을 검증 | ✅ PASS |
 | **TC-92** | Suite 6 (장기가동메모리/고아정리) | `DELETE /api/jobs/:id` · `watchdogStats` | 규칙 삭제 시 대기 예약 정리 및 장기 가동 캐시(`workerLogSnippets`, `taskQueueRunMap`) 상한 검증 | ✅ PASS |
+| **TC-93** | Suite 6 (워크로드테이블참조무결성) | `renderSpaceRunsTable` | 미선언 지역 변수(`fleetObj`) 참조 제거 및 워크로드 테이블 정상 렌더링 검증 | ✅ PASS |
+| **TC-94** | Suite 6 (인라인핸들러전수검증) | `index.html` · `app.js` | HTML 및 동적 템플릿의 모든 `onclick`/`onchange`/`oninput` 핸들러 함수 선언 무결성 검증 | ✅ PASS |
+| **TC-95** | Suite 6 (승인폴링보호/그룹선택) | `loadApprovals` · `selectWorkerGroup` | 15초 승인 백그라운드 갱신의 설정 폼 보호(`background: true`) 및 슬롯 그룹 선택 `jobId` 반영 검증 | ✅ PASS |
+| **TC-96** | Suite 6 (백오프해제/좀비가드) | `POST /api/load-guard` · `runWatchdogSweep` | `clearBackoff` 시 `backoffReason` 초기화 및 Watchdog 활성 규칙·본인 소유 이중 가드 검증 | ✅ PASS |
 
 ---
 
