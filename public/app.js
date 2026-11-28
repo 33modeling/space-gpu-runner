@@ -199,6 +199,7 @@ async function selectSpaceSite(siteId, options = {}) {
   lastKnownActiveWorkerIdsSig = "";
   selectedWorkerRunIds.clear();
   latestRawSpaceRuns = [];
+  isSettingsFormDirty = false;
   window._initialEditorLoaded = false;
   if (typeof closeMonitorQuickLog === "function") {
     closeMonitorQuickLog();
@@ -504,7 +505,7 @@ async function loadServerState(options = {}) {
     }
     maybeTriggerBrowserAlert(data.alerts || data.workerFleet?.notifications?.alerts || [], data.config);
     renderTopAutoStatusBanner();
-    renderConfig(data.config, data.approvalLoopStats);
+    renderConfig(data.config, data.approvalLoopStats, { background: Boolean(options.background) });
     renderApprovalLoopStatus(data.approvalLoopStats, data.config);
     renderPresetsBar(data.presets || latestWorkerFleet?.presets || []);
     renderWorkerFleetBoard(latestWorkerFleet);
@@ -2022,10 +2023,12 @@ async function quickUpdateTargetWorkers(jobId, valueOrOpts) {
   );
   const baseVal = Number(jf?.minConcurrentRuns ?? jf?.targetCount ?? document.getElementById("quickTargetInput")?.value ?? 1);
   const rawTarget =
-    typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
-      ? baseVal + Number(valueOrOpts.delta || 0)
+    typeof valueOrOpts === "object" && valueOrOpts !== null
+      ? valueOrOpts.delta !== undefined
+        ? baseVal + Number(valueOrOpts.delta || 0)
+        : Number(valueOrOpts.absolute ?? valueOrOpts.value ?? baseVal)
       : Number(valueOrOpts || 1);
-  const target = Math.max(1, Math.min(9999, Math.round(rawTarget)));
+  const target = Math.max(1, Math.min(9999, Math.round(Number.isFinite(rawTarget) ? rawTarget : baseVal || 1)));
   syncAllQuickTargetInputsDom(target, gpusPerWorker, resolvedJobId);
   if (jf) {
     jf.minConcurrentRuns = target;
@@ -2080,10 +2083,12 @@ async function quickUpdateTargetGpus(jobId, valueOrOpts) {
     jf?.targetGpuCount ?? (jf?.minConcurrentRuns ?? jf?.targetCount ?? 1) * gpusPerWorker
   );
   const rawTargetGpus =
-    typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
-      ? baseGpus + Number(valueOrOpts.delta || 0)
+    typeof valueOrOpts === "object" && valueOrOpts !== null
+      ? valueOrOpts.delta !== undefined
+        ? baseGpus + Number(valueOrOpts.delta || 0)
+        : Number(valueOrOpts.absolute ?? valueOrOpts.value ?? baseGpus)
       : Number(valueOrOpts || gpusPerWorker);
-  const requestedGpus = Math.max(1, Math.min(99999, Math.round(rawTargetGpus)));
+  const requestedGpus = Math.max(1, Math.min(99999, Math.round(Number.isFinite(rawTargetGpus) ? rawTargetGpus : baseGpus || gpusPerWorker)));
   const targetWorkers = Math.max(1, Math.ceil(requestedGpus / gpusPerWorker));
   syncAllQuickTargetInputsDom(targetWorkers, gpusPerWorker, resolvedJobId);
   if (jf) {
@@ -2140,10 +2145,12 @@ async function quickUpdateTargetPending(jobId, valueOrOpts) {
   const quickInputEl = document.getElementById("quickTargetPendingInput");
   const baseVal = Number(jf?.targetPendingCount ?? quickInputEl?.value ?? 0);
   const rawTargetPending =
-    typeof valueOrOpts === "object" && valueOrOpts !== null && valueOrOpts.delta !== undefined
-      ? baseVal + Number(valueOrOpts.delta || 0)
+    typeof valueOrOpts === "object" && valueOrOpts !== null
+      ? valueOrOpts.delta !== undefined
+        ? baseVal + Number(valueOrOpts.delta || 0)
+        : Number(valueOrOpts.absolute ?? valueOrOpts.value ?? baseVal)
       : Number(valueOrOpts ?? 0);
-  const targetPending = Math.max(0, Math.min(9999, Math.round(rawTargetPending)));
+  const targetPending = Math.max(0, Math.min(9999, Math.round(Number.isFinite(rawTargetPending) ? rawTargetPending : baseVal || 0)));
   if (quickInputEl) quickInputEl.value = targetPending;
   const pendInput = document.getElementById("jobTargetPending");
   if (pendInput) pendInput.value = targetPending;
@@ -2277,11 +2284,25 @@ function renderApprovalLoopStatus(stats, cfg = serverState?.config || {}) {
   }
 }
 
-function renderConfig(cfg, loopStats = null) {
+let isSettingsFormDirty = false;
+document.addEventListener("input", (e) => {
+  if (e.target && typeof e.target.closest === "function" && e.target.closest("#viewSettingsSection")) {
+    isSettingsFormDirty = true;
+  }
+});
+document.addEventListener("change", (e) => {
+  if (e.target && typeof e.target.closest === "function" && e.target.closest("#viewSettingsSection")) {
+    isSettingsFormDirty = true;
+  }
+});
+
+function renderConfig(cfg, loopStats = null, options = {}) {
   const activeProf = getActiveSiteProfile(currentSiteId);
   const siteHost = getActiveSiteHost(currentSiteId);
   const siteLabel = `${activeProf.id.toUpperCase()} (${activeProf.gpuModel})`;
   const activeId = document.activeElement?.id || "";
+  const skipFormInputs = Boolean(options?.background && isSettingsFormDirty);
+  if (!skipFormInputs) {
   if (activeId !== "cfgBaseUrl") document.getElementById("cfgBaseUrl").value = cfg.baseUrl || activeProf.baseUrl || "https://mlp.n9.sr-cloud.com";
   if (activeId !== "cfgSfmUrl") document.getElementById("cfgSfmUrl").value = cfg.sfmUrl || activeProf.sfmUrl || "https://sfsm.n9.sr-cloud.com";
   if (activeId !== "cfgAccessToken") document.getElementById("cfgAccessToken").value = cfg.accessToken || "";
@@ -2315,7 +2336,7 @@ function renderConfig(cfg, loopStats = null) {
   const wdEl = document.getElementById("cfgWatchdogEnabled");
   if (wdEl) wdEl.checked = cfg.watchdogEnabled !== false;
   if (activeId !== "cfgMaxPendingTimeoutMin" && document.getElementById("cfgMaxPendingTimeoutMin")) {
-    document.getElementById("cfgMaxPendingTimeoutMin").value = cfg.maxPendingTimeoutMin ?? 20;
+    document.getElementById("cfgMaxPendingTimeoutMin").value = cfg.maxPendingTimeoutMin ?? 120;
   }
   const logRestartEl = document.getElementById("cfgLogErrorAutoRestart");
   if (logRestartEl) logRestartEl.checked = Boolean(cfg.logErrorAutoRestart);
@@ -2386,6 +2407,10 @@ function renderConfig(cfg, loopStats = null) {
   }
 
   document.getElementById("cfgSchedulerEnabled").checked = Boolean(cfg.schedulerEnabled);
+  } // end if (!skipFormInputs)
+  if (cfg.bookmarkletSyncKey) {
+    updateBookmarkletHref(cfg.bookmarkletSyncKey);
+  }
 
   const loadGuardBadge = document.getElementById("loadGuardBadge");
   if (loadGuardBadge) {
@@ -2508,10 +2533,10 @@ async function saveConfig(overrideSiteId = "") {
       watchdogEnabled: document.getElementById("cfgWatchdogEnabled")
         ? document.getElementById("cfgWatchdogEnabled").checked
         : true,
-      maxPendingTimeoutMin: Number(document.getElementById("cfgMaxPendingTimeoutMin")?.value || 20),
+      maxPendingTimeoutMin: Number(document.getElementById("cfgMaxPendingTimeoutMin")?.value || 120),
       logErrorAutoRestart: document.getElementById("cfgLogErrorAutoRestart")
         ? document.getElementById("cfgLogErrorAutoRestart").checked
-        : true,
+        : false,
       injectWorkerEnv: document.getElementById("cfgInjectWorkerEnv")
         ? document.getElementById("cfgInjectWorkerEnv").checked
         : false,
@@ -2576,6 +2601,7 @@ async function saveConfig(overrideSiteId = "") {
         localStorage.setItem("space_active_site_id", currentSiteId);
       } catch {}
     }
+    isSettingsFormDirty = false;
     applyUiRefreshInterval(payload.uiRefreshIntervalSec);
     const savedProf = getActiveSiteProfile(currentSiteId);
     showToast(
@@ -5910,7 +5936,7 @@ function renderQuickPaletteSuggestions(rawText = "") {
       items.push({
         label: `⚡ ${parsed.jobName ? `[${parsed.jobName}] ` : ""}목표 워커 수를 ${parsed.workers}개로 즉시 변경`,
         hint: "Enter 실행",
-        action: () => quickUpdateTargetWorkers(parsed.jobId || undefined, { absolute: parsed.workers }),
+        action: () => quickUpdateTargetWorkers(parsed.jobId || undefined, parsed.workers),
       });
     } else if (parsed.type === "set_gpus") {
       items.push({
@@ -6134,7 +6160,16 @@ function computePresetScheduleIso(presetVal, nowMs = Date.now()) {
 function onSelectSchedTimePreset(val) {
   const dtInput = document.getElementById("schedCustomDateTime");
   if (!dtInput) return;
-  dtInput.style.display = val === "custom" ? "inline-block" : "none";
+  if (val === "custom") {
+    dtInput.style.display = "inline-block";
+    if (!dtInput.value) {
+      const plus1h = new Date(Date.now() + 60 * 60 * 1000);
+      const localIso = new Date(plus1h.getTime() - plus1h.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      dtInput.value = localIso;
+    }
+  } else {
+    dtInput.style.display = "none";
+  }
 }
 
 function onChangeSchedActionType(actionType) {

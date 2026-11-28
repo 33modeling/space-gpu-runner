@@ -4,7 +4,7 @@
 - **문서 버전**: `v3.1.0`
 - **최종 검증일**: `2026-11-27`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **88개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **92개** 케이스)
 
 ---
 
@@ -194,6 +194,10 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-86** | Suite 6 (팔레트백업/포커스) | `public/app.js` | `Ctrl+K` 명령 팔레트의 `exportBackupSnapshot()` 및 `selectFleetJobTab()` 함수 정의 무결성 검증 | ✅ PASS |
 | **TC-87** | Suite 6 (미존재파일/한글헤더/SSE) | `readSfmFile` · `/api/jobs/report` · `broadcastSseEvent` | 미존재 파일 템플릿 통과 차단, 한글 규칙명 리포트 RFC5987 인코딩, 멀티 사이트 SSE 타이머 격리 검증 | ✅ PASS |
 | **TC-88** | Suite 6 (승인접두사/정규식방어) | `shouldAutoApproveItem` · `searchWorkerLogLines` | 본인 런 접두사(`v9-s01-...`) 승인 매칭 및 비정상 정규식 예외 방어 검증 | ✅ PASS |
+| **TC-89** | Suite 6 (팔레트수량NaN방어) | `quickUpdateTargetWorkers` | `Ctrl+K` 팔레트 워커 변경(`v9 30`) 시 `NaN` 변환 오류 차단 및 숫자/객체 양방향 호환 검증 | ✅ PASS |
+| **TC-90** | Suite 6 (저장후실행필드보존) | `POST /api/jobs/trigger` | `[저장 후 지금 +1 실행]` 시 `maxGpuHours`, `taskQueueItems`, `watchOutputDir`, `priority` 유실 방지 검증 | ✅ PASS |
+| **TC-91** | Suite 6 (설정폼편집보호) | `renderConfig` (`isSettingsFormDirty`) | `[시스템 설정]` 수정 중 5초 백그라운드 폴링이 미저장 입력·체크박스를 덮어쓰지 않음을 검증 | ✅ PASS |
+| **TC-92** | Suite 6 (장기가동메모리/고아정리) | `DELETE /api/jobs/:id` · `watchdogStats` | 규칙 삭제 시 대기 예약 정리 및 장기 가동 캐시(`workerLogSnippets`, `taskQueueRunMap`) 상한 검증 | ✅ PASS |
 
 ---
 

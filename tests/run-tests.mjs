@@ -1110,12 +1110,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=32`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=33`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=8`),
-      fetch(`${BASE_URL}/app.js?v=32`),
+      fetch(`${BASE_URL}/app.js?v=33`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1123,7 +1123,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=32"), true, "라이브 index.html이 최신 캐시버전 app.js?v=32을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=33"), true, "라이브 index.html이 최신 캐시버전 app.js?v=33을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -2207,5 +2207,47 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     // 2) 잘못된 정규식 전달 시에도 예외(throw) 없이 안전하게 빈 결과 반환
     const badRxRes = srv.searchWorkerLogLines("step 10 loss=0.5", { query: "loss=[unclosed", isRegex: true });
     assert.equal(badRxRes.matchCount, 0);
+  });
+
+  test("TC-89: [회귀 방지] `Ctrl+K` 팔레트 워커 변경(`v9 30`) 시 `{ absolute: 30 }` NaN 오류 차단 검증", () => {
+    assert.equal(
+      appJsSrc.includes("quickUpdateTargetWorkers(parsed.jobId || undefined, parsed.workers)"),
+      true,
+      "팔레트 워커 변경 시 숫자 값을 직접 전달해야 함"
+    );
+    assert.equal(
+      appJsSrc.includes("valueOrOpts.absolute ?? valueOrOpts.value"),
+      true,
+      "객체 형태({ absolute })가 전달되어도 NaN 없이 안전 변환되어야 함"
+    );
+  });
+
+  test("TC-90: [회귀 방지] `POST /api/jobs/trigger`(`jobData`) 실행 시 `maxGpuHours`, `taskQueueItems`, `watchOutputDir`, `priority` 보존 검증", () => {
+    const triggerBlockIdx = serverSrc.indexOf('pathname === "/api/jobs/trigger"');
+    assert.ok(triggerBlockIdx > 0);
+    const triggerSlice = serverSrc.slice(triggerBlockIdx, triggerBlockIdx + 5500);
+    assert.equal(triggerSlice.includes("...(existingJob || {})"), true, "기존 규칙의 런타임·확장 필드를 보존해야 함");
+    assert.equal(triggerSlice.includes("maxGpuHours:"), true);
+    assert.equal(triggerSlice.includes("taskQueueItems:"), true);
+    assert.equal(triggerSlice.includes("watchOutputDir:"), true);
+  });
+
+  test("TC-91: [회귀 방지] `[시스템 설정]` 편집 중 백그라운드 폴링의 입력값 덮어쓰기 방지(`isSettingsFormDirty`) 검증", () => {
+    assert.equal(appJsSrc.includes("let isSettingsFormDirty = false;"), true);
+    assert.equal(
+      appJsSrc.includes("const skipFormInputs = Boolean(options?.background && isSettingsFormDirty);"),
+      true,
+      "시스템 설정 수정 중 백그라운드 갱신이 체크박스·입력값을 초기화하지 않아야 함"
+    );
+  });
+
+  test("TC-92: [회귀 방지] 규칙 삭제 시 고아 예약 정리 및 장기 가동 메모리 상한(`workerLogSnippets`, `taskQueueRunMap`) 검증", () => {
+    assert.equal(serverSrc.includes("Object.keys(watchdogStats.workerLogSnippets).length <= 240"), true);
+    assert.equal(serverSrc.includes("mapKeys.length > 500"), true);
+    assert.equal(
+      serverSrc.includes('!(String(a?.jobId || "") === String(jobId) && a?.status === "pending")'),
+      true,
+      "규칙 삭제 시 해당 규칙의 대기 예약도 함께 정리되어야 함"
+    );
   });
 });

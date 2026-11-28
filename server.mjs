@@ -5387,6 +5387,16 @@ async function scanWorkerLogsRoundRobin(allRuns = getSiteKnownRuns(), options = 
         isSilentHang: hangState.isSilentHang,
         updatedAt: new Date(nowScanMs).toISOString(),
       };
+      const snippetKeys = Object.keys(watchdogStats.workerLogSnippets);
+      if (snippetKeys.length > 300) {
+        const activeIdSet = new Set(runsList.filter((r) => classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE").map((r) => String(r.id ?? r.runId ?? "")));
+        for (const sk of snippetKeys) {
+          if (Object.keys(watchdogStats.workerLogSnippets).length <= 240) break;
+          if (!activeIdSet.has(sk)) {
+            delete watchdogStats.workerLogSnippets[sk];
+          }
+        }
+      }
       scannedCount += 1;
 
       if (hasError && !prevHadError && detectedNode) {
@@ -7630,6 +7640,13 @@ async function evaluateJobRule(job, allRuns, forceTrigger = false, options = {})
       if (pickedTask) {
         if (!job.taskQueueRunMap || typeof job.taskQueueRunMap !== "object") job.taskQueueRunMap = {};
         job.taskQueueRunMap[String(createdId)] = pickedTask.taskIdx;
+        const mapKeys = Object.keys(job.taskQueueRunMap);
+        if (mapKeys.length > 500) {
+          mapKeys.sort((a, b) => Number(a) - Number(b));
+          for (const oldK of mapKeys.slice(0, mapKeys.length - 400)) {
+            delete job.taskQueueRunMap[oldK];
+          }
+        }
       }
     }
     schedulerLoopStats.lastCreatedAt = createdIso;
@@ -8505,6 +8522,7 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        "Access-Control-Allow-Origin": "*",
         "X-Accel-Buffering": "no",
       });
       res.write(`event: connected\ndata: ${JSON.stringify({ ok: true, siteId: getCurrentSiteId(), ts: Date.now() })}\n\n`);
@@ -10823,6 +10841,9 @@ const server = http.createServer(async (req, res) => {
       job.enabled = body.enabled !== undefined ? Boolean(body.enabled) : !job.enabled;
       if (!job.enabled) {
         job.draining = false;
+        job._pendingRefillImmediate = false;
+        job._knownPendingRunIds = [];
+        job._incompletePendingBatchRetryAtMs = 0;
       } else {
         job._pendingRefillImmediate = true;
       }
@@ -11099,6 +11120,16 @@ const server = http.createServer(async (req, res) => {
       const jobId = safeDecodeURIComponent(pathname.split("/").pop() || "");
       if (jobId === null) return sendJson(res, 400, { error: "Malformed job ID" });
       state.jobs = state.jobs.filter((j) => j.id !== jobId);
+      for (const j of rawState.jobs || []) {
+        if (j && String(j.drainNextJobId || "") === String(jobId)) {
+          j.drainNextJobId = "";
+        }
+      }
+      if (Array.isArray(rawState.scheduledActions)) {
+        rawState.scheduledActions = rawState.scheduledActions.filter(
+          (a) => !(String(a?.jobId || "") === String(jobId) && a?.status === "pending")
+        );
+      }
       saveState();
       addLog("warn", `자동 실행 규칙 삭제됨: ${jobId}`);
       return sendJson(res, 200, { ok: true, jobs: state.jobs, workerFleet: computeWorkerFleetStats(getSiteKnownRuns()) });
@@ -11119,9 +11150,11 @@ const server = http.createServer(async (req, res) => {
         const existingJob = idx >= 0 ? state.jobs[idx] : null;
         const fallbackJob = existingJob || state.jobs[0] || {};
         const updatedJob = {
+          ...(existingJob || {}),
           id: targetId,
           siteId: normalizeSiteId(d.siteId || existingJob?.siteId || getCurrentSiteId()),
           name: String(d.name || existingJob?.name || "group-vol-worker").trim(),
+          priority: toSafeInt(d.priority, existingJob?.priority ?? 10, 1, 999),
           enabled: d.enabled !== undefined ? Boolean(d.enabled) : Boolean(existingJob?.enabled ?? true),
           mode: d.mode || existingJob?.mode || "ensure_running",
           useSpecId: d.useSpecId !== undefined ? String(d.useSpecId || "").trim() : String(existingJob?.useSpecId || ""),
@@ -11168,6 +11201,37 @@ const server = http.createServer(async (req, res) => {
           cooldownSec: toSafeInt(d.cooldownSec, existingJob?.cooldownSec ?? 15, 1, 86400),
           volumeClaim: Array.isArray(d.volumeClaim) ? d.volumeClaim : fallbackJob.volumeClaim || [],
           injectWorkerEnv: d.injectWorkerEnv !== undefined ? Boolean(d.injectWorkerEnv) : existingJob?.injectWorkerEnv,
+          watchOutputDir:
+            d.watchOutputDir !== undefined
+              ? String(d.watchOutputDir || "").trim()
+              : String(existingJob?.watchOutputDir || ""),
+          maxGpuHours:
+            d.maxGpuHours !== undefined
+              ? Math.max(0, Number(parseFiniteNumber(d.maxGpuHours) || 0))
+              : Math.max(0, Number(existingJob?.maxGpuHours || 0)),
+          budgetCapAction:
+            d.budgetCapAction !== undefined
+              ? d.budgetCapAction === "stop"
+                ? "stop"
+                : "drain"
+              : existingJob?.budgetCapAction === "stop"
+              ? "stop"
+              : "drain",
+          taskQueueItems:
+            d.taskQueueItems !== undefined
+              ? parseTaskQueueItems(d.taskQueueItems)
+              : Array.isArray(existingJob?.taskQueueItems)
+              ? existingJob.taskQueueItems
+              : [],
+          appendTaskArgsToCmd:
+            d.appendTaskArgsToCmd !== undefined
+              ? Boolean(d.appendTaskArgsToCmd)
+              : existingJob?.appendTaskArgsToCmd !== false,
+          taskQueueCompletedIdx: Array.isArray(existingJob?.taskQueueCompletedIdx) ? existingJob.taskQueueCompletedIdx : [],
+          taskQueueRunMap:
+            existingJob?.taskQueueRunMap && typeof existingJob.taskQueueRunMap === "object"
+              ? existingJob.taskQueueRunMap
+              : {},
           maxTotalSucceededRuns:
             d.maxTotalSucceededRuns !== undefined
               ? toSafeInt(d.maxTotalSucceededRuns, existingJob?.maxTotalSucceededRuns ?? 0, 0, 999999)
