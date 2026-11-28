@@ -192,9 +192,9 @@ async function main() {
     const job = findJobByNameOrId(jobs, pos[1]);
     if (!job) throw new Error(`Rule not found: ${pos[1] || ""}`);
     const count = Math.max(1, Number(pos[2] || 1));
-    const res = await apiCall("/api/space/runs/spawn-extra", {
+    const res = await apiCall("/api/jobs/trigger", {
       method: "POST",
-      body: { jobId: job.id, count },
+      body: { jobId: job.id, spawnCount: count },
       siteId,
     });
     console.log(`[OK] [${job.name}] Spawned ${res.spawnedCount || count} worker(s).`);
@@ -205,14 +205,18 @@ async function main() {
     const job = findJobByNameOrId(jobs, pos[1]);
     if (!job) throw new Error(`Rule not found: ${pos[1] || ""}`);
     if (flags.stop) {
-      await apiCall("/api/jobs/drain", { method: "POST", body: { jobId: job.id, draining: false }, siteId });
+      await apiCall("/api/jobs/drain", {
+        method: "POST",
+        body: { jobId: job.id, action: "stop_drain", draining: false },
+        siteId,
+      });
       console.log(`[OK] [${job.name}] Graceful drain stopped.`);
       return;
     }
     const nextJob = flags.next ? findJobByNameOrId(jobs, String(flags.next)) : null;
     await apiCall("/api/jobs/drain", {
       method: "POST",
-      body: { jobId: job.id, draining: true, nextJobId: nextJob?.id || "", cancelPending: true },
+      body: { jobId: job.id, action: "start_drain", draining: true, nextJobId: nextJob?.id || "", cancelPending: true },
       siteId,
     });
     console.log(`[OK] [${job.name}] Graceful drain started${nextJob ? ` -> handover to [${nextJob.name}]` : ""}.`);

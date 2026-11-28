@@ -642,9 +642,11 @@
                 <span id="sfmPreviewMeta" class="badge mono" style="margin-left:8px;"></span>
               </div>
               <div class="btn-row">
-                <button type="button" class="secondary sm" onclick="previewSfmDataFile(currentSfmPreviewPath, 'head')">앞 100줄</button>
-                <button type="button" class="secondary sm" onclick="previewSfmDataFile(currentSfmPreviewPath, 'tail')">뒤 100줄</button>
-                <button type="button" class="sm" onclick="downloadSfmDataFile(currentSfmPreviewPath)">파일 다운로드</button>
+                <span id="sfmPreviewFileBtns" class="btn-row">
+                  <button type="button" class="secondary sm" onclick="previewSfmDataFile(currentSfmPreviewPath, 'head')">앞 100줄</button>
+                  <button type="button" class="secondary sm" onclick="previewSfmDataFile(currentSfmPreviewPath, 'tail')">뒤 100줄</button>
+                  <button type="button" class="sm" onclick="downloadSfmDataFile(currentSfmPreviewPath)">파일 다운로드</button>
+                </span>
                 <button type="button" class="secondary sm" onclick="document.getElementById('sfmQuickPreviewPanel').style.display='none'">닫기</button>
               </div>
             </div>
@@ -1048,6 +1050,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=30"></script>
+  <script src="/app.js?v=31"></script>
 </body>
 </html>

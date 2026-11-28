@@ -1108,12 +1108,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=30`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=31`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=8`),
-      fetch(`${BASE_URL}/app.js?v=30`),
+      fetch(`${BASE_URL}/app.js?v=31`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1121,7 +1121,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=30"), true, "라이브 index.html이 최신 캐시버전 app.js?v=30을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=31"), true, "라이브 index.html이 최신 캐시버전 app.js?v=31을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -2097,5 +2097,48 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
       false,
       "목표 하향·간격 수정 시 전역 쿨다운을 무시하는 호출이 없어야 함"
     );
+  });
+
+  test("TC-81: [버그 감사 회귀 방지] `recordProblemNodeEvent`(`lastAt`/`lastReason`)와 `evaluateProblemNodeQuarantine` 필드 호환성 검증", () => {
+    const nowMs = Date.now();
+    const legacyShapeNodes = {
+      "worker-node-07": {
+        node: "worker-node-07",
+        count: 3,
+        lastReason: "NCCL timeout",
+        lastAt: new Date(nowMs - 60000).toISOString(),
+      },
+    };
+    const q = srv.evaluateProblemNodeQuarantine(legacyShapeNodes, 0, nowMs, 25);
+    assert.equal(q.isQuarantineActive, true, "`lastAt`/`lastReason` 형식으로 저장된 불량 노드도 정상 격리 감지되어야 함");
+    assert.equal(q.highestRepeatNode, "worker-node-07");
+    assert.equal(q.quarantinedNodes[0].lastError, "NCCL timeout");
+  });
+
+  test("TC-82: [버그 감사 회귀 방지] `POST /api/jobs/preflight` 웹 에디터 객체 캐시(`state.scriptFiles[sp].content`) 인식 및 스케줄러 OFF 시에도 시각 예약 실행 검증", () => {
+    assert.equal(
+      serverSrc.includes("cachedScriptEntry?.content === \"string\""),
+      true,
+      "Pre-Flight 점검이 객체 형태의 scriptFiles[sp].content 캐시를 정상 읽어야 함"
+    );
+    assert.equal(
+      serverSrc.includes("rt.isScheduleExecRunning = true"),
+      true,
+      "1초 메인 루프에서 스케줄러 일시정지 여부와 무관하게 시각 예약 작업을 적시 실행해야 함"
+    );
+  });
+
+  test("TC-83: [버그 감사 회귀 방지] `bin/gpu-ctl.mjs` CLI 엔드포인트(`POST /api/jobs/trigger`, `action: start_drain/stop_drain`) 정합성 검증", () => {
+    const cliSrc = fs.readFileSync(path.join(ROOT_DIR, "bin", "gpu-ctl.mjs"), "utf-8");
+    assert.equal(cliSrc.includes("/api/space/runs/spawn-extra"), false, "존재하지 않는 404 경로 참조가 없어야 함");
+    assert.equal(cliSrc.includes('"/api/jobs/trigger"'), true, "실제 존재하는 /api/jobs/trigger 엔드포인트를 호출해야 함");
+    assert.equal(cliSrc.includes('action: "stop_drain"'), true);
+    assert.equal(cliSrc.includes('action: "start_drain"'), true);
+  });
+
+  test("TC-84: [버그 감사 회귀 방지] `Ctrl+K` 팔레트 `getFocusedJobFleet` 참조 무결성 및 폴더 집계 시 파일 다운로드 경로 오염 방지 검증", () => {
+    assert.equal(appJsSrc.includes("getFocusedMonitorJobFleet"), false, "미정의 함수 getFocusedMonitorJobFleet 참조가 없어야 함");
+    assert.equal(appJsSrc.includes("const jf = getFocusedJobFleet(latestWorkerFleet);"), true);
+    assert.equal(appJsSrc.includes("currentSfmPreviewPath = dirPath"), false, "폴더 집계 시 단일 파일 미리보기 경로 변수를 덮어쓰지 않아야 함");
   });
 });

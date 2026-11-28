@@ -3683,13 +3683,19 @@ function recordProblemNodeEvent(nodeId, reason, runId = "") {
     node: cleanNode,
     count: 0,
     lastReason: "",
+    lastError: "",
     lastRunId: "",
     lastAt: null,
+    lastSeenAt: null,
   };
+  const nowIso = new Date().toISOString();
+  const cleanReason = String(reason || "error").slice(0, 100);
   existing.count += 1;
-  existing.lastReason = String(reason || "error").slice(0, 100);
+  existing.lastReason = cleanReason;
+  existing.lastError = cleanReason;
   if (runId) existing.lastRunId = String(runId);
-  existing.lastAt = new Date().toISOString();
+  existing.lastAt = nowIso;
+  existing.lastSeenAt = nowIso;
   badNodeStats.problemNodes[cleanNode] = existing;
 
   const keys = Object.keys(badNodeStats.problemNodes);
@@ -4138,6 +4144,7 @@ function sanitizeStateForBackup(rawStateObj, { includeTokens = false } = {}) {
     sites: cleanSites,
     jobs: cleanJobs,
     presets: Array.isArray(src.presets) ? src.presets : [],
+    scheduledActions: Array.isArray(src.scheduledActions) ? src.scheduledActions : [],
     scriptFiles: src.scriptFiles && typeof src.scriptFiles === "object" ? src.scriptFiles : {},
   };
 }
@@ -4664,14 +4671,15 @@ function evaluateProblemNodeQuarantine(
   for (const [nodeName, info] of Object.entries(problemNodesMap || {})) {
     if (!nodeName || !info || typeof info !== "object") continue;
     const count = Number(info.count || 0);
-    const lastSeenMs = info.lastSeenAt ? new Date(info.lastSeenAt).getTime() : 0;
+    const seenIso = info.lastSeenAt || info.lastAt || null;
+    const lastSeenMs = seenIso ? new Date(seenIso).getTime() : 0;
     const isRecent = lastSeenMs > 0 && nowMs - lastSeenMs <= 30 * 60 * 1000;
     if (isRecent && count >= 2) {
       quarantinedNodes.push({
         node: nodeName,
         count,
-        lastError: info.lastError || "",
-        lastSeenAt: info.lastSeenAt || null,
+        lastError: info.lastError || info.lastReason || "",
+        lastSeenAt: seenIso,
       });
       if (count > maxCount) {
         maxCount = count;
@@ -4796,14 +4804,36 @@ async function executeDueScheduledActions(nowMs = Date.now()) {
         }
         summary = `[${targetJob.name}] 자동 생성 ${nextOn ? "ON 활성화" : "일시정지(OFF)"}`;
       } else if (act.actionType === "start_drain") {
-        targetJob.draining = true;
-        targetJob.drainNextJobId = String(act.drainNextJobId || "");
-        const nextJob = targetJob.drainNextJobId
-          ? state.jobs.find((j) => String(j.id) === targetJob.drainNextJobId)
+        const nextJob = act.drainNextJobId
+          ? state.jobs.find((j) => String(j.id) === String(act.drainNextJobId))
           : null;
+        const knownRuns = getSiteKnownRuns(activeSid);
+        const runningCnt = knownRuns.filter(
+          (r) =>
+            classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
+            String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING") &&
+            doesRunMatchJob(r, targetJob, state.jobs)
+        ).length;
+        if (runningCnt === 0) {
+          targetJob.draining = false;
+          targetJob.enabled = false;
+          targetJob.drainNextJobId = "";
+          targetJob.drainSharedCap = 0;
+        } else {
+          targetJob.enabled = true;
+          targetJob.draining = true;
+          targetJob.drainNextJobId = nextJob ? String(nextJob.id) : "";
+          targetJob.drainSharedCap = Math.max(
+            toSafeInt(targetJob.minConcurrentRuns, 1, 1, 99999),
+            nextJob ? toSafeInt(nextJob.minConcurrentRuns, 1, 1, 99999) : 0,
+            runningCnt
+          );
+        }
         if (nextJob) {
           nextJob.enabled = true;
           nextJob.draining = false;
+          nextJob._pendingRefillImmediate = true;
+          state.config.schedulerEnabled = true;
         }
         summary = `[${targetJob.name}] 무중단 드레이닝 개시${nextJob ? ` → 후속 [${nextJob.name}] 자동 인계` : ""}`;
       } else if (act.actionType === "set_command") {
@@ -7919,13 +7949,29 @@ setInterval(() => {
     siteContextStorage.run(siteId, async () => {
       try {
         const rt = getSiteRuntime(siteId);
+        const now = Date.now();
+
+        // 0. Check Scheduled Autopilot actions every second regardless of `schedulerEnabled` or `checkIntervalSec`!
+        if (!rt.isScheduleExecRunning && Array.isArray(rawState.scheduledActions) && rawState.scheduledActions.length > 0) {
+          rt.isScheduleExecRunning = true;
+          try {
+            const executed = await executeDueScheduledActions(now);
+            if (executed.length > 0) {
+              rt.lastSchedulerTickTime = 0;
+            }
+          } catch {
+            // ignore
+          } finally {
+            rt.isScheduleExecRunning = false;
+          }
+        }
+
         if (!state.config.accessToken) return;
         if (!state.config.groupId) {
           await ensureGroupIdConfigured();
           if (!state.config.groupId) return;
         }
 
-        const now = Date.now();
         const knownRuns = getSiteKnownRuns(siteId);
         const hasNonRunningActive = knownRuns.some(
           (r) =>
@@ -9617,6 +9663,9 @@ const server = http.createServer(async (req, res) => {
         "logErrorAutoRestart",
         "silentHangDetectEnabled",
         "silentHangAutoRestart",
+        "nanGuardEnabled",
+        "nanAutoRestart",
+        "ttlPreWarmEnabled",
         "injectWorkerEnv",
         "hybridFallbackEnabled",
         "timeScaleEnabled",
@@ -9646,6 +9695,7 @@ const server = http.createServer(async (req, res) => {
       const intSpecs = {
         maxPendingTimeoutMin: [120, 3, 10080],
         silentHangTimeoutMin: [45, 5, 1440],
+        ttlPreWarmLeadMin: [15, 2, 180],
         dailyDigestHourKst: [9, 0, 23],
         globalMaxGpus: [0, 0, 999999],
         dayTargetWorkers: [20, 1, 9999],
@@ -10142,8 +10192,15 @@ const server = http.createServer(async (req, res) => {
         for (const sp of scriptPaths) {
           let content = null;
           let sourceLabel = "SFM 원격 스토리지";
-          if (state.scriptFiles && typeof state.scriptFiles[sp] === "string") {
-            content = state.scriptFiles[sp];
+          const cachedScriptEntry = state.scriptFiles ? state.scriptFiles[sp] : null;
+          const cachedScriptText =
+            typeof cachedScriptEntry === "string"
+              ? cachedScriptEntry
+              : typeof cachedScriptEntry?.content === "string"
+              ? cachedScriptEntry.content
+              : null;
+          if (cachedScriptText !== null) {
+            content = cachedScriptText;
             sourceLabel = "웹 에디터 동기화 캐시";
           } else if (state.config.accessToken) {
             try {
@@ -10236,6 +10293,15 @@ const server = http.createServer(async (req, res) => {
       }
       if (snap.scriptFiles && typeof snap.scriptFiles === "object") {
         rawState.scriptFiles = { ...(rawState.scriptFiles || {}), ...snap.scriptFiles };
+      }
+      if (Array.isArray(snap.scheduledActions)) {
+        const existingSchedIds = new Set((rawState.scheduledActions || []).map((a) => String(a?.id || "")));
+        const importedPending = snap.scheduledActions.filter(
+          (a) => a && a.id && a.status === "pending" && !existingSchedIds.has(String(a.id))
+        );
+        if (importedPending.length > 0) {
+          rawState.scheduledActions = [...(rawState.scheduledActions || []), ...importedPending].slice(-200);
+        }
       }
       saveState();
       addLog("info", `📦 [설정·규칙 백업 복원] 규칙 ${restoredJobsCount}건 · 프리셋 ${restoredPresetsCount}건 병합 복원 완료`);
@@ -10716,7 +10782,10 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const job = state.jobs.find((j) => String(j.id) === String(body.jobId));
       if (!job) return sendJson(res, 404, { error: "Job rule not found" });
-      const action = String(body.action || (job.draining ? "stop_drain" : "start_drain"));
+      const action = String(
+        body.action ||
+          (body.draining === false ? "stop_drain" : body.draining === true ? "start_drain" : job.draining ? "stop_drain" : "start_drain")
+      );
 
       if (action === "stop_drain") {
         job.draining = false;

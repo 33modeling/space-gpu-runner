@@ -203,6 +203,11 @@ async function selectSpaceSite(siteId, options = {}) {
   if (typeof closeMonitorQuickLog === "function") {
     closeMonitorQuickLog();
   }
+  const diffPanel = document.getElementById("ruleDiffOrReportPanel");
+  if (diffPanel) diffPanel.style.display = "none";
+  const sfmPrevPanel = document.getElementById("sfmQuickPreviewPanel");
+  if (sfmPrevPanel) sfmPrevPanel.style.display = "none";
+  connectSseEventStream();
   try {
     await api("/api/sites/select", {
       method: "POST",
@@ -5771,8 +5776,10 @@ async function previewSfmDataFile(filePath, mode = "tail") {
   const titleEl = document.getElementById("sfmPreviewTitle");
   const metaEl = document.getElementById("sfmPreviewMeta");
   const boxEl = document.getElementById("sfmPreviewContentBox");
+  const fileBtnsEl = document.getElementById("sfmPreviewFileBtns");
   if (!panel || !boxEl) return;
   panel.style.display = "block";
+  if (fileBtnsEl) fileBtnsEl.style.display = "inline-flex";
   if (titleEl) titleEl.textContent = target;
   if (metaEl) metaEl.textContent = "불러오는 중...";
   boxEl.textContent = "볼륨 파일을 읽는 중입니다...";
@@ -5917,7 +5924,7 @@ function renderQuickPaletteSuggestions(rawText = "") {
         label: `📄 슬롯 또는 컨테이너 #${parsed.target} 실시간 로그 열기`,
         hint: "Enter 실행",
         action: () => {
-          const jf = getFocusedMonitorJobFleet(latestWorkerFleet);
+          const jf = getFocusedJobFleet(latestWorkerFleet);
           const num = Number(parsed.target);
           const bySlot = (jf?.activeWorkers || []).find(
             (w) => Number(w.assignedSlot) === num || Number(w.slotIndex) === num || String(w.id) === parsed.target
@@ -6058,8 +6065,12 @@ function connectSseEventStream() {
   try {
     const url = `/api/events?pw=${encodeURIComponent(sessionPassword)}&siteId=${encodeURIComponent(currentSiteId)}`;
     sseSource = new EventSource(url);
-    sseSource.addEventListener("state_changed", () => {
+    sseSource.addEventListener("state_changed", (ev) => {
       if (!sessionPassword || document.hidden) return;
+      try {
+        const payload = ev?.data ? JSON.parse(ev.data) : {};
+        if (payload.siteId && payload.siteId !== currentSiteId) return;
+      } catch {}
       clearTimeout(sseRefreshDebounceTimer);
       sseRefreshDebounceTimer = setTimeout(() => {
         loadServerState({ background: true });
@@ -6342,10 +6353,11 @@ async function aggregateSfmFolderJsonl() {
   const titleEl = document.getElementById("sfmPreviewTitle");
   const metaEl = document.getElementById("sfmPreviewMeta");
   const boxEl = document.getElementById("sfmPreviewContentBox");
+  const fileBtnsEl = document.getElementById("sfmPreviewFileBtns");
   if (!panel || !boxEl) return;
 
-  currentSfmPreviewPath = dirPath;
   panel.style.display = "block";
+  if (fileBtnsEl) fileBtnsEl.style.display = "none";
   if (titleEl) titleEl.textContent = `📊 샤드·결과 집계: ${dirPath}`;
   if (metaEl) metaEl.textContent = "스캔 중...";
   boxEl.textContent = "폴더 내 .jsonl / .json 파일들을 읽어 지표를 집계하는 중입니다...";
