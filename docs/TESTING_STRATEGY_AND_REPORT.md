@@ -4,7 +4,7 @@
 - **문서 버전**: `v3.1.0`
 - **최종 검증일**: `2026-11-27`
 - **검증 대상**: `server.mjs`, `public/index.html`, `public/style.css`, `public/app.js`, `bin/gpu-ctl.mjs`, `scripts/manage-service.sh`, 라이브 데몬(`0.0.0.0:4300`)
-- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **84개** 케이스)
+- **자동화 테스트 엔트리**: [`tests/run-tests.mjs`](file:///home/kms/dev/space-gpu-runner/tests/run-tests.mjs) (`npm test` · 총 **88개** 케이스)
 
 ---
 
@@ -190,6 +190,10 @@ TEST_BASE_URL=http://127.0.0.1:4300 ADMIN_PASSWORD=cycy node --test tests/run-te
 | **TC-82** | Suite 6 (사전점검캐시/예약적시성) | `POST /api/jobs/preflight` & `setInterval` | 웹 에디터 스크립트 객체 캐시 인식 및 스케줄러 OFF 시에도 1초 단위 예약 실행 검증 | ✅ PASS |
 | **TC-83** | Suite 6 (터미널CLI라우트정합) | `bin/gpu-ctl.mjs` | `spawn`(`POST /api/jobs/trigger`) 및 `drain`(`start_drain`/`stop_drain`) 엔드포인트 정합성 검증 | ✅ PASS |
 | **TC-84** | Suite 6 (팔레트/집계기무결성) | `public/app.js` | `Ctrl+K` `log` 명령 참조 무결성 및 `.jsonl` 폴더 집계 시 단일 파일 미리보기 상태 보호 검증 | ✅ PASS |
+| **TC-85** | Suite 6 (정적전수참조검증) | `server.mjs` | 모든 `spaceApi` 메서드(29개)가 `spaceApi.` 접두사 없이 단독 호출(`ReferenceError`)되지 않음을 전수 검증 | ✅ PASS |
+| **TC-86** | Suite 6 (팔레트백업/포커스) | `public/app.js` | `Ctrl+K` 명령 팔레트의 `exportBackupSnapshot()` 및 `selectFleetJobTab()` 함수 정의 무결성 검증 | ✅ PASS |
+| **TC-87** | Suite 6 (미존재파일/한글헤더/SSE) | `readSfmFile` · `/api/jobs/report` · `broadcastSseEvent` | 미존재 파일 템플릿 통과 차단, 한글 규칙명 리포트 RFC5987 인코딩, 멀티 사이트 SSE 타이머 격리 검증 | ✅ PASS |
+| **TC-88** | Suite 6 (승인접두사/정규식방어) | `shouldAutoApproveItem` · `searchWorkerLogLines` | 본인 런 접두사(`v9-s01-...`) 승인 매칭 및 비정상 정규식 예외 방어 검증 | ✅ PASS |
 
 ---
 

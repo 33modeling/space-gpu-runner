@@ -116,6 +116,8 @@ function createServerLogicSandbox() {
     "generateJobExperimentReport",
     "aggregateJsonlMetrics",
     "computeNextAutoSpawnEligibility",
+    "shouldAutoApproveItem",
+    "searchWorkerLogLines",
     "getJobContainerPrefix",
     "doesRunMatchJob",
     "doesRunMatchSiteJobs",
@@ -1108,12 +1110,12 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     );
   });
 
-  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=31`) 및 `/api/state` 응답 무결성 검증", async (t) => {
+  test("TC-40: 라이브 정적 에셋(`/style.css?v=8`, `/app.js?v=32`) 및 `/api/state` 응답 무결성 검증", async (t) => {
     if (!serverReachable) return t.skip("로컬 4300 데몬 미실행 환경 — 스킵");
     const [htmlRes, cssRes, jsRes, stateRes] = await Promise.all([
       fetch(`${BASE_URL}/`),
       fetch(`${BASE_URL}/style.css?v=8`),
-      fetch(`${BASE_URL}/app.js?v=31`),
+      fetch(`${BASE_URL}/app.js?v=32`),
       fetch(`${BASE_URL}/api/state`, { headers: { "X-Admin-Password": ADMIN_PW } }),
     ]);
     assert.equal(htmlRes.status, 200);
@@ -1121,7 +1123,7 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(jsRes.status, 200);
     assert.equal(stateRes.status, 200);
     const htmlText = await htmlRes.text();
-    assert.equal(htmlText.includes("/app.js?v=31"), true, "라이브 index.html이 최신 캐시버전 app.js?v=31을 서빙해야 함");
+    assert.equal(htmlText.includes("/app.js?v=32"), true, "라이브 index.html이 최신 캐시버전 app.js?v=32을 서빙해야 함");
     const stateJson = await stateRes.json();
     assert.equal(typeof stateJson.activeSiteId, "string");
     assert.equal(Array.isArray(stateJson.jobs), true);
@@ -2140,5 +2142,70 @@ describe("Suite 6: 라이브 데몬(Port 4300) 비파괴 REST API 계약 및 멀
     assert.equal(appJsSrc.includes("getFocusedMonitorJobFleet"), false, "미정의 함수 getFocusedMonitorJobFleet 참조가 없어야 함");
     assert.equal(appJsSrc.includes("const jf = getFocusedJobFleet(latestWorkerFleet);"), true);
     assert.equal(appJsSrc.includes("currentSfmPreviewPath = dirPath"), false, "폴더 집계 시 단일 파일 미리보기 경로 변수를 덮어쓰지 않아야 함");
+  });
+
+  test("TC-85: [정적 전수 검증] `server.mjs` 내 모든 `spaceApi` 메서드가 `spaceApi.` 접두사 없이 단독 호출(`ReferenceError`)되지 않음을 검증", () => {
+    const apiBlockMatch = serverSrc.match(/const spaceApi = \{([\s\S]*?)\n\};\n/);
+    assert.ok(apiBlockMatch, "spaceApi 정의 블록이 존재해야 함");
+    const apiMethods = [...apiBlockMatch[1].matchAll(/^\s{2}([a-zA-Z0-9_]+)\s*:/gm)].map((m) => m[1]);
+    const lines = serverSrc.split("\n");
+    const bareCalls = [];
+    for (const m of apiMethods) {
+      lines.forEach((line, idx) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+        const rx = new RegExp(`(?<![.\\w$])${m}\\s*\\(`, "g");
+        if (rx.test(line)) {
+          bareCalls.push(`L${idx + 1}:${m}`);
+        }
+      });
+    }
+    assert.deepEqual(bareCalls, [], `spaceApi 메서드가 단독 호출되어 ReferenceError를 유발하는 코드가 없어야 함: ${bareCalls.join(", ")}`);
+  });
+
+  test("TC-86: [회귀 방지] `Ctrl+K` 팔레트 백업(`exportBackupSnapshot`) 및 규칙 전환(`selectFleetJobTab`) 함수 정의 무결성 검증", () => {
+    assert.equal(appJsSrc.includes("exportRunnerBackup"), false, "미정의 exportRunnerBackup 참조가 없어야 함");
+    assert.equal(appJsSrc.includes("selectMonitorFocusedRule"), false, "미정의 selectMonitorFocusedRule 참조가 없어야 함");
+    assert.equal(appJsSrc.includes("exportBackupSnapshot()"), true);
+    assert.equal(appJsSrc.includes("selectFleetJobTab(j.id)"), true);
+  });
+
+  test("TC-87: [회귀 방지] `readSfmFile` 미존재 파일 템플릿 폴백 차단(`allowTemplateFallback: false`) 및 한글 규칙명 리포트 헤더 RFC5987 인코딩 검증", () => {
+    assert.equal(
+      serverSrc.includes("spaceApi.readSfmFile(sp, { allowTemplateFallback: false })"),
+      true,
+      "Pre-Flight 점검 시 존재하지 않는 스크립트 파일이 더미 템플릿으로 통과되지 않아야 함"
+    );
+    assert.equal(
+      serverSrc.includes("filename*=UTF-8''${encodedUtf8Name}"),
+      true,
+      "한글/특수문자 규칙명 실험 리포트 다운로드 시 ERR_INVALID_CHAR 예외가 발생하지 않아야 함"
+    );
+    assert.equal(
+      serverSrc.includes("sseCoalesceTimersBySite"),
+      true,
+      "멀티 사이트(N9/N6) 동시 이벤트 시 SSE 코얼레싱 타이머가 사이트별로 독립 동작해야 함"
+    );
+  });
+
+  test("TC-88: [회귀 방지] `shouldAutoApproveItem` 접두사(`v9-s01-...`) 매칭 및 `searchWorkerLogLines` 비정상 정규식 방어 검증", () => {
+    // 1) targetRunName='v9' 전달 시 본인 소유 'v9-s01-1128' 승인 허용 & 타인 소유 거부
+    assert.equal(
+      srv.shouldAutoApproveItem(
+        { runId: "991", runName: "v9-s01-1128", userId: "minsoo3.kim" },
+        { scope: "off", currentUser: "minsoo3.kim", targetRunName: "v9" }
+      ),
+      true
+    );
+    assert.equal(
+      srv.shouldAutoApproveItem(
+        { runId: "992", runName: "v9-s01-1128", userId: "other.colleague" },
+        { scope: "off", currentUser: "minsoo3.kim", targetRunName: "v9" }
+      ),
+      false
+    );
+    // 2) 잘못된 정규식 전달 시에도 예외(throw) 없이 안전하게 빈 결과 반환
+    const badRxRes = srv.searchWorkerLogLines("step 10 loss=0.5", { query: "loss=[unclosed", isRegex: true });
+    assert.equal(badRxRes.matchCount, 0);
   });
 });

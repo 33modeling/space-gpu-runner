@@ -5128,6 +5128,8 @@ async function saveCurrentJobAsPreset() {
   const name = prompt("저장할 실험 프리셋(북마크) 이름을 입력하세요:", defaultName);
   if (!name || !name.trim()) return;
   const minConcurrentRuns = Math.max(1, Number(document.getElementById("jobMinConcurrent")?.value || 1));
+  const targetPendingRuns = Math.max(0, Number(document.getElementById("jobTargetPending")?.value || 0));
+  const cooldownSec = Math.max(1, Number(document.getElementById("jobCooldownSec")?.value || 15));
   const allowSpot = document.getElementById("jobAllowSpot")?.checked || false;
   const executionCommand = document.getElementById("jobExecutionCommand")?.value || "bash /group-volume/run.sh";
   const coreCount = Math.max(1, Number(document.getElementById("jobCoreCount")?.value || 1));
@@ -5137,10 +5139,13 @@ async function saveCurrentJobAsPreset() {
     const res = await api("/api/presets", {
       method: "POST",
       body: JSON.stringify({
+        jobId: document.getElementById("jobId")?.value || "",
         name: name.trim(),
         badge: `${minConcurrentRuns}W · ${allowSpot ? "Spot" : "Std"}`,
         executionCommand,
         minConcurrentRuns,
+        targetPendingRuns,
+        cooldownSec,
         coreCount,
         allowSpot,
         expectedRunTime,
@@ -5962,7 +5967,7 @@ function renderQuickPaletteSuggestions(rawText = "") {
     { label: "페이지 이동: 실행 규칙", hint: "rules", action: () => switchMainView("rules") },
     { label: "페이지 이동: 시스템 설정", hint: "settings", action: () => switchMainView("settings") },
     { label: "출발 전 스크립트 사전 점검 (Pre-Flight)", hint: "preflight", action: () => { switchMainView("rules"); runJobPreflightCheck(); } },
-    { label: "설정 · 규칙 JSON 백업 다운로드", hint: "backup", action: () => exportRunnerBackup(false) },
+    { label: "설정 · 규칙 JSON 백업 다운로드", hint: "backup", action: () => exportBackupSnapshot() },
   ];
   for (const j of jobs) {
     baseCommands.push({
@@ -5970,7 +5975,7 @@ function renderQuickPaletteSuggestions(rawText = "") {
       hint: j.name,
       action: () => {
         switchMainView("monitor");
-        selectMonitorFocusedRule(j.id);
+        selectFleetJobTab(j.id);
       },
     });
   }

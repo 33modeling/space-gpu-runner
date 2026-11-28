@@ -767,19 +767,21 @@ function saveState() {
 }
 
 const sseClients = new Set();
-let sseCoalesceTimer = null;
+const sseCoalesceTimersBySite = new Map();
 
 function broadcastSseEvent(eventName = "state_changed", payload = {}) {
   if (sseClients.size === 0) return;
   if (eventName === "state_changed") {
-    if (sseCoalesceTimer) return;
-    sseCoalesceTimer = setTimeout(() => {
-      sseCoalesceTimer = null;
+    const siteKey = String(payload?.siteId || "global");
+    if (sseCoalesceTimersBySite.has(siteKey)) return;
+    const t = setTimeout(() => {
+      sseCoalesceTimersBySite.delete(siteKey);
       const frame = `event: state_changed\ndata: ${JSON.stringify({
         ts: Date.now(),
         ...payload,
       })}\n\n`;
       for (const client of Array.from(sseClients)) {
+        if (payload?.siteId && client.siteId && client.siteId !== payload.siteId) continue;
         try {
           client.res.write(frame);
         } catch {
@@ -787,7 +789,8 @@ function broadcastSseEvent(eventName = "state_changed", payload = {}) {
         }
       }
     }, 350);
-    if (typeof sseCoalesceTimer.unref === "function") sseCoalesceTimer.unref();
+    if (typeof t.unref === "function") t.unref();
+    sseCoalesceTimersBySite.set(siteKey, t);
     return;
   }
   const frame = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now(), ...payload })}\n\n`;
@@ -1750,7 +1753,8 @@ const spaceApi = {
     }
   },
 
-  readSfmFile: async (filePath = "/group-volume/run.sh") => {
+  readSfmFile: async (filePath = "/group-volume/run.sh", options = {}) => {
+    const allowTemplateFallback = options?.allowTemplateFallback !== false;
     const resolved = resolveSfmFilePaths(filePath, resolveGroupId(), resolveCurrentUserName());
     const { containerPath, viewerFilePath, onedataViewerPath, sfmPath } = resolved;
     const savedEntry =
@@ -1767,7 +1771,7 @@ const spaceApi = {
           params: { path: vPath },
           rawResponse: true,
         });
-        if (typeof dlRes === "string" && dlRes.length > 0 && !dlRes.trim().startsWith("<!DOCTYPE html")) {
+        if (typeof dlRes === "string" && !dlRes.trim().startsWith("<!DOCTYPE html")) {
           return {
             path: containerPath,
             viewerPath: vPath,
@@ -1787,7 +1791,7 @@ const spaceApi = {
         params: { path: sfmPath },
         rawResponse: true,
       });
-      if (typeof sfmRes === "string" && sfmRes.length > 0 && !sfmRes.trim().startsWith("<!DOCTYPE html")) {
+      if (typeof sfmRes === "string" && !sfmRes.trim().startsWith("<!DOCTYPE html")) {
         return {
           path: containerPath,
           viewerPath: viewerFilePath,
@@ -1805,11 +1809,15 @@ const spaceApi = {
       return {
         path: containerPath,
         viewerPath: viewerFilePath,
-        content: savedEntry.content || "",
+        content: typeof savedEntry === "string" ? savedEntry : savedEntry.content || "",
         source: "dashboard_store",
         updatedAt: savedEntry.updatedAt || null,
         autoInject: Boolean(savedEntry.autoInject),
       };
+    }
+
+    if (!allowTemplateFallback) {
+      throw Object.assign(new Error(`볼륨에서 파일을 찾을 수 없습니다: ${containerPath}`), { statusCode: 404 });
     }
 
     return {
@@ -2453,11 +2461,16 @@ function shouldAutoApproveItem(
   const rName = String(item.runName || item.name || item.containerName || "");
   const itemUser = String(item.userId || item.userName || item.user || "").trim();
 
+  const ownedByMe = isRunOwnedByUser({ userId: itemUser }, currentUser);
   if (targetRunId && rId === String(targetRunId)) return true;
-  if (targetRunName && (rName === String(targetRunName) || rId === String(targetRunName))) return true;
+  if (targetRunName) {
+    const tName = String(targetRunName);
+    if (rName === tName || rId === tName || (ownedByMe && rName.startsWith(tName + "-"))) {
+      return true;
+    }
+  }
   if (trackedRunIds && typeof trackedRunIds.has === "function" && trackedRunIds.has(rId)) return true;
 
-  const ownedByMe = isRunOwnedByUser({ userId: itemUser }, currentUser);
   if (ownedByMe && Array.isArray(jobs)) {
     for (const j of jobs) {
       if (!j || j.autoApprove === false) continue;
@@ -3075,13 +3088,14 @@ async function pushAlertNotification(level, title, message, meta = {}) {
   }
   recentAlertDedupeMap.set(dedupeKey, now);
 
+  const alertMeta = { siteId: getCurrentSiteId(), ...meta };
   const alertEntry = {
     id: `alert-${now}-${Math.random().toString(36).slice(2, 7)}`,
     time: new Date(now).toISOString(),
     level, // info | success | warn | error
     title,
     message,
-    meta,
+    meta: alertMeta,
   };
 
   if (!Array.isArray(state.alerts)) state.alerts = [];
@@ -3165,16 +3179,19 @@ function applyTimeScaleToJobs() {
   const ts = computeTimeScaleStatus();
   if (!ts.enabled) return ts;
   let changed = false;
-  const targetJobs = state.jobs.filter((j) => j.enabled);
+  const targetJobs = state.jobs.filter((j) => j.enabled && !j.draining);
   for (const job of targetJobs) {
     if (Number(job.minConcurrentRuns) !== ts.desiredTarget) {
-      const prev = job.minConcurrentRuns;
+      const prev = Number(job.minConcurrentRuns || 1);
       job.minConcurrentRuns = ts.desiredTarget;
       changed = true;
       addLog(
         "info",
         `🌙 [시간대별 자동 스케일링] ${ts.periodLabel} (${ts.kstTimeStr}) 적용 → [${job.name}] 목표 워커 수 ${prev}개 ➔ ${ts.desiredTarget}개로 자동 전환`
       );
+      if (ts.desiredTarget < prev) {
+        trimExcessPendingWorkersForJob(job, getSiteKnownRuns()).catch(() => {});
+      }
     }
   }
   if (changed) saveState();
@@ -3769,9 +3786,13 @@ function searchWorkerLogLines(logText = "", { query = "", isRegex = false, caseS
   const safeQuery = q.slice(0, 240);
   let matcher = null;
   if (isRegex) {
-    const flags = caseSensitive ? "" : "i";
-    const rx = new RegExp(safeQuery, flags);
-    matcher = (line) => rx.test(line);
+    try {
+      const flags = caseSensitive ? "" : "i";
+      const rx = new RegExp(safeQuery, flags);
+      matcher = (line) => rx.test(line);
+    } catch {
+      return { matchCount: 0, matches: [] };
+    }
   } else if (caseSensitive) {
     matcher = (line) => line.includes(safeQuery);
   } else {
@@ -4499,8 +4520,18 @@ async function pollWatchedOutputDirIfNeeded(job, force = false) {
     return cached;
   }
   try {
-    const listRes = await listSfmFiles(dirPath);
-    const items = Array.isArray(listRes?.files) ? listRes.files : Array.isArray(listRes) ? listRes : [];
+    const listRes = await spaceApi.listSfmFiles(dirPath);
+    const items = Array.isArray(listRes?.items)
+      ? listRes.items
+      : Array.isArray(listRes?.results)
+      ? listRes.results
+      : Array.isArray(listRes?.files)
+      ? listRes.files
+      : Array.isArray(listRes?.data)
+      ? listRes.data
+      : Array.isArray(listRes)
+      ? listRes
+      : [];
     const summary = summarizeOutputDirectoryEntries(items, nowMs);
     const record = {
       path: dirPath,
@@ -8657,7 +8688,7 @@ const server = http.createServer(async (req, res) => {
             : null,
         },
         jobs: state.jobs,
-        presets: state.presets || [],
+        presets: (state.presets || []).filter((p) => !p?.siteId || normalizeSiteId(p.siteId) === activeSid),
         scheduledActions: (rawState.scheduledActions || [])
           .filter((a) => normalizeSiteId(a?.siteId || "n9") === activeSid)
           .slice(-50)
@@ -8665,7 +8696,9 @@ const server = http.createServer(async (req, res) => {
         telemetry: fleet.telemetry,
         history: siteHistory.slice(0, 100),
         allHistory: (state.history || []).slice(0, 100),
-        alerts: (state.alerts || []).slice(0, 50),
+        alerts: (state.alerts || [])
+          .filter((a) => !a?.meta?.siteId || normalizeSiteId(a.meta.siteId) === activeSid)
+          .slice(0, 50),
         schedulerLoopStats,
         approvalLoopStats,
         autoApprovalTimeline: fleet.autoApprovalTimeline || [],
@@ -9069,13 +9102,17 @@ const server = http.createServer(async (req, res) => {
       if (body.rollingRestart) {
         const myUser = resolveCurrentUserName();
         const runs = await fetchCurrentRuns(true).catch(() => getSiteKnownRuns());
+        const scriptRefJobs = body.jobId
+          ? state.jobs.filter((j) => String(j.id) === String(body.jobId))
+          : state.jobs.filter((j) => String(j.executionCommand || "").includes(writeRes.path));
+        const matchJobs = scriptRefJobs.length > 0 ? scriptRefJobs : state.jobs;
         const runningRuns = runs
           .filter(
             (r) =>
               classifyRunStatus(r.status || r.state || r.phase) === "ACTIVE" &&
               String(r.status || r.state || r.phase || "").toUpperCase().includes("RUNNING") &&
               isRunOwnedByUser(r, myUser) &&
-              doesRunMatchSiteJobs(r, state.jobs, body.jobId)
+              doesRunMatchSiteJobs(r, matchJobs, body.jobId)
           )
           .sort((a, b) => Number(a.id ?? a.runId ?? 0) - Number(b.id ?? b.runId ?? 0));
         const batchSize = toSafeInt(body.batchSize, 2, 1, 8);
@@ -9144,7 +9181,8 @@ const server = http.createServer(async (req, res) => {
       const parts = pathname.split("/");
       const runId = safeDecodeURIComponent(parts[parts.length - 2] || "");
       if (!runId) return sendJson(res, 400, { error: "Malformed run ID" });
-      const logText = await spaceApi.getRunLog(runId, { tailLines: 500 });
+      const tailLines = toSafeInt(parsedUrl.searchParams.get("tailLines"), 500, 10, 5000);
+      const logText = await spaceApi.getRunLog(runId, { tailLines });
       return sendJson(res, 200, { runId, log: logText });
     }
 
@@ -9929,7 +9967,7 @@ const server = http.createServer(async (req, res) => {
       if (!targetPath) return sendJson(res, 400, { error: "파일 경로(path)를 지정해 주세요." });
       const mode = String(parsedUrl.searchParams.get("mode") || "tail").toLowerCase();
       const maxLines = toSafeInt(parsedUrl.searchParams.get("lines"), 100, 10, 500);
-      const readRes = await readSfmFile(targetPath);
+      const readRes = await spaceApi.readSfmFile(targetPath, { allowTemplateFallback: false });
       const sliced = slicePreviewContent(readRes?.content || "", { mode, maxLines, maxBytes: 65536 });
       return sendJson(res, 200, {
         ok: true,
@@ -9942,7 +9980,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/space/sfm-download" && req.method === "GET") {
       const targetPath = String(parsedUrl.searchParams.get("path") || "").trim();
       if (!targetPath) return sendJson(res, 400, { error: "파일 경로(path)를 지정해 주세요." });
-      const readRes = await readSfmFile(targetPath);
+      const readRes = await spaceApi.readSfmFile(targetPath, { allowTemplateFallback: false });
       const rawContent = String(readRes?.content ?? "");
       const safeFileName =
         targetPath
@@ -10094,17 +10132,19 @@ const server = http.createServer(async (req, res) => {
         fleet.telemetry || getSiteTelemetryObject(),
         fleetJob
       );
+      const safeReportBase = String(targetJob.name || "job").replace(/[^a-zA-Z0-9._-]/g, "_") || "job";
+      const encodedUtf8Name = encodeURIComponent(`experiment-report-${targetJob.name || "job"}`);
       if (fmt === "csv") {
         res.writeHead(200, {
           "Content-Type": "text/csv; charset=utf-8",
-          "Content-Disposition": `attachment; filename="experiment-report-${targetJob.name}.csv"`,
+          "Content-Disposition": `attachment; filename="experiment-report-${safeReportBase}.csv"; filename*=UTF-8''${encodedUtf8Name}.csv`,
         });
         return res.end(report.csv);
       }
       if (fmt === "md") {
         res.writeHead(200, {
           "Content-Type": "text/markdown; charset=utf-8",
-          "Content-Disposition": `attachment; filename="experiment-report-${targetJob.name}.md"`,
+          "Content-Disposition": `attachment; filename="experiment-report-${safeReportBase}.md"; filename*=UTF-8''${encodedUtf8Name}.md`,
         });
         return res.end(report.markdown);
       }
@@ -10116,7 +10156,7 @@ const server = http.createServer(async (req, res) => {
       const dirPath = String(body.dirPath || "").trim();
       if (!dirPath) return sendJson(res, 400, { error: "집계할 볼륨 폴더 경로(dirPath)를 입력해 주세요." });
       const maxFiles = toSafeInt(body.maxFiles, 25, 1, 60);
-      const rawListing = await listSfmFiles(dirPath);
+      const rawListing = await spaceApi.listSfmFiles(dirPath);
       const list = Array.isArray(rawListing)
         ? rawListing
         : rawListing?.items || rawListing?.results || rawListing?.data || rawListing?.files || [];
@@ -10140,7 +10180,7 @@ const server = http.createServer(async (req, res) => {
               f?.containerPath ||
               `${dirPath.replace(/\/+$/, "")}/${nm}`;
             try {
-              const rd = await readSfmFile(cPath);
+              const rd = await spaceApi.readSfmFile(cPath, { allowTemplateFallback: false });
               return { fileName: nm, content: rd?.content || "" };
             } catch {
               return { fileName: nm, content: "" };
@@ -10204,7 +10244,7 @@ const server = http.createServer(async (req, res) => {
             sourceLabel = "웹 에디터 동기화 캐시";
           } else if (state.config.accessToken) {
             try {
-              const sfmRes = await readSfmFile(sp);
+              const sfmRes = await spaceApi.readSfmFile(sp, { allowTemplateFallback: false });
               content = sfmRes?.content ?? "";
             } catch (sfmErr) {
               pushCheck(
@@ -10317,12 +10357,15 @@ const server = http.createServer(async (req, res) => {
 
     // 8-A4. Batch 2 - Feature 4: Experiment Presets Bookmark Endpoints (`GET/POST /api/presets`, `POST /api/presets/apply`, `DELETE /api/presets/:id`)
     if (pathname === "/api/presets" && req.method === "GET") {
-      return sendJson(res, 200, { presets: state.presets || [] });
+      const sid = getCurrentSiteId();
+      const visiblePresets = (state.presets || []).filter((p) => !p?.siteId || normalizeSiteId(p.siteId) === sid);
+      return sendJson(res, 200, { presets: visiblePresets });
     }
 
     if (pathname === "/api/presets" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!Array.isArray(state.presets)) state.presets = [];
+      const sid = getCurrentSiteId();
       const activeJob =
         (body.jobId && state.jobs.find((j) => j.id === body.jobId)) ||
         state.jobs.find((j) => j.enabled) ||
@@ -10330,20 +10373,27 @@ const server = http.createServer(async (req, res) => {
         {};
       const presetWorkers = toSafeInt(body.minConcurrentRuns, activeJob.minConcurrentRuns ?? 1, 1, 9999);
       const presetCoreCount = toSafeInt(body.coreCount, activeJob.coreCount ?? 1, 1, 1024);
+      const presetPending = toSafeInt(body.targetPendingRuns, activeJob.targetPendingRuns ?? 0, 0, 9999);
+      const presetCooldown = toSafeInt(body.cooldownSec, activeJob.cooldownSec ?? state.config.checkIntervalSec ?? 15, 1, 86400);
       const newPreset = {
         id: body.id || `preset-${Date.now()}`,
+        siteId: sid,
         name: String(body.name || "새 실험 프리셋").trim(),
         badge: String(body.badge || `${presetWorkers}W`).trim(),
         executionCommand: String(body.executionCommand ?? activeJob.executionCommand ?? "bash /group-volume/run.sh").trim(),
         minConcurrentRuns: presetWorkers,
+        targetPendingRuns: presetPending,
+        cooldownSec: presetCooldown,
         coreCount: presetCoreCount,
         allowSpot: Boolean(body.allowSpot ?? activeJob.allowSpot),
         expectedRunTime: String(body.expectedRunTime ?? activeJob.expectedRunTime ?? "8h"),
-        injectWorkerEnv: Boolean(body.injectWorkerEnv ?? state.config.injectWorkerEnv),
-        nextStageCommand: String(body.nextStageCommand ?? state.config.nextStageCommand ?? "").trim(),
+        injectWorkerEnv: Boolean(body.injectWorkerEnv ?? activeJob.injectWorkerEnv ?? state.config.injectWorkerEnv),
+        nextStageCommand: String(body.nextStageCommand ?? activeJob.nextStageCommand ?? "").trim(),
         updatedAt: new Date().toISOString(),
       };
-      const existingIdx = state.presets.findIndex((p) => p.id === newPreset.id || p.name === newPreset.name);
+      const existingIdx = state.presets.findIndex(
+        (p) => p.id === newPreset.id || (p.name === newPreset.name && (!p.siteId || normalizeSiteId(p.siteId) === sid))
+      );
       if (existingIdx >= 0) {
         state.presets[existingIdx] = newPreset;
       } else {
@@ -10351,7 +10401,8 @@ const server = http.createServer(async (req, res) => {
       }
       saveState();
       addLog("info", `⚡ [실험 프리셋 북마크 저장] '${newPreset.name}' (${newPreset.minConcurrentRuns}워커 · ${newPreset.allowSpot ? "Spot" : "Standard"})`);
-      return sendJson(res, 200, { ok: true, preset: newPreset, presets: state.presets });
+      const visiblePresets = state.presets.filter((p) => !p?.siteId || normalizeSiteId(p.siteId) === sid);
+      return sendJson(res, 200, { ok: true, preset: newPreset, presets: visiblePresets });
     }
 
     if (pathname === "/api/presets/apply" && req.method === "POST") {
@@ -10370,6 +10421,7 @@ const server = http.createServer(async (req, res) => {
           .slice(0, 18) || "preset-worker";
         job = {
           id: `job-${Date.now()}`,
+          siteId: getCurrentSiteId(),
           name: `${cleanRuleBase}-${state.jobs.length + 1}`,
           enabled: true,
           mode: "ensure_running",
@@ -10386,13 +10438,15 @@ const server = http.createServer(async (req, res) => {
           expectedRunTime: preset.expectedRunTime || "8h",
           enableWebConsole: true,
           minConcurrentRuns: Math.max(1, Number(preset.minConcurrentRuns || 1)),
+          targetPendingRuns: Math.max(0, Number(preset.targetPendingRuns ?? 0)),
           restartOnSuccess: true,
           restartOnFail: true,
-          cooldownSec: 15,
+          cooldownSec: toSafeInt(preset.cooldownSec, refJob.cooldownSec ?? state.config.checkIntervalSec ?? 15, 1, 86400),
           volumeClaim: refJob.volumeClaim || [],
           injectWorkerEnv: Boolean(preset.injectWorkerEnv ?? state.config.injectWorkerEnv),
           nextStageCommand: preset.nextStageCommand || "",
           _stage2Transitioned: false,
+          _pendingRefillImmediate: true,
           lastCheckAt: null,
           lastTriggeredAt: null,
           lastRunId: null,
@@ -10408,18 +10462,23 @@ const server = http.createServer(async (req, res) => {
         if (job) {
           job.executionCommand = preset.executionCommand || job.executionCommand;
           job.minConcurrentRuns = Math.max(1, Number(preset.minConcurrentRuns || 1));
+          if (preset.targetPendingRuns !== undefined) {
+            job.targetPendingRuns = Math.max(0, Number(preset.targetPendingRuns || 0));
+          }
+          if (preset.cooldownSec !== undefined) {
+            job.cooldownSec = toSafeInt(preset.cooldownSec, job.cooldownSec ?? 15, 1, 86400);
+          }
           job.coreCount = Math.max(1, Number(preset.coreCount || 1));
           job.allowSpot = Boolean(preset.allowSpot);
           if (preset.expectedRunTime) job.expectedRunTime = preset.expectedRunTime;
           if (preset.injectWorkerEnv !== undefined) {
             job.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
-            state.config.injectWorkerEnv = Boolean(preset.injectWorkerEnv);
           }
           if (preset.nextStageCommand !== undefined) {
             job.nextStageCommand = preset.nextStageCommand;
-            state.config.nextStageCommand = preset.nextStageCommand;
           }
           job._stage2Transitioned = false;
+          job._pendingRefillImmediate = true;
           job.enabled = true;
           saveState();
         }
@@ -10448,10 +10507,12 @@ const server = http.createServer(async (req, res) => {
     if (pathname.startsWith("/api/presets/") && req.method === "DELETE") {
       const presetId = safeDecodeURIComponent(pathname.split("/").pop() || "");
       if (presetId === null) return sendJson(res, 400, { error: "Malformed preset ID" });
+      const sid = getCurrentSiteId();
       state.presets = (state.presets || []).filter((p) => p.id !== presetId);
       saveState();
       addLog("info", `🗑️ [프리셋 삭제] ID=${presetId}`);
-      return sendJson(res, 200, { ok: true, presets: state.presets });
+      const visiblePresets = state.presets.filter((p) => !p?.siteId || normalizeSiteId(p.siteId) === sid);
+      return sendJson(res, 200, { ok: true, presets: visiblePresets });
     }
 
     // 8-A5. Batch 2 - Feature 5: GPU Telemetry Report Export (`GET /api/telemetry/export?format=csv|json`)
